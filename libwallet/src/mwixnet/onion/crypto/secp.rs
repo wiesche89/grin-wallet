@@ -19,6 +19,7 @@ pub use grin_util::secp::{
 	constants::SECRET_KEY_SIZE,
 	key::{SecretKey, ZERO_KEY},
 	pedersen::Commitment,
+	pedersen::RangeProof,
 	rand::thread_rng,
 	ContextFlag, Secp256k1,
 };
@@ -47,7 +48,7 @@ pub fn read_secret_key<R: Reader>(reader: &mut R) -> Result<SecretKey, ser::Erro
 }
 
 /// Build a Pedersen Commitment using the provided value and blinding factor
-#[cfg(test)]
+//#[cfg(test)]
 pub fn commit(value: u64, blind: &SecretKey) -> Result<Commitment, secp256k1zkp::Error> {
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
 	let commit = secp.commit(value, blind.clone())?;
@@ -76,8 +77,8 @@ pub fn sub_value(commitment: &Commitment, value: u64) -> Result<Commitment, secp
 }
 
 /// Signs the message with the provided SecretKey
-#[cfg(test)]
-#[allow(dead_code)]
+//#[cfg(test)]
+//#[allow(dead_code)]
 pub fn sign(
 	sk: &SecretKey,
 	msg: &grin_util::secp::Message,
