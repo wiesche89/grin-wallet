@@ -1,23 +1,31 @@
 [package]
 name = "grin_wallet"
-version = "5.4.1"
-authors = ["Grin Developers <mimblewimble@lists.launchpad.net>"]
+version.workspace = true
+authors.workspace = true
 description = "Simple, private and scalable cryptocurrency implementation based on the MimbleWimble chain format."
-license = "Apache-2.0"
-repository = "https://github.com/mimblewimble/grin-wallet"
-keywords = [ "crypto", "grin", "mimblewimble" ]
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
 readme = "README.md"
 exclude = ["**/*.grin", "**/*.grin2"]
 build = "src/build/build.rs"
-edition = "2021"
+edition.workspace = true
 
 [[bin]]
 name = "grin-wallet"
 path = "src/bin/grin-wallet.rs"
 
 [workspace]
-members = ["api", "config", "controller", "impls", "libwallet", "util"]
+members = ["api", "config", "controller", "impls", "libwallet", "util", "doc"]
 exclude = ["integration"]
+
+[workspace.package]
+version = "5.4.1"
+authors = ["Grin Developers <mimblewimble@lists.launchpad.net>"]
+license = "Apache-2.0"
+repository = "https://github.com/mimblewimble/grin-wallet"
+keywords = ["crypto", "grin", "mimblewimble"]
+edition = "2021"
 
 [dependencies]
 clap = { version = "2.33", features = ["yaml"] }
