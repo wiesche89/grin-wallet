@@ -56,6 +56,14 @@ pub struct WalletConfig {
 	/// Scaling factor from transaction weight to transaction fee
 	/// should match accept_fee_base parameter in grin-server
 	pub accept_fee_base: Option<u64>,
+	/// Maximum total fee accepted for a discovered MWixnet route, in nanogrin.
+	pub mwixnet_max_total_fee: Option<u64>,
+	/// Default lifetime of a route-bound MWixnet request, in blocks.
+	pub mwixnet_request_ttl_blocks: Option<u16>,
+	/// Confirmation depth used for MWixnet inputs and recovery transactions.
+	pub mwixnet_confirmation_depth: Option<u64>,
+	/// Swap-server identities accepted for discovered MWixnet routes.
+	pub mwixnet_route_allowlist: Option<Vec<String>>,
 }
 
 impl Default for WalletConfig {
@@ -75,6 +83,10 @@ impl Default for WalletConfig {
 			tls_certificate_key: None,
 			dark_background_color_scheme: Some(true),
 			accept_fee_base: None,
+			mwixnet_max_total_fee: Some(1_000_000_000),
+			mwixnet_request_ttl_blocks: Some(120),
+			mwixnet_confirmation_depth: Some(10),
+			mwixnet_route_allowlist: None,
 		}
 	}
 }
@@ -113,6 +125,21 @@ impl WalletConfig {
 	pub fn accept_fee_base(&self) -> u64 {
 		self.accept_fee_base
 			.unwrap_or_else(|| WalletConfig::default_accept_fee_base())
+	}
+
+	/// Maximum total fee accepted for a discovered MWixnet route.
+	pub fn mwixnet_max_total_fee(&self) -> u64 {
+		self.mwixnet_max_total_fee.unwrap_or(1_000_000_000)
+	}
+
+	/// Default lifetime of a route-bound MWixnet request.
+	pub fn mwixnet_request_ttl_blocks(&self) -> u16 {
+		self.mwixnet_request_ttl_blocks.unwrap_or(120)
+	}
+
+	/// Confirmation depth used for MWixnet inputs and recovery transactions.
+	pub fn mwixnet_confirmation_depth(&self) -> u64 {
+		self.mwixnet_confirmation_depth.unwrap_or(10)
 	}
 
 	/// Node API requests timeout.

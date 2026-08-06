@@ -27,6 +27,7 @@ use grin_wallet_config as config;
 use grin_core;
 use grin_keychain;
 use grin_util;
+pub use mwixnet_protocol;
 
 use grin_wallet_util as util;
 

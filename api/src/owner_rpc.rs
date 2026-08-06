@@ -14,7 +14,9 @@
 
 //! JSON-RPC Stub generation for the Owner API
 use grin_wallet_libwallet::RetrieveTxQueryArgs;
-use libwallet::mwixnet::MwixnetReqCreationResult;
+use libwallet::mwixnet::{
+	MwixnetReqCreationResult, MwixnetRouteReqCreationResult, WalletMwixnetRequestInfo, WalletRoute,
+};
 use uuid::Uuid;
 
 use crate::config::{TorConfig, WalletConfig};
@@ -2032,6 +2034,38 @@ pub trait OwnerRpc {
 		lock_output: bool,
 		server_keys: Vec<String>,
 	) -> Result<MwixnetReqCreationResult, Error>;
+
+	/// Returns MWixnet routes discovered and verified by the wallet.
+	fn get_mwixnet_routes(
+		&self,
+		_token: Token,
+		include_unusable: bool,
+	) -> Result<Vec<WalletRoute>, Error>;
+
+	/// Creates and locks a request for a verified MWixnet route.
+	fn create_mwixnet_route_req(
+		&self,
+		token: Token,
+		commitment: String,
+		route_id: crate::libwallet::mwixnet_protocol::Hash,
+		request_ttl_blocks: Option<u16>,
+		max_total_fee: Option<String>,
+	) -> Result<MwixnetRouteReqCreationResult, Error>;
+
+	/// Returns persisted MWixnet requests, optionally filtered by wallet request ID.
+	fn get_mwixnet_requests(
+		&self,
+		token: Token,
+		wallet_request_id: Option<crate::libwallet::mwixnet_protocol::Hash>,
+		refresh: bool,
+	) -> Result<Vec<WalletMwixnetRequestInfo>, Error>;
+
+	/// Cancels an accepted MWixnet request and stores the signed acknowledgement.
+	fn cancel_mwixnet_request(
+		&self,
+		token: Token,
+		wallet_request_id: crate::libwallet::mwixnet_protocol::Hash,
+	) -> Result<WalletMwixnetRequestInfo, Error>;
 }
 
 impl<L, C, K> OwnerRpc for Owner<L, C, K>
@@ -2472,6 +2506,60 @@ where
 			&commit,
 			lock_output,
 		)
+	}
+
+	fn get_mwixnet_routes(
+		&self,
+		_token: Token,
+		include_unusable: bool,
+	) -> Result<Vec<WalletRoute>, Error> {
+		Owner::get_mwixnet_routes(self, include_unusable)
+	}
+
+	fn create_mwixnet_route_req(
+		&self,
+		token: Token,
+		commitment: String,
+		route_id: crate::libwallet::mwixnet_protocol::Hash,
+		request_ttl_blocks: Option<u16>,
+		max_total_fee: Option<String>,
+	) -> Result<MwixnetRouteReqCreationResult, Error> {
+		let commitment = Commitment::from_vec(from_hex(&commitment).map_err(Error::CommitDeser)?);
+		let max_total_fee = max_total_fee
+			.map(|value| value.parse().map_err(|_| Error::U64Deser(value)))
+			.transpose()?;
+		Owner::create_mwixnet_route_req(
+			self,
+			(&token.keychain_mask).as_ref(),
+			&commitment,
+			route_id,
+			request_ttl_blocks,
+			max_total_fee,
+		)
+	}
+
+	fn get_mwixnet_requests(
+		&self,
+		token: Token,
+		wallet_request_id: Option<crate::libwallet::mwixnet_protocol::Hash>,
+		refresh: bool,
+	) -> Result<Vec<WalletMwixnetRequestInfo>, Error> {
+		if refresh {
+			return Owner::refresh_mwixnet_requests(
+				self,
+				(&token.keychain_mask).as_ref(),
+				wallet_request_id,
+			);
+		}
+		Owner::get_mwixnet_requests(self, wallet_request_id)
+	}
+
+	fn cancel_mwixnet_request(
+		&self,
+		token: Token,
+		wallet_request_id: crate::libwallet::mwixnet_protocol::Hash,
+	) -> Result<WalletMwixnetRequestInfo, Error> {
+		Owner::cancel_mwixnet_request(self, (&token.keychain_mask).as_ref(), wallet_request_id)
 	}
 }
 

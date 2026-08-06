@@ -1,0 +1,321 @@
+{
+  "negative_cases": [
+    "wrong_version",
+    "wrong_type",
+    "truncated_list",
+    "limit_exceeded",
+    "low_order_x25519",
+    "invalid_aead_tag",
+    "idempotency_hash_mismatch",
+    "wrong_sequence",
+    "invalid_signature",
+    "swapped_hop_positions"
+  ],
+  "health_layer": {
+    "aad": "000000011417171717171717171717171717171717171717171717171717171717171717170000000000000001181818181818181818181818181818181818181818181818181818181818181801973ac258850f1ca00630b7aaa5cd9ab76ef29265eb81061618b7874cfa2ba156",
+    "shared_secret": "b71085c9b3bb33b56e9254c97b75f582b2ad6ee4843d4fb71a27d8ecfeeff250",
+    "hkdf_prk": "0b787bb387464ce06b66729535d69e9be658e5b56eb10a9da7145a829dc64fbc",
+    "hkdf_info": "00000001140000000000000001181818181818181818181818181818181818181818181818181818181818181801",
+    "layer_key": "ff25198dc83d92d769597b50765d32f2341abe41e7982465f9055ef3e59c9cc3",
+    "tag": "010f182e294184053f30c23aad84e142",
+    "aead_nonce": "1a1a1a1a1a1a1a1a1a1a1a1a",
+    "challenge_hash": "1818181818181818181818181818181818181818181818181818181818181818",
+    "ephemeral_secret": "1919191919191919191919191919191919191919191919191919191919191919",
+    "hop_position": 1,
+    "layer": {
+      "aead_nonce": "1a1a1a1a1a1a1a1a1a1a1a1a",
+      "ciphertext": "1715f60da9af1b7a06b37050926e49e26527b3420992053def770a2fc9a9a59be88c205f461c3d6f010f182e294184053f30c23aad84e142",
+      "ephemeral_public_key": "973ac258850f1ca00630b7aaa5cd9ab76ef29265eb81061618b7874cfa2ba156"
+    },
+    "manifest_sequence": "1",
+    "payload": {
+      "hop_nonce": "1616161616161616161616161616161616161616161616161616161616161616",
+      "next_layer": "010203"
+    },
+    "receiver_public": "bce059bf5b2ab7a91f3e863acf0c84d3ebbe04ca8490094b052b5b15afab1743",
+    "receiver_secret": "1515151515151515151515151515151515151515151515151515151515151515",
+    "route_id": "1717171717171717171717171717171717171717171717171717171717171717"
+  },
+  "offers": {
+    "mixer": {
+      "binary": "0000000100fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f6180202020202020202020202020202020202020202020202020202020202020202000000000000000100000020000000006b49e010000000000000000194c8bf2d333debc8da18b5b541d3492bbb3e35ceeab2c50ff6a1818d969ae1053befad9e9a98c959d5a7965c5c012102105ed7f601683b7f66aff7bd4817bf07",
+      "hash": "10da786c40623cc30e8261b534a1d6daa8ac03291da16216a0409fcb6058e0a0",
+      "value": {
+        "capacity": 32,
+        "identity_public_key": "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618",
+        "minimum_fee": "1",
+        "onion_address": "7ulsioc2uddvwzh3pdgwal5b3gi7327xnmj4ldwxalvmqnpj6yma3rqd.onion",
+        "onion_public_key": "0202020202020202020202020202020202020202020202020202020202020202",
+        "sequence": "1",
+        "signature": "94c8bf2d333debc8da18b5b541d3492bbb3e35ceeab2c50ff6a1818d969ae1053befad9e9a98c959d5a7965c5c012102105ed7f601683b7f66aff7bd4817bf07",
+        "type": "MixerOffer",
+        "valid_until": "1800003600",
+        "version": 1
+      }
+    },
+    "swap": {
+      "binary": "0000000101fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618020202020202020202020202020202020202020202020202020202020202020200000000000000010000002001020104010000000000bebc200078000000006b49e0100000000000000001b909cdb8a00356d31eaebb71aeb1e2738a11bfaea7c1306a4a99561498930c42ff77fcc22edb55c2eca7f8f0977dc5f08ec47f938150fe80dccbf560a7c9d50e",
+      "hash": "c91924c9912f1c96407aac525833ccbcc0c6c0b65c4463c379ff951312cb292e",
+      "value": {
+        "capacity": 32,
+        "desired_max_hops": 4,
+        "desired_min_hops": 2,
+        "identity_public_key": "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618",
+        "max_request_ttl_blocks": 120,
+        "maximum_fee_per_hop": "12500000",
+        "minimum_fee": "1",
+        "onion_address": "7ulsioc2uddvwzh3pdgwal5b3gi7327xnmj4ldwxalvmqnpj6yma3rqd.onion",
+        "onion_public_key": "0202020202020202020202020202020202020202020202020202020202020202",
+        "sequence": "1",
+        "signature": "b909cdb8a00356d31eaebb71aeb1e2738a11bfaea7c1306a4a99561498930c42ff77fcc22edb55c2eca7f8f0977dc5f08ec47f938150fe80dccbf560a7c9d50e",
+        "type": "SwapOffer",
+        "valid_until": "1800003600",
+        "version": 1
+      }
+    }
+  },
+  "route": {
+    "acceptances": [
+      {
+        "binary": "00000001038b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a0000000000000001dbcc54612788464f2545735b98bf33156dab91670041712a6daee0a4dbbf5ec8ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c000000006b49e010ccf684f906c06643c7d3043465fffbc7755968fdc38455f4d014ca25e5c4a8fa72f1eed17c8722bb77684c64b777b65694729e4685f6373b0038b6e8f77b4308",
+        "hash": "10f921cf76af0fb43044379e3a05979551332aa28521816de636adaa11e30690",
+        "value": {
+          "accepted_until": "1800003600",
+          "manifest_sequence": "1",
+          "participant_identity": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+          "proposal_hash": "dbcc54612788464f2545735b98bf33156dab91670041712a6daee0a4dbbf5ec8",
+          "route_id": "8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a",
+          "signature": "ccf684f906c06643c7d3043465fffbc7755968fdc38455f4d014ca25e5c4a8fa72f1eed17c8722bb77684c64b777b65694729e4685f6373b0038b6e8f77b4308",
+          "type": "RouteAcceptance",
+          "version": 1
+        }
+      },
+      {
+        "binary": "00000001038b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a0000000000000001dbcc54612788464f2545735b98bf33156dab91670041712a6daee0a4dbbf5ec81398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca000000006b49e0105c84c7548691fcaa53c287ed09a45336c79556db05222b185c4ea13ebcbf3abaa81fcdd8f2656a4e633a80db629761f22a0d1056b67afb5a01a796c209b9ba0c",
+        "hash": "640f74ec6c5bf11359814b1f6b321a5af34074a74832ff3a8a79dfa4c7284e07",
+        "value": {
+          "accepted_until": "1800003600",
+          "manifest_sequence": "1",
+          "participant_identity": "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca",
+          "proposal_hash": "dbcc54612788464f2545735b98bf33156dab91670041712a6daee0a4dbbf5ec8",
+          "route_id": "8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a",
+          "signature": "5c84c7548691fcaa53c287ed09a45336c79556db05222b185c4ea13ebcbf3abaa81fcdd8f2656a4e633a80db629761f22a0d1056b67afb5a01a796c209b9ba0c",
+          "type": "RouteAcceptance",
+          "version": 1
+        }
+      }
+    ],
+    "manifest": {
+      "binary": "00000001048b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a0000000000000001dbcc54612788464f2545735b98bf33156dab91670041712a6daee0a4dbbf5ec8000000006b49d1c4000000006b49e0100000000000bebc20000200ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22cea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c1111111111111111111111111111111111111111111111111111111111111111011398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca121212121212121212121212121212121212121212121212121212121212121290c5f54ab9922f2d24181f80c211595dab43a0e93d3e67bb5c7f7b56b185535049fe5aebd927581290f43f6b95e924e695942e0417f8dcf9fe02c4dc592da508000200000001038b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a0000000000000001dbcc54612788464f2545735b98bf33156dab91670041712a6daee0a4dbbf5ec8ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c000000006b49e010ccf684f906c06643c7d3043465fffbc7755968fdc38455f4d014ca25e5c4a8fa72f1eed17c8722bb77684c64b777b65694729e4685f6373b0038b6e8f77b430800000001038b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a0000000000000001dbcc54612788464f2545735b98bf33156dab91670041712a6daee0a4dbbf5ec81398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca000000006b49e0105c84c7548691fcaa53c287ed09a45336c79556db05222b185c4ea13ebcbf3abaa81fcdd8f2656a4e633a80db629761f22a0d1056b67afb5a01a796c209b9ba0cea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22cc8d61d90aeb16a7635396ae44d35e9d623082abc83a3fd506e180a323b04180521dbb45e5e4acd69cab3d96a764aef553da08984ebb149329ab4c5a65eb35f06",
+      "hash": "3e7fd62a89509cb96ba153ca05f6f79d09d8ac12be434f48d8e2fea39b8bc888",
+      "value": {
+        "acceptances": [
+          {
+            "accepted_until": "1800003600",
+            "manifest_sequence": "1",
+            "participant_identity": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+            "proposal_hash": "dbcc54612788464f2545735b98bf33156dab91670041712a6daee0a4dbbf5ec8",
+            "route_id": "8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a",
+            "signature": "ccf684f906c06643c7d3043465fffbc7755968fdc38455f4d014ca25e5c4a8fa72f1eed17c8722bb77684c64b777b65694729e4685f6373b0038b6e8f77b4308",
+            "type": "RouteAcceptance",
+            "version": 1
+          },
+          {
+            "accepted_until": "1800003600",
+            "manifest_sequence": "1",
+            "participant_identity": "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca",
+            "proposal_hash": "dbcc54612788464f2545735b98bf33156dab91670041712a6daee0a4dbbf5ec8",
+            "route_id": "8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a",
+            "signature": "5c84c7548691fcaa53c287ed09a45336c79556db05222b185c4ea13ebcbf3abaa81fcdd8f2656a4e633a80db629761f22a0d1056b67afb5a01a796c209b9ba0c",
+            "type": "RouteAcceptance",
+            "version": 1
+          }
+        ],
+        "fee_per_hop": "12500000",
+        "manifest_sequence": "1",
+        "ordered_hops": [
+          {
+            "identity_public_key": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+            "onion_address": "5jfgyy7ctrjavpxvkb5rglwf7gkuo5vox27hxescd3vgsfcg2iwfmxqd.onion",
+            "onion_public_key": "1111111111111111111111111111111111111111111111111111111111111111",
+            "role": "Swap"
+          },
+          {
+            "identity_public_key": "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca",
+            "onion_address": "compmldndjcxyun2njfv6pn5f5u7zkjscyqy3sezpzawxul5spfd5iad.onion",
+            "onion_public_key": "1212121212121212121212121212121212121212121212121212121212121212",
+            "role": "Mixer"
+          }
+        ],
+        "proposal_hash": "dbcc54612788464f2545735b98bf33156dab91670041712a6daee0a4dbbf5ec8",
+        "proposer_signature": "90c5f54ab9922f2d24181f80c211595dab43a0e93d3e67bb5c7f7b56b185535049fe5aebd927581290f43f6b95e924e695942e0417f8dcf9fe02c4dc592da508",
+        "route_id": "8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a",
+        "signature": "c8d61d90aeb16a7635396ae44d35e9d623082abc83a3fd506e180a323b04180521dbb45e5e4acd69cab3d96a764aef553da08984ebb149329ab4c5a65eb35f06",
+        "swap_identity": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+        "type": "RouteManifest",
+        "valid_from": "1799999940",
+        "valid_until": "1800003600",
+        "version": 1
+      }
+    },
+    "proposal": {
+      "binary": "00000001028b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a0000000000000001000000006b49d1c4000000006b49e0100000000000bebc20000200ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22cea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c1111111111111111111111111111111111111111111111111111111111111111011398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca121212121212121212121212121212121212121212121212121212121212121290c5f54ab9922f2d24181f80c211595dab43a0e93d3e67bb5c7f7b56b185535049fe5aebd927581290f43f6b95e924e695942e0417f8dcf9fe02c4dc592da508",
+      "hash": "dbcc54612788464f2545735b98bf33156dab91670041712a6daee0a4dbbf5ec8",
+      "value": {
+        "fee_per_hop": "12500000",
+        "manifest_sequence": "1",
+        "ordered_hops": [
+          {
+            "identity_public_key": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+            "onion_address": "5jfgyy7ctrjavpxvkb5rglwf7gkuo5vox27hxescd3vgsfcg2iwfmxqd.onion",
+            "onion_public_key": "1111111111111111111111111111111111111111111111111111111111111111",
+            "role": "Swap"
+          },
+          {
+            "identity_public_key": "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca",
+            "onion_address": "compmldndjcxyun2njfv6pn5f5u7zkjscyqy3sezpzawxul5spfd5iad.onion",
+            "onion_public_key": "1212121212121212121212121212121212121212121212121212121212121212",
+            "role": "Mixer"
+          }
+        ],
+        "proposer_signature": "90c5f54ab9922f2d24181f80c211595dab43a0e93d3e67bb5c7f7b56b185535049fe5aebd927581290f43f6b95e924e695942e0417f8dcf9fe02c4dc592da508",
+        "route_id": "8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a",
+        "type": "RouteProposal",
+        "valid_from": "1799999940",
+        "valid_until": "1800003600",
+        "version": 1
+      }
+    },
+    "route_id": "8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a"
+  },
+  "health": {
+    "attestations": [
+      {
+        "binary": "000000010a8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a0000000000000001e664c3a5769226d875fc3a5a6b63e1da0728b63bff31ab61cedd6cd94549b2b57e2363ba0e543983cb9782ed29ff7c88cb63b41614f58eea4c0fbc34215c9bd8011398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca000000006b49d20000d7d3a7812bc7133b4a5007b798f1097d20b3a01975bcff66f009f2fb0dc61efe36ea80f05e94eb12e260203f8fa9a234927411fdefb8c617958fcd9faab3fb06",
+        "hash": "09e76737ad5a4f9b1ef7bf1ca5b31f079b9a325bb630e2e7cfb0805fb0c341cf",
+        "value": {
+          "challenge_hash": "e664c3a5769226d875fc3a5a6b63e1da0728b63bff31ab61cedd6cd94549b2b5",
+          "hop_nonce_hash": "7e2363ba0e543983cb9782ed29ff7c88cb63b41614f58eea4c0fbc34215c9bd8",
+          "hop_position": 1,
+          "manifest_sequence": "1",
+          "next_attestation_hash": null,
+          "observed_at": "1800000000",
+          "participant_identity": "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca",
+          "route_id": "8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a",
+          "signature": "d7d3a7812bc7133b4a5007b798f1097d20b3a01975bcff66f009f2fb0dc61efe36ea80f05e94eb12e260203f8fa9a234927411fdefb8c617958fcd9faab3fb06",
+          "type": "HealthAttestation",
+          "version": 1
+        }
+      }
+    ],
+    "certificate": {
+      "binary": "000000010b8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a0000000000000001e664c3a5769226d875fc3a5a6b63e1da0728b63bff31ab61cedd6cd94549b2b509e76737ad5a4f9b1ef7bf1ca5b31f079b9a325bb630e2e7cfb0805fb0c341cf000000006b49d200000000006b49d458ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22cf1d6ab818b8bbf6d053b86c74b02420e52144aef66eb62d672d397f64cc03085df13e7eecb3ee5e71fcc89bca61ed627c0de079c6f8e64e19d3ddea8fdcbdf0d",
+      "hash": "293db0858db6b1d53b46e9f6412b922169cd12efa49b497a43d166f2a7b98155",
+      "value": {
+        "attestation_root": "09e76737ad5a4f9b1ef7bf1ca5b31f079b9a325bb630e2e7cfb0805fb0c341cf",
+        "challenge_hash": "e664c3a5769226d875fc3a5a6b63e1da0728b63bff31ab61cedd6cd94549b2b5",
+        "expires_at": "1800000600",
+        "manifest_sequence": "1",
+        "route_id": "8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a",
+        "signature": "f1d6ab818b8bbf6d053b86c74b02420e52144aef66eb62d672d397f64cc03085df13e7eecb3ee5e71fcc89bca61ed627c0de079c6f8e64e19d3ddea8fdcbdf0d",
+        "swap_identity": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+        "type": "RouteHealthCertificate",
+        "verified_at": "1800000000",
+        "version": 1
+      }
+    },
+    "challenge": {
+      "binary": "00000001088b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a00000000000000011f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f000000006b49d1c4000000006b49d2f09225793ded8b80baed544c3db3c491ec39fe28b486a2c33be949975e41a190927c82cdf39ef39abf8807e62acaa21ca316ca3d3f4197fd7e8b925741dfcb3109",
+      "hash": "e664c3a5769226d875fc3a5a6b63e1da0728b63bff31ab61cedd6cd94549b2b5",
+      "value": {
+        "created_at": "1799999940",
+        "expires_at": "1800000240",
+        "manifest_sequence": "1",
+        "nonce": "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f",
+        "route_id": "8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a",
+        "signature": "9225793ded8b80baed544c3db3c491ec39fe28b486a2c33be949975e41a190927c82cdf39ef39abf8807e62acaa21ca316ca3d3f4197fd7e8b925741dfcb3109",
+        "type": "HealthChallenge",
+        "version": 1
+      }
+    },
+    "proof": {
+      "binary": "000000011600000001088b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a00000000000000011f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f000000006b49d1c4000000006b49d2f09225793ded8b80baed544c3db3c491ec39fe28b486a2c33be949975e41a190927c82cdf39ef39abf8807e62acaa21ca316ca3d3f4197fd7e8b925741dfcb31090001202020202020202020202020202020202020202020202020202020202020202000000001158b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a0000000000000001e664c3a5769226d875fc3a5a6b63e1da0728b63bff31ab61cedd6cd94549b2b50001000000010a8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a0000000000000001e664c3a5769226d875fc3a5a6b63e1da0728b63bff31ab61cedd6cd94549b2b57e2363ba0e543983cb9782ed29ff7c88cb63b41614f58eea4c0fbc34215c9bd8011398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca000000006b49d20000d7d3a7812bc7133b4a5007b798f1097d20b3a01975bcff66f009f2fb0dc61efe36ea80f05e94eb12e260203f8fa9a234927411fdefb8c617958fcd9faab3fb06000000010b8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a0000000000000001e664c3a5769226d875fc3a5a6b63e1da0728b63bff31ab61cedd6cd94549b2b509e76737ad5a4f9b1ef7bf1ca5b31f079b9a325bb630e2e7cfb0805fb0c341cf000000006b49d200000000006b49d458ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22cf1d6ab818b8bbf6d053b86c74b02420e52144aef66eb62d672d397f64cc03085df13e7eecb3ee5e71fcc89bca61ed627c0de079c6f8e64e19d3ddea8fdcbdf0d",
+      "value": {
+        "certificate": {
+          "attestation_root": "09e76737ad5a4f9b1ef7bf1ca5b31f079b9a325bb630e2e7cfb0805fb0c341cf",
+          "challenge_hash": "e664c3a5769226d875fc3a5a6b63e1da0728b63bff31ab61cedd6cd94549b2b5",
+          "expires_at": "1800000600",
+          "manifest_sequence": "1",
+          "route_id": "8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a",
+          "signature": "f1d6ab818b8bbf6d053b86c74b02420e52144aef66eb62d672d397f64cc03085df13e7eecb3ee5e71fcc89bca61ed627c0de079c6f8e64e19d3ddea8fdcbdf0d",
+          "swap_identity": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+          "type": "RouteHealthCertificate",
+          "verified_at": "1800000000",
+          "version": 1
+        },
+        "challenge": {
+          "created_at": "1799999940",
+          "expires_at": "1800000240",
+          "manifest_sequence": "1",
+          "nonce": "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f",
+          "route_id": "8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a",
+          "signature": "9225793ded8b80baed544c3db3c491ec39fe28b486a2c33be949975e41a190927c82cdf39ef39abf8807e62acaa21ca316ca3d3f4197fd7e8b925741dfcb3109",
+          "type": "HealthChallenge",
+          "version": 1
+        },
+        "hop_nonces": [
+          "2020202020202020202020202020202020202020202020202020202020202020"
+        ],
+        "response": {
+          "attestations": [
+            {
+              "challenge_hash": "e664c3a5769226d875fc3a5a6b63e1da0728b63bff31ab61cedd6cd94549b2b5",
+              "hop_nonce_hash": "7e2363ba0e543983cb9782ed29ff7c88cb63b41614f58eea4c0fbc34215c9bd8",
+              "hop_position": 1,
+              "manifest_sequence": "1",
+              "next_attestation_hash": null,
+              "observed_at": "1800000000",
+              "participant_identity": "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca",
+              "route_id": "8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a",
+              "signature": "d7d3a7812bc7133b4a5007b798f1097d20b3a01975bcff66f009f2fb0dc61efe36ea80f05e94eb12e260203f8fa9a234927411fdefb8c617958fcd9faab3fb06",
+              "type": "HealthAttestation",
+              "version": 1
+            }
+          ],
+          "challenge_hash": "e664c3a5769226d875fc3a5a6b63e1da0728b63bff31ab61cedd6cd94549b2b5",
+          "manifest_sequence": "1",
+          "route_id": "8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a",
+          "type": "HealthResponse",
+          "version": 1
+        },
+        "type": "RouteHealthProof",
+        "version": 1
+      }
+    },
+    "response": {
+      "binary": "00000001158b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a0000000000000001e664c3a5769226d875fc3a5a6b63e1da0728b63bff31ab61cedd6cd94549b2b50001000000010a8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a0000000000000001e664c3a5769226d875fc3a5a6b63e1da0728b63bff31ab61cedd6cd94549b2b57e2363ba0e543983cb9782ed29ff7c88cb63b41614f58eea4c0fbc34215c9bd8011398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca000000006b49d20000d7d3a7812bc7133b4a5007b798f1097d20b3a01975bcff66f009f2fb0dc61efe36ea80f05e94eb12e260203f8fa9a234927411fdefb8c617958fcd9faab3fb06",
+      "value": {
+        "attestations": [
+          {
+            "challenge_hash": "e664c3a5769226d875fc3a5a6b63e1da0728b63bff31ab61cedd6cd94549b2b5",
+            "hop_nonce_hash": "7e2363ba0e543983cb9782ed29ff7c88cb63b41614f58eea4c0fbc34215c9bd8",
+            "hop_position": 1,
+            "manifest_sequence": "1",
+            "next_attestation_hash": null,
+            "observed_at": "1800000000",
+            "participant_identity": "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca",
+            "route_id": "8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a",
+            "signature": "d7d3a7812bc7133b4a5007b798f1097d20b3a01975bcff66f009f2fb0dc61efe36ea80f05e94eb12e260203f8fa9a234927411fdefb8c617958fcd9faab3fb06",
+            "type": "HealthAttestation",
+            "version": 1
+          }
+        ],
+        "challenge_hash": "e664c3a5769226d875fc3a5a6b63e1da0728b63bff31ab61cedd6cd94549b2b5",
+        "manifest_sequence": "1",
+        "route_id": "8b6397eebb9273931835b624ef392c169d3e1ab6af62eafdf049f44ca707d86a",
+        "type": "HealthResponse",
+        "version": 1
+      }
+    }
+  }
+}

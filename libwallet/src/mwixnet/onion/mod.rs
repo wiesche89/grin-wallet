@@ -35,7 +35,7 @@ use crypto::secp::random_secret;
 use onion::{new_stream_cipher, Onion, OnionError, Payload, RawBytes};
 
 /// Maximum number of servers in an mwixnet route.
-pub const MAX_MWIXNET_HOPS: usize = 16;
+pub const MAX_MWIXNET_HOPS: usize = mwixnet_protocol::MAX_ROUTE_HOPS;
 
 /// Onion hop struct
 #[derive(Clone)]

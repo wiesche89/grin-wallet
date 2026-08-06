@@ -19,12 +19,11 @@ use uuid::Uuid;
 
 use crate::api_impl::foreign::finalize_tx as foreign_finalize;
 use crate::grin_core::core::hash::Hashed;
-use crate::grin_core::core::{FeeFields, Output, OutputFeatures, Transaction};
-use crate::grin_core::libtx::proof;
+use crate::grin_core::core::{FeeFields, KernelFeatures, Output, OutputFeatures, Transaction};
+use crate::grin_core::libtx::{build, proof, tx_fee};
 use crate::grin_keychain::ViewKey;
 use crate::grin_util::secp::{key::SecretKey, pedersen::Commitment};
-use crate::grin_util::Mutex;
-use crate::grin_util::ToHex;
+use crate::grin_util::{from_hex, Mutex, ToHex};
 use crate::util::OnionV3Address;
 
 use crate::api_impl::owner_updater::StatusMessage;
@@ -35,8 +34,9 @@ use crate::types::{AcctPathMapping, NodeClient, OutputData, OutputStatus, TxLogE
 use crate::{
 	address,
 	mwixnet::{
-		create_onion, ComSignature, Hop, MixnetReqCreationParams, MwixnetReqCreationResult,
-		SwapReq, MAX_MWIXNET_HOPS,
+		create_onion, CancelSwapReq, ComSignature, Hop, MixnetReqCreationParams,
+		MwixnetReqCreationResult, MwixnetRouteReqCreationResult, RouteSwapReq, SwapReq,
+		VerifiedMwixnetRoute, WalletMwixnetRequest, WalletMwixnetRequestStatus, MAX_MWIXNET_HOPS,
 	},
 	wallet_lock, BuiltOutput, Error, InitTxArgs, IssueInvoiceTxArgs, NodeHeightResult,
 	OutputCommitMapping, PaymentProof, RetrieveTxQueryArgs, ScannedBlockInfo, Slatepack,
@@ -60,6 +60,79 @@ where
 	K: Keychain,
 {
 	keys::accounts(w)
+}
+
+/// Create and persist a byte-stable cancellation request before it is sent.
+pub fn create_mwixnet_cancel_req<C, K>(
+	w: &mut WalletBackend<C, K>,
+	keychain_mask: Option<&SecretKey>,
+	wallet_request_id: mwixnet_protocol::Hash,
+	use_test_rng: bool,
+) -> Result<CancelSwapReq, Error>
+where
+	C: NodeClient,
+	K: Keychain,
+{
+	let mut wallet_request = w
+		.mwixnet_requests()?
+		.into_iter()
+		.find(|request| request.request.wallet_request_id == wallet_request_id)
+		.ok_or_else(|| Error::GenericError("MWixnet request not found".into()))?;
+	if let Some(request) = wallet_request.cancel_request.clone() {
+		return Ok(request);
+	}
+	if wallet_request.status != WalletMwixnetRequestStatus::Accepted {
+		return Err(Error::GenericError(
+			"only an accepted MWixnet request can be cancelled".into(),
+		));
+	}
+
+	let output = updater::retrieve_outputs(w, keychain_mask, true, None, None)?
+		.into_iter()
+		.find(|output| output.commit == wallet_request.request.onion.commit)
+		.map(|output| output.output)
+		.ok_or_else(|| Error::GenericError("MWixnet input output not found".into()))?;
+	let keychain = w.keychain(keychain_mask)?;
+	let input_blind =
+		keychain.derive_key(output.value, &output.key_id, SwitchCommitmentType::Regular)?;
+	let created_at = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map_err(|error| Error::GenericError(error.to_string()))?
+		.as_secs();
+	let route_id = wallet_request.request.route_id;
+	let manifest_sequence = wallet_request.request.manifest_sequence;
+	let swap_req_hash = wallet_request.request.hash();
+	let input_commitment = wallet_request.request.onion.commit;
+	let request_hash = CancelSwapReq::signing_hash(
+		&route_id,
+		manifest_sequence,
+		&wallet_request_id,
+		&swap_req_hash,
+		&input_commitment,
+		created_at,
+	);
+	let request = CancelSwapReq {
+		version: mwixnet_protocol::MWIXNET_PROTOCOL_VERSION,
+		msg_type: mwixnet_protocol::MwixnetType::CancelSwapReq,
+		route_id,
+		manifest_sequence,
+		wallet_request_id,
+		swap_req_hash,
+		input_commitment,
+		created_at,
+		comsig: ComSignature::sign(
+			output.value,
+			&input_blind,
+			&request_hash.0.to_vec(),
+			use_test_rng,
+		)
+		.map_err(|error| Error::Signature(error.to_string()))?,
+	};
+	wallet_request.cancel_request = Some(request.clone());
+	let mut batch = w.batch_no_mask()?;
+	batch.save_mwixnet_request(&wallet_request)?;
+	batch.commit()?;
+	Ok(request)
 }
 
 /// new account path
@@ -1170,7 +1243,210 @@ where
 		}
 	}
 
+	{
+		wallet_lock!(wallet_inst, w);
+		update_mwixnet_recovery(w, keychain_mask, tip.0)?;
+	}
+
 	Ok(result)
+}
+
+/// Reconcile MWixnet requests with the chain and retry persisted reclaim transactions.
+pub fn update_mwixnet_recovery<C, K>(
+	w: &mut WalletBackend<C, K>,
+	keychain_mask: Option<&SecretKey>,
+	chain_height: u64,
+) -> Result<(), Error>
+where
+	C: NodeClient,
+	K: Keychain,
+{
+	let mut client = w.w2n_client().clone();
+	let outputs = updater::retrieve_outputs(w, keychain_mask, true, None, None)?;
+	let mut requests = w.mwixnet_requests()?;
+	for request in &mut requests {
+		let mwixnet_confirmed = if let Some(kernel) = &request.kernel_excess {
+			let bytes = match from_hex(kernel) {
+				Ok(bytes) => bytes,
+				Err(error) => {
+					warn!("Ignoring invalid MWixnet kernel excess: {}", error);
+					continue;
+				}
+			};
+			if bytes.len() != 33 {
+				warn!("Ignoring invalid MWixnet kernel excess length");
+				continue;
+			}
+			let kernel = Commitment::from_vec(bytes);
+			if let Some((_, height, _)) = client.get_kernel(&kernel, None, Some(chain_height))? {
+				chain_height.saturating_sub(height) + 1 >= request.confirmation_depth
+			} else {
+				false
+			}
+		} else {
+			false
+		};
+
+		let reclaim_confirmed = if let Some(reclaim) = &request.reclaim_tx {
+			let kernel = reclaim.kernels().first().unwrap().excess;
+			if let Some((_, height, _)) = client.get_kernel(&kernel, None, Some(chain_height))? {
+				chain_height.saturating_sub(height) + 1 >= request.confirmation_depth
+			} else {
+				false
+			}
+		} else {
+			false
+		};
+
+		if mwixnet_confirmed || reclaim_confirmed {
+			request.status = if mwixnet_confirmed {
+				WalletMwixnetRequestStatus::Confirmed
+			} else {
+				WalletMwixnetRequestStatus::ReclaimConfirmed
+			};
+			request.conflict_observed_height = None;
+			let mut batch = w.batch_no_mask()?;
+			batch.save_mwixnet_request(request)?;
+			batch.commit()?;
+			continue;
+		}
+
+		request.status = match request.status {
+			WalletMwixnetRequestStatus::Confirmed => WalletMwixnetRequestStatus::Posted,
+			WalletMwixnetRequestStatus::ReclaimConfirmed => {
+				WalletMwixnetRequestStatus::ReclaimPending
+			}
+			WalletMwixnetRequestStatus::ConflictConfirmed => {
+				WalletMwixnetRequestStatus::ConflictObserved
+			}
+			status => status,
+		};
+
+		let input = outputs
+			.iter()
+			.find(|output| output.commit == request.request.onion.commit)
+			.map(|output| output.output.clone());
+		if input
+			.as_ref()
+			.map(|output| output.status == OutputStatus::Spent)
+			.unwrap_or(false)
+		{
+			let observed = *request.conflict_observed_height.get_or_insert(chain_height);
+			request.status =
+				if chain_height.saturating_sub(observed) + 1 >= request.confirmation_depth {
+					WalletMwixnetRequestStatus::ConflictConfirmed
+				} else {
+					WalletMwixnetRequestStatus::ConflictObserved
+				};
+			let mut batch = w.batch_no_mask()?;
+			batch.save_mwixnet_request(request)?;
+			batch.commit()?;
+			continue;
+		}
+		if request.conflict_observed_height.take().is_some()
+			&& request.status == WalletMwixnetRequestStatus::ConflictObserved
+		{
+			request.status = if request.reclaim_tx.is_some() {
+				WalletMwixnetRequestStatus::ReclaimPending
+			} else {
+				WalletMwixnetRequestStatus::Accepted
+			};
+		}
+
+		let recovery_due = chain_height >= request.request.expires_at_height
+			|| request.cancel_ack.is_some()
+			|| matches!(
+				request.status,
+				WalletMwixnetRequestStatus::Rejected
+					| WalletMwixnetRequestStatus::Expired
+					| WalletMwixnetRequestStatus::Cancelled
+			);
+		if !recovery_due {
+			continue;
+		}
+
+		if request.reclaim_tx.is_none() {
+			let Some(input) = input else {
+				warn!(
+					"Unable to recover MWixnet request {:?}: input not found",
+					request.request.wallet_request_id
+				);
+				continue;
+			};
+			let parent_key_id = input.root_key_id.clone();
+			let minimum_fee = tx_fee(1, 1, 1);
+			let fee = minimum_fee.saturating_mul(2).min(request.reclaim_max_fee);
+			if fee < minimum_fee {
+				warn!(
+					"Unable to recover MWixnet request {:?}: wallet maximum is below the reclaim fee",
+					request.request.wallet_request_id
+				);
+				continue;
+			}
+			let Some(amount) = input.value.checked_sub(fee) else {
+				warn!(
+					"Unable to recover MWixnet request {:?}: reclaim fee exceeds input value",
+					request.request.wallet_request_id
+				);
+				continue;
+			};
+			let output_key = w.next_child_for(keychain_mask, &parent_key_id)?;
+			let keychain = w.keychain(keychain_mask)?;
+			let proof_builder = proof::ProofBuilder::new(&keychain);
+			let input_part = if input.is_coinbase {
+				build::coinbase_input(input.value, input.key_id.clone())
+			} else {
+				build::input(input.value, input.key_id.clone())
+			};
+			let reclaim = build::transaction(
+				KernelFeatures::Plain {
+					fee: FeeFields::try_from(fee).map_err(|error| Error::Fee(error.to_string()))?,
+				},
+				&[input_part, build::output(amount, output_key.clone())],
+				&keychain,
+				&proof_builder,
+			)?;
+			let output_commit = reclaim.outputs()[0].commitment();
+			let tx_id = {
+				let mut batch = w.batch(keychain_mask)?;
+				let tx_id = batch.next_tx_log_id(&parent_key_id)?;
+				let mut tx = TxLogEntry::new(parent_key_id.clone(), TxLogEntryType::TxSent, tx_id);
+				tx.amount_debited = input.value;
+				tx.amount_credited = amount;
+				tx.num_inputs = 1;
+				tx.num_outputs = 1;
+				tx.fee =
+					Some(FeeFields::try_from(fee).map_err(|error| Error::Fee(error.to_string()))?);
+				tx.kernel_excess = Some(reclaim.kernels()[0].excess);
+				tx.kernel_lookup_min_height = Some(chain_height);
+				batch.save(OutputData {
+					root_key_id: parent_key_id.clone(),
+					key_id: output_key.clone(),
+					n_child: output_key.to_path().last_path_index(),
+					commit: Some(output_commit.to_hex()),
+					mmr_index: None,
+					value: amount,
+					status: OutputStatus::Unconfirmed,
+					height: chain_height,
+					lock_height: 0,
+					is_coinbase: false,
+					tx_log_entry: Some(tx_id),
+				})?;
+				batch.save_tx_log_entry(tx, &parent_key_id)?;
+				request.reclaim_tx = Some(reclaim.clone());
+				request.reclaim_tx_id = Some(tx_id);
+				request.status = WalletMwixnetRequestStatus::ReclaimPending;
+				batch.save_mwixnet_request(request)?;
+				batch.commit()?;
+				tx_id
+			};
+			request.reclaim_tx_id = Some(tx_id);
+		}
+		if let Some(reclaim) = &request.reclaim_tx {
+			let _ = client.post_tx(reclaim, false);
+		}
+	}
+	Ok(())
 }
 
 /// Check TTL
@@ -1505,7 +1781,202 @@ where
 	}
 
 	Ok(MwixnetReqCreationResult {
-		request: SwapReq { comsig, onion },
+		request: SwapReq::Legacy(crate::mwixnet::LegacySwapReq { comsig, onion }),
 		tx_id,
+	})
+}
+
+/// Create and atomically persist a route-bound MWixnet request.
+#[allow(clippy::too_many_arguments)]
+pub fn create_mwixnet_route_req<C, K>(
+	w: &mut WalletBackend<C, K>,
+	keychain_mask: Option<&SecretKey>,
+	commitment: &Commitment,
+	route: &VerifiedMwixnetRoute,
+	request_ttl_blocks: Option<u16>,
+	max_total_fee: Option<u64>,
+	configured_request_ttl_blocks: u16,
+	configured_max_total_fee: u64,
+	confirmation_depth: u64,
+	use_test_rng: bool,
+) -> Result<MwixnetRouteReqCreationResult, Error>
+where
+	C: NodeClient,
+	K: Keychain,
+{
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map_err(|error| Error::GenericError(error.to_string()))?
+		.as_secs();
+	route.validate(now).map_err(Error::GenericError)?;
+	if !route.wallet_route().usable {
+		return Err(Error::GenericError(
+			"MWixnet route is not accepting requests".into(),
+		));
+	}
+	let hop_count = route.manifest.ordered_hops.len();
+	let total_fee = route
+		.manifest
+		.fee_per_hop
+		.checked_mul(hop_count as u64)
+		.ok_or_else(|| Error::Fee("mwixnet fee overflow".into()))?;
+	let maximum = max_total_fee.unwrap_or(configured_max_total_fee);
+	if total_fee > maximum {
+		return Err(Error::Fee(format!(
+			"mwixnet total fee {} exceeds wallet maximum {}",
+			total_fee, maximum
+		)));
+	}
+	let ttl = request_ttl_blocks
+		.unwrap_or(configured_request_ttl_blocks)
+		.min(route.swap_offer.max_request_ttl_blocks);
+	if !(mwixnet_protocol::MIN_REQUEST_TTL_BLOCKS..=mwixnet_protocol::MAX_REQUEST_TTL_BLOCKS)
+		.contains(&ttl)
+	{
+		return Err(Error::GenericError("invalid MWixnet request TTL".into()));
+	}
+
+	let parent_key_id = w.parent_key_id();
+	let keychain = w.keychain(keychain_mask)?;
+	let outputs = updater::retrieve_outputs(w, keychain_mask, true, None, Some(&parent_key_id))?;
+	let output = outputs
+		.into_iter()
+		.find(|output| output.commit == *commitment)
+		.map(|output| output.output)
+		.ok_or_else(|| Error::GenericError("output not found".into()))?;
+	let current_height = w.w2n_client().get_chain_tip()?.0;
+	if !output.eligible_to_spend(current_height, confirmation_depth) {
+		return Err(Error::GenericError("output is not spendable".into()));
+	}
+	let expires_at_height = current_height
+		.checked_add(ttl as u64)
+		.ok_or_else(|| Error::GenericError("MWixnet request height overflow".into()))?;
+	let amount = output.value;
+	let input_blind = keychain.derive_key(amount, &output.key_id, SwitchCommitmentType::Regular)?;
+	let fee = FeeFields::try_from(route.manifest.fee_per_hop)
+		.map_err(|error| Error::Fee(error.to_string()))?;
+	let total_fee_fields = FeeFields::try_from(total_fee)
+		.map_err(|_| Error::Fee("mwixnet total fee exceeds FeeFields limit".into()))?;
+	if total_fee >= amount {
+		return Err(Error::Fee(
+			"mwixnet fees reach or exceed output value".into(),
+		));
+	}
+	let new_amount = amount
+		.checked_sub(total_fee)
+		.ok_or_else(|| Error::Fee("mwixnet fees exceed output value".into()))?;
+	let new_output = build_output(w, keychain_mask, OutputFeatures::Plain, new_amount)?;
+	let secp = keychain.secp();
+	let mut blind_sum = new_output
+		.blind
+		.split(&BlindingFactor::from_secret_key(input_blind.clone()), secp)?;
+	let server_keys = route
+		.manifest
+		.ordered_hops
+		.iter()
+		.map(|hop| xPublicKey::from(hop.onion_public_key.0))
+		.collect::<Vec<_>>();
+	let hops = server_keys
+		.iter()
+		.enumerate()
+		.map(|(position, server_pubkey)| -> Result<Hop, Error> {
+			if position + 1 == server_keys.len() {
+				Ok(Hop {
+					server_pubkey: *server_pubkey,
+					excess: blind_sum.secret_key(secp)?,
+					fee,
+					rangeproof: Some(new_output.output.proof),
+				})
+			} else {
+				let excess = if use_test_rng {
+					BlindingFactor::zero()
+				} else {
+					BlindingFactor::rand(secp)
+				};
+				blind_sum = blind_sum.split(&excess, secp)?;
+				Ok(Hop {
+					server_pubkey: *server_pubkey,
+					excess: excess.secret_key(secp)?,
+					fee,
+					rangeproof: None,
+				})
+			}
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	let onion = create_onion(commitment, &hops, use_test_rng)
+		.map_err(|error| Error::GenericError(error.to_string()))?;
+	let wallet_request_id = if use_test_rng {
+		mwixnet_protocol::Hash([7; 32])
+	} else {
+		mwixnet_protocol::Hash(rand::random())
+	};
+	let onion_hash = RouteSwapReq::onion_hash(&onion);
+	let request_hash = RouteSwapReq::signing_hash(
+		&wallet_request_id,
+		&route.manifest.route_id,
+		route.manifest.manifest_sequence,
+		expires_at_height,
+		&onion_hash,
+	);
+	let request = RouteSwapReq {
+		version: mwixnet_protocol::MWIXNET_PROTOCOL_VERSION,
+		msg_type: mwixnet_protocol::MwixnetType::SwapReq,
+		wallet_request_id,
+		route_id: route.manifest.route_id,
+		manifest_sequence: route.manifest.manifest_sequence,
+		expires_at_height,
+		onion,
+		onion_hash,
+		comsig: ComSignature::sign(amount, &input_blind, &request_hash.0.to_vec(), use_test_rng)
+			.map_err(|error| Error::Signature(error.to_string()))?,
+	};
+
+	let mut batch = w.batch(keychain_mask)?;
+	let tx_id = batch.next_tx_log_id(&parent_key_id)?;
+	let mut tx = TxLogEntry::new(parent_key_id.clone(), TxLogEntryType::TxSent, tx_id);
+	tx.amount_debited = amount;
+	tx.amount_credited = new_amount;
+	tx.num_inputs = 1;
+	tx.num_outputs = 1;
+	tx.fee = Some(total_fee_fields);
+	tx.kernel_lookup_min_height = Some(current_height);
+	let mut update_output = batch.get(&output.key_id, &None)?;
+	update_output.tx_log_entry = Some(tx_id);
+	batch.lock_output(&mut update_output)?;
+	batch.save(OutputData {
+		root_key_id: parent_key_id.clone(),
+		key_id: new_output.key_id.clone(),
+		n_child: new_output.key_id.to_path().last_path_index(),
+		commit: Some(new_output.output.commitment().to_hex()),
+		mmr_index: None,
+		value: new_amount,
+		status: OutputStatus::Unconfirmed,
+		height: current_height,
+		lock_height: 0,
+		is_coinbase: false,
+		tx_log_entry: Some(tx_id),
+	})?;
+	batch.save_tx_log_entry(tx, &parent_key_id)?;
+	batch.save_mwixnet_request(&WalletMwixnetRequest {
+		request: request.clone(),
+		tx_id: Some(tx_id),
+		input_commitment: commitment.to_hex(),
+		swap_onion_address: route.announcement.entry_onion,
+		status: WalletMwixnetRequestStatus::Accepted,
+		reclaim_max_fee: maximum,
+		confirmation_depth,
+		kernel_excess: None,
+		cancel_request: None,
+		cancel_ack: None,
+		reclaim_tx: None,
+		reclaim_tx_id: None,
+		conflict_observed_height: None,
+	})?;
+	batch.commit()?;
+
+	Ok(MwixnetRouteReqCreationResult {
+		request,
+		tx_id,
+		swap_onion_address: route.announcement.entry_onion,
 	})
 }

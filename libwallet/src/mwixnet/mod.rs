@@ -22,5 +22,8 @@ pub use onion::{
 };
 
 pub use types::{
-	Hop, MixnetReqCreationParams, MwixnetReqCreationResult, MwixnetServerPublicKey, SwapReq,
+	CancelAck, CancelStatus, CancelSwapReq, Hop, LegacySwapReq, MixnetReqCreationParams,
+	MwixnetReqCreationResult, MwixnetRouteReqCreationResult, MwixnetServerPublicKey, RouteSwapReq,
+	SwapReq, SwapSubmission, SwapSubmissionStatus, VerifiedMwixnetRoute, WalletMwixnetRequest,
+	WalletMwixnetRequestInfo, WalletMwixnetRequestStatus, WalletRoute,
 };

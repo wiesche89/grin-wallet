@@ -15,7 +15,7 @@
 use crate::tor::config::exp_sec_key_bytes;
 use arti_client::config::pt::TransportConfigBuilder;
 use arti_client::config::{BridgeConfigBuilder, TorClientConfigBuilder};
-use arti_client::{TorClient, TorClientConfig};
+use arti_client::{StreamPrefs, TorClient, TorClientConfig};
 use bytes::Bytes;
 use ed25519_dalek::hazmat::ExpandedSecretKey;
 use ed25519_dalek::Digest;
@@ -233,7 +233,7 @@ fn build_post_request(json: String, url: &Uri) -> Result<Request<Full<Bytes>>, E
 		.header("accept", "application/json")
 		.header("content-type", "application/json")
 		.body(Full::from(json))
-		.map_err(|e| Error::TorProcess(format!("{:?}", e)))
+		.map_err(|e| Error::TorProcess(format!("HTTP request build failed: {}", e)))
 }
 
 /// Make POST request.
@@ -243,6 +243,43 @@ where
 {
 	let json = serde_json::to_string(input)
 		.map_err(|_| Error::GenericError("Could not serialize data to JSON".to_owned()))?;
+	tor_post_json(tor_config, json, url, false)
+}
+
+/// Make an isolated POST request, retrying transport failures with a new circuit.
+pub fn tor_post_with_retries<IN>(
+	tor_config: &TorConfig,
+	input: &IN,
+	url: &str,
+) -> Result<String, Error>
+where
+	IN: Serialize,
+{
+	const ATTEMPTS: usize = 3;
+	let json = serde_json::to_string(input)
+		.map_err(|_| Error::GenericError("Could not serialize data to JSON".to_owned()))?;
+	for attempt in 1..=ATTEMPTS {
+		match tor_post_json(tor_config, json.clone(), url, true) {
+			Ok(response) => return Ok(response),
+			Err(Error::TorProcess(error)) if attempt < ATTEMPTS => {
+				warn!(
+					"Tor request attempt {}/{} failed: {}; retrying with a new circuit",
+					attempt, ATTEMPTS, error
+				);
+				thread::sleep(Duration::from_secs(2));
+			}
+			Err(error) => return Err(error),
+		}
+	}
+	unreachable!()
+}
+
+fn tor_post_json(
+	tor_config: &TorConfig,
+	json: String,
+	url: &str,
+	isolated: bool,
+) -> Result<String, Error> {
 	let url = url.to_string();
 	let url: Uri = url
 		.parse()
@@ -260,50 +297,92 @@ where
 	let res: Result<String, Error> = thread::spawn(move || {
 		let c = client.clone();
 		client.runtime().block_on(async move {
-			let res = c
+			let onion = host.ends_with(".onion");
+			let stream = c
 				.runtime()
 				.timeout(timeout, async {
-					let stream = c
-						.connect((host.clone(), port))
-						.await
-						.map_err(|e| Error::TorProcess(format!("{:?}", e)))?;
-					let (mut request_sender, connection) =
-						hyper::client::conn::http1::handshake(TokioIo::new(stream))
-							.await
-							.map_err(|e| Error::TorProcess(format!("{:?}", e)))?;
-
-					// Spawn a task to poll the connection and drive the HTTP state.
-					tokio::spawn(async move {
-						if let Err(e) = connection.await {
-							error!("Tor connection error: {}", e);
-						}
-					});
-
-					let resp = request_sender
-						.send_request(request)
-						.await
-						.map_err(|e| Error::TorProcess(format!("{:?}", e)))?;
-
-					let status = resp.status();
-					let body_resp = resp
-						.into_body()
-						.collect()
-						.await
-						.map_err(|e| Error::TorProcess(format!("{:?}", e)))?;
-					let body = body_resp.to_bytes().into();
-					let body_text = String::from_utf8(body)
-						.map_err(|e| Error::TorProcess(format!("{:?}", e)))?;
-					if !status.is_success() {
-						return Err(Error::TorProcess(format!(
-							"HTTP request failed with status {}: {}",
-							status, body_text
-						)));
+					if isolated {
+						let mut prefs = StreamPrefs::new();
+						prefs.new_isolation_group();
+						c.connect_with_prefs((host.clone(), port), &prefs).await
+					} else {
+						c.connect((host.clone(), port)).await
 					}
-					Ok(body_text)
 				})
 				.await;
+			let stream = match stream {
+				Ok(Ok(stream)) => stream,
+				Ok(Err(error)) if onion => {
+					return Err(Error::TorProcess(format!(
+						"Onion circuit failed for {}: {}",
+						host, error
+					)))
+				}
+				Ok(Err(error)) => {
+					return Err(Error::TorProcess(format!(
+						"Tor circuit failed for {}: {}",
+						host, error
+					)))
+				}
+				Err(_) if onion => {
+					return Err(Error::TorProcess(format!(
+						"Onion circuit timed out for {} after {} seconds",
+						host,
+						timeout.as_secs()
+					)))
+				}
+				Err(_) => {
+					return Err(Error::TorProcess(format!(
+						"Tor circuit timed out for {} after {} seconds",
+						host,
+						timeout.as_secs()
+					)))
+				}
+			};
+
+			let res =
+				c.runtime()
+					.timeout(timeout, async {
+						let (mut request_sender, connection) =
+							hyper::client::conn::http1::handshake(TokioIo::new(stream))
+								.await
+								.map_err(|e| {
+									Error::TorProcess(format!("HTTP handshake failed: {}", e))
+								})?;
+
+						// Spawn a task to poll the connection and drive the HTTP state.
+						tokio::spawn(async move {
+							if let Err(e) = connection.await {
+								error!("Tor connection error: {}", e);
+							}
+						});
+
+						let resp = request_sender.send_request(request).await.map_err(|e| {
+							Error::TorProcess(format!("HTTP request failed: {}", e))
+						})?;
+
+						let status = resp.status();
+						let body_resp = resp.into_body().collect().await.map_err(|e| {
+							Error::TorProcess(format!("HTTP response failed: {}", e))
+						})?;
+						let body = body_resp.to_bytes().into();
+						let body_text = String::from_utf8(body).map_err(|e| {
+							Error::TorProcess(format!("HTTP response is not UTF-8: {}", e))
+						})?;
+						if !status.is_success() {
+							return Err(Error::TorProcess(format!(
+								"HTTP status {}: {}",
+								status, body_text
+							)));
+						}
+						Ok(body_text)
+					})
+					.await;
 			match res {
-				Err(e) => Err(Error::TorProcess(format!("{:?}", e))),
+				Err(_) => Err(Error::TorProcess(format!(
+					"HTTP request timed out after {} seconds",
+					timeout.as_secs()
+				))),
 				Ok(body) => Ok(body),
 			}
 		})
@@ -405,7 +484,7 @@ fn launch_client(
 	let client = TorClient::with_runtime(r)
 		.config(client_config)
 		.create_unbootstrapped()
-		.map_err(|e| Error::TorProcess(format!("{:?}", e)))?;
+		.map_err(|e| Error::TorProcess(format!("Tor bootstrap initialization failed: {}", e)))?;
 	let c = client.clone();
 	let timeout = tor_config.bootstrap_timeout();
 	let res = client.runtime().block_on(async move {
@@ -430,10 +509,13 @@ fn launch_client(
 		};
 		match c.runtime().timeout(timeout, bootstrap()).await {
 			Ok(r) => match r {
-				Err(e) => Err(Error::TorProcess(format!("{:?}", e))),
+				Err(e) => Err(Error::TorProcess(format!("Tor bootstrap failed: {}", e))),
 				Ok(_) => Ok(c),
 			},
-			Err(e) => Err(Error::TorProcess(format!("{:?}", e))),
+			Err(_) => Err(Error::TorProcess(format!(
+				"Tor bootstrap timed out after {} seconds",
+				timeout.as_secs()
+			))),
 		}
 	});
 	res

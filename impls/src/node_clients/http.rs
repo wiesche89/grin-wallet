@@ -167,6 +167,15 @@ impl NodeClient for HTTPNodeClient {
 		Ok((result.height, result.last_block_pushed))
 	}
 
+	fn get_mwixnet_routes(
+		&self,
+		cursor: Option<libwallet::mwixnet_protocol::Hash>,
+		limit: u16,
+	) -> Result<libwallet::mwixnet_protocol::NodeRoutePage, libwallet::Error> {
+		let params = json!({ "cursor": cursor, "limit": limit });
+		self.send_json_request("get_mwixnet_routes", &params)
+	}
+
 	/// Get kernel implementation
 	fn get_kernel(
 		&mut self,

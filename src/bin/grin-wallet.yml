@@ -177,6 +177,51 @@ subcommands:
             long: amount_includes_fee
   - mwixnet:
       about: EXPERIMENTAL - Swap a wallet output through an mwixnet route
+      settings:
+        - SubcommandsNegateReqs
+      subcommands:
+        - routes:
+            about: List mwixnet routes announced by the configured node
+        - status:
+            about: Show locally stored mwixnet requests
+            args:
+              - request:
+                  help: Optional wallet request identifier
+                  index: 1
+        - retry:
+            about: Retry a locally stored mwixnet request
+            args:
+              - request:
+                  help: Wallet request identifier
+                  index: 1
+                  required: true
+        - cancel:
+            about: Cancel an accepted mwixnet request
+            args:
+              - request:
+                  help: Wallet request identifier
+                  index: 1
+                  required: true
+        - send:
+            about: Swap an output through a discovered mwixnet route
+            args:
+              - commit:
+                  help: Commitment of the wallet output to swap
+                  index: 1
+                  required: true
+              - route:
+                  help: Route identifier shown by mwixnet routes
+                  long: route
+                  takes_value: true
+                  required: true
+              - request_ttl_blocks:
+                  help: Request lifetime in blocks
+                  long: request_ttl_blocks
+                  takes_value: true
+              - max_total_fee:
+                  help: Maximum accepted total route fee in nanogrin
+                  long: max_total_fee
+                  takes_value: true
       args:
         - commit:
             help: Commitment of the wallet output to swap

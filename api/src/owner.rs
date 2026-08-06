@@ -19,6 +19,7 @@ use crate::core::core::OutputFeatures;
 use crate::core::global;
 use crate::impls::SlateSender as _;
 use crate::impls::TorSlateSender;
+use crate::impls::{json_rpc, tor::arti::tor_post_with_retries};
 use crate::keychain::{Identifier, Keychain};
 use crate::libwallet::api_impl::owner_updater::{start_updater_log_thread, StatusMessage};
 use crate::libwallet::api_impl::types::update_tx_slate_state;
@@ -30,9 +31,9 @@ use crate::libwallet::{
 };
 use crate::util::logger::LoggingConfig;
 use crate::util::secp::{key::SecretKey, pedersen::Commitment};
-use crate::util::{from_hex, static_secp_instance, Mutex, ZeroingString};
+use crate::util::{from_hex, static_secp_instance, Mutex, ToHex, ZeroingString};
 use grin_wallet_config::config::{
-	reload_global_config, update_global_config, WALLET_CONFIG_FILE_NAME,
+	get_global_config, reload_global_config, update_global_config, WALLET_CONFIG_FILE_NAME,
 };
 use grin_wallet_libwallet::mwixnet::{MixnetReqCreationParams, MwixnetReqCreationResult};
 use grin_wallet_libwallet::RetrieveTxQueryArgs;
@@ -40,6 +41,7 @@ use grin_wallet_util::OnionV3Address;
 
 use chrono::prelude::*;
 use ed25519_dalek::SigningKey as DalekSecretKey;
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::fs::File;
 use std::io::Write;
@@ -50,6 +52,66 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
+
+enum MwixnetServerError {
+	Protocol(libwallet::mwixnet_protocol::ProtocolRpcError),
+	Wallet(Error),
+}
+
+impl From<MwixnetServerError> for Error {
+	fn from(error: MwixnetServerError) -> Self {
+		match error {
+			MwixnetServerError::Protocol(error) => Error::GenericError(error.to_string()),
+			MwixnetServerError::Wallet(error) => error,
+		}
+	}
+}
+
+fn mwixnet_rejection_status(
+	error: &libwallet::mwixnet_protocol::ProtocolRpcError,
+) -> Option<libwallet::mwixnet::WalletMwixnetRequestStatus> {
+	if error.retryable {
+		None
+	} else if error.code == libwallet::mwixnet_protocol::ProtocolErrorCode::RequestExpired {
+		Some(libwallet::mwixnet::WalletMwixnetRequestStatus::Expired)
+	} else {
+		Some(libwallet::mwixnet::WalletMwixnetRequestStatus::Rejected)
+	}
+}
+
+fn mwixnet_server_rpc<T: serde::de::DeserializeOwned>(
+	tor_config: &TorConfig,
+	onion: &libwallet::mwixnet_protocol::OnionAddress,
+	method: &str,
+	params: serde_json::Value,
+) -> Result<T, MwixnetServerError> {
+	let request = json_rpc::build_request(method, &params);
+	let response = tor_post_with_retries(tor_config, &request, &format!("http://{}/v1", onion))
+		.map_err(|error| MwixnetServerError::Wallet(Error::GenericError(error.to_string())))?;
+	let response: json_rpc::Response = serde_json::from_str(&response).map_err(|error| {
+		MwixnetServerError::Wallet(Error::GenericError(format!(
+			"Invalid MWixnet response: {}",
+			error
+		)))
+	})?;
+	if let Some(error) = response.error {
+		if let Some(data) = &error.data {
+			if let Ok(error) = serde_json::from_value(data.clone()) {
+				return Err(MwixnetServerError::Protocol(error));
+			}
+		}
+		return Err(MwixnetServerError::Wallet(Error::GenericError(format!(
+			"MWixnet RPC {} failed: {:?}",
+			method, error
+		))));
+	}
+	serde_json::from_value(response.result.unwrap_or(serde_json::Value::Null)).map_err(|error| {
+		MwixnetServerError::Wallet(Error::GenericError(format!(
+			"Invalid MWixnet {} result: {}",
+			method, error
+		)))
+	})
+}
 
 /// Main interface into all wallet API functions.
 /// Wallet APIs are split into two seperate blocks of functionality
@@ -2574,6 +2636,583 @@ where
 			self.doctest_mode,
 		)
 	}
+
+	fn refresh_mwixnet_routes(
+		&self,
+		route_id: Option<libwallet::mwixnet_protocol::Hash>,
+	) -> Result<Vec<libwallet::mwixnet::WalletRoute>, Error> {
+		use libwallet::mwixnet_protocol::{MwixnetOffer, RouteRelayItem};
+
+		let client = {
+			let mut w_lock = self.wallet_inst.lock();
+			w_lock.lc_provider()?.wallet_inst()?.w2n_client().clone()
+		};
+		let now = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map_err(|error| Error::GenericError(error.to_string()))?
+			.as_secs();
+		let mut cursor = None;
+		let mut items = Vec::new();
+		loop {
+			let page = client.get_mwixnet_routes(
+				cursor,
+				libwallet::mwixnet_protocol::P2P_BATCH_MAX_ROUTES as u16,
+			)?;
+			for item in &page.items {
+				item.validate(now).map_err(|error| {
+					Error::GenericError(format!("Invalid MWixnet route from node: {}", error))
+				})?;
+			}
+			items.extend(page.items);
+			match page.next_cursor {
+				Some(next) if Some(next) != cursor => cursor = Some(next),
+				Some(_) => {
+					return Err(Error::GenericError(
+						"MWixnet route pagination did not advance".into(),
+					))
+				}
+				None => break,
+			}
+		}
+
+		let mut announcements = BTreeMap::new();
+		let mut statuses = BTreeMap::new();
+		let mut revocations: BTreeMap<_, Vec<_>> = BTreeMap::new();
+		for item in items {
+			match item {
+				RouteRelayItem::Announcement(item) => {
+					let replace = announcements
+						.get(&item.route_id)
+						.map(|current: &libwallet::mwixnet_protocol::RouteAnnouncement| {
+							item.manifest_sequence > current.manifest_sequence
+								|| (item.manifest_sequence == current.manifest_sequence
+									&& item.sequence > current.sequence)
+						})
+						.unwrap_or(true);
+					if replace {
+						announcements.insert(item.route_id, item);
+					}
+				}
+				RouteRelayItem::Status(item) => {
+					let replace = statuses
+						.get(&item.route_id)
+						.map(|current: &libwallet::mwixnet_protocol::RouteStatus| {
+							item.manifest_sequence > current.manifest_sequence
+								|| (item.manifest_sequence == current.manifest_sequence
+									&& item.sequence > current.sequence)
+						})
+						.unwrap_or(true);
+					if replace {
+						statuses.insert(item.route_id, item);
+					}
+				}
+				RouteRelayItem::Revocation(item) => {
+					revocations.entry(item.route_id).or_default().push(item);
+				}
+			}
+		}
+		if let Some(route_id) = route_id {
+			announcements.retain(|id, _| *id == route_id);
+		}
+
+		if announcements.is_empty() {
+			return Ok(Vec::new());
+		}
+		let tor_config = crate::tor_config::load(&self.config_path())?;
+		let mut routes = Vec::new();
+		for (_, announcement) in announcements {
+			let mut fallback = libwallet::mwixnet::WalletRoute {
+				route_id: announcement.route_id,
+				manifest_sequence: announcement.manifest_sequence,
+				status: announcement.status,
+				usable: false,
+				unusable_reason: None,
+				hop_count: announcement.hop_count,
+				fee_per_hop: announcement.fee_per_hop,
+				total_fee: announcement
+					.fee_per_hop
+					.saturating_mul(announcement.hop_count as u64),
+				last_verified: announcement.last_verified,
+				valid_until: announcement.valid_until,
+			};
+			if announcement.validate(now).is_err() {
+				fallback.unusable_reason = Some("invalid MWixnet route announcement".into());
+				routes.push(fallback);
+				continue;
+			}
+			if let Some(route) = libwallet::mwixnet::WalletRoute::from_terminal_relay(
+				&announcement,
+				statuses.get(&announcement.route_id),
+				revocations
+					.get(&announcement.route_id)
+					.map(Vec::as_slice)
+					.unwrap_or_default(),
+				now,
+			)
+			.map_err(Error::GenericError)?
+			{
+				let mut w_lock = self.wallet_inst.lock();
+				w_lock
+					.lc_provider()?
+					.wallet_inst()?
+					.delete_mwixnet_route(announcement.route_id)?;
+				routes.push(route);
+				continue;
+			}
+			let verified = (|| {
+				let manifest = mwixnet_server_rpc(
+					&tor_config,
+					&announcement.entry_onion,
+					"get_route",
+					serde_json::json!({ "route_id": announcement.route_id }),
+				)?;
+				let offer = mwixnet_server_rpc(
+					&tor_config,
+					&announcement.entry_onion,
+					"get_mwixnet_offer",
+					serde_json::json!({}),
+				)?;
+				let swap_offer = match offer {
+					MwixnetOffer::Swap(offer) => offer,
+					MwixnetOffer::Mixer(_) => {
+						return Err(Error::GenericError(
+							"MWixnet entry server returned a mixer offer".into(),
+						))
+					}
+				};
+				let health = mwixnet_server_rpc(
+					&tor_config,
+					&announcement.entry_onion,
+					"get_route_health",
+					serde_json::json!({
+						"route_id": announcement.route_id,
+						"manifest_sequence": announcement.manifest_sequence,
+					}),
+				)?;
+				Ok(libwallet::mwixnet::VerifiedMwixnetRoute {
+					manifest,
+					swap_offer,
+					health,
+					status: statuses.remove(&announcement.route_id),
+					revocations: revocations
+						.remove(&announcement.route_id)
+						.unwrap_or_default(),
+					announcement,
+				})
+			})();
+			match verified {
+				Ok(verified) => match verified.validate(now) {
+					Ok(()) => {
+						let route = verified.wallet_route();
+						let mut w_lock = self.wallet_inst.lock();
+						w_lock
+							.lc_provider()?
+							.wallet_inst()?
+							.save_mwixnet_route(&verified)?;
+						routes.push(route);
+					}
+					Err(error) => {
+						fallback.unusable_reason = Some(error);
+						routes.push(fallback);
+					}
+				},
+				Err(error) => {
+					fallback.unusable_reason = Some(error.to_string());
+					routes.push(fallback);
+				}
+			}
+		}
+		Ok(routes)
+	}
+
+	/// Return locally verified MWixnet routes.
+	pub fn get_mwixnet_routes(
+		&self,
+		include_unusable: bool,
+	) -> Result<Vec<libwallet::mwixnet::WalletRoute>, Error> {
+		let wallet_config = get_global_config(&self.config_path())?.members.wallet;
+		let refreshed = match self.refresh_mwixnet_routes(None) {
+			Ok(routes) => routes,
+			Err(error) => {
+				warn!("Unable to refresh MWixnet routes: {}", error);
+				Vec::new()
+			}
+		};
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		let now = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map_err(|error| Error::GenericError(error.to_string()))?
+			.as_secs();
+		let cached = w.mwixnet_routes()?;
+		let identities = cached
+			.iter()
+			.map(|verified| {
+				(
+					verified.manifest.route_id,
+					verified.manifest.swap_identity.0.to_hex(),
+				)
+			})
+			.collect::<BTreeMap<_, _>>();
+		let cached = cached
+			.into_iter()
+			.map(|verified| match verified.validate(now) {
+				Ok(()) => verified.wallet_route(),
+				Err(error) => {
+					let mut route = verified.wallet_route();
+					route.usable = false;
+					if route.valid_until <= now {
+						route.status = libwallet::mwixnet_protocol::RouteState::Expired;
+					}
+					route.unusable_reason = Some(error);
+					route
+				}
+			})
+			.collect::<Vec<_>>();
+		let mut routes = refreshed;
+		let refreshed_ids = routes
+			.iter()
+			.map(|route| route.route_id)
+			.collect::<std::collections::HashSet<_>>();
+		routes.extend(
+			cached
+				.into_iter()
+				.filter(|route| !refreshed_ids.contains(&route.route_id)),
+		);
+		for route in &mut routes {
+			if route.total_fee > wallet_config.mwixnet_max_total_fee() {
+				route.usable = false;
+				route.unusable_reason = Some("route fee exceeds wallet maximum".into());
+			}
+			if let Some(allowlist) = &wallet_config.mwixnet_route_allowlist {
+				if identities
+					.get(&route.route_id)
+					.map(|identity| !allowlist.iter().any(|allowed| allowed == identity))
+					.unwrap_or(true)
+				{
+					route.usable = false;
+					route.unusable_reason =
+						Some("swap identity is not in the wallet allowlist".into());
+				}
+			}
+		}
+		routes.retain(|route| include_unusable || route.usable);
+		Ok(routes)
+	}
+
+	/// Create a request for a locally verified MWixnet route.
+	pub fn create_mwixnet_route_req(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		commitment: &Commitment,
+		route_id: libwallet::mwixnet_protocol::Hash,
+		request_ttl_blocks: Option<u16>,
+		max_total_fee: Option<u64>,
+	) -> Result<libwallet::mwixnet::MwixnetRouteReqCreationResult, Error> {
+		let wallet_config = get_global_config(&self.config_path())?.members.wallet;
+		let route_status = self
+			.refresh_mwixnet_routes(Some(route_id))?
+			.into_iter()
+			.find(|route| route.route_id == route_id)
+			.ok_or_else(|| Error::GenericError("MWixnet route not found".into()))?;
+		if !route_status.usable {
+			return Err(Error::GenericError(
+				route_status
+					.unusable_reason
+					.unwrap_or_else(|| "MWixnet route is not accepting requests".into()),
+			));
+		}
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		let route = w
+			.mwixnet_routes()?
+			.into_iter()
+			.find(|route| route.manifest.route_id == route_id)
+			.ok_or_else(|| Error::GenericError("MWixnet route not found in wallet cache".into()))?;
+		if let Some(allowlist) = &wallet_config.mwixnet_route_allowlist {
+			let identity = route.manifest.swap_identity.0.to_hex();
+			if !allowlist.iter().any(|allowed| allowed == &identity) {
+				return Err(Error::GenericError(
+					"MWixnet swap identity is not in the wallet allowlist".into(),
+				));
+			}
+		}
+		owner::create_mwixnet_route_req(
+			w,
+			keychain_mask,
+			commitment,
+			&route,
+			request_ttl_blocks,
+			max_total_fee,
+			wallet_config.mwixnet_request_ttl_blocks(),
+			wallet_config.mwixnet_max_total_fee(),
+			wallet_config.mwixnet_confirmation_depth(),
+			self.doctest_mode,
+		)
+	}
+
+	/// Create and submit a route-bound MWixnet request.
+	pub fn submit_mwixnet_route_req(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		commitment: &Commitment,
+		route_id: libwallet::mwixnet_protocol::Hash,
+		request_ttl_blocks: Option<u16>,
+		max_total_fee: Option<u64>,
+	) -> Result<libwallet::mwixnet::WalletMwixnetRequestInfo, Error> {
+		let created = self.create_mwixnet_route_req(
+			keychain_mask,
+			commitment,
+			route_id,
+			request_ttl_blocks,
+			max_total_fee,
+		)?;
+		let request_id = created.request.wallet_request_id;
+		let request = self
+			.refresh_mwixnet_requests(keychain_mask, Some(request_id))?
+			.into_iter()
+			.find(|request| request.wallet_request_id == request_id)
+			.ok_or_else(|| Error::GenericError("MWixnet wallet request not found".into()))?;
+		match request.status {
+			libwallet::mwixnet::WalletMwixnetRequestStatus::Rejected => {
+				Err(Error::GenericError("MWixnet request rejected".into()))
+			}
+			libwallet::mwixnet::WalletMwixnetRequestStatus::Expired => {
+				Err(Error::GenericError("MWixnet request expired".into()))
+			}
+			_ => Ok(request),
+		}
+	}
+
+	/// Return locally persisted route-bound MWixnet requests.
+	pub fn get_mwixnet_requests(
+		&self,
+		wallet_request_id: Option<libwallet::mwixnet_protocol::Hash>,
+	) -> Result<Vec<libwallet::mwixnet::WalletMwixnetRequestInfo>, Error> {
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		Ok(w.mwixnet_requests()?
+			.into_iter()
+			.filter(|request| {
+				wallet_request_id
+					.map(|id| request.request.wallet_request_id == id)
+					.unwrap_or(true)
+			})
+			.map(|request| libwallet::mwixnet::WalletMwixnetRequestInfo::from(&request))
+			.collect())
+	}
+
+	/// Refresh persisted MWixnet requests through their idempotent swap call.
+	pub fn refresh_mwixnet_requests(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		wallet_request_id: Option<libwallet::mwixnet_protocol::Hash>,
+	) -> Result<Vec<libwallet::mwixnet::WalletMwixnetRequestInfo>, Error> {
+		let requests = {
+			let mut w_lock = self.wallet_inst.lock();
+			let w = w_lock.lc_provider()?.wallet_inst()?;
+			w.mwixnet_requests()?
+				.into_iter()
+				.filter(|request| {
+					wallet_request_id
+						.map(|id| request.request.wallet_request_id == id)
+						.unwrap_or(true)
+				})
+				.collect::<Vec<_>>()
+		};
+		let tor_config = crate::tor_config::load(&self.config_path())?;
+		for mut request in requests {
+			if matches!(
+				request.status,
+				libwallet::mwixnet::WalletMwixnetRequestStatus::Confirmed
+					| libwallet::mwixnet::WalletMwixnetRequestStatus::ReclaimConfirmed
+					| libwallet::mwixnet::WalletMwixnetRequestStatus::ConflictConfirmed
+			) {
+				continue;
+			}
+			let submission: libwallet::mwixnet::SwapSubmission = match mwixnet_server_rpc(
+				&tor_config,
+				&request.swap_onion_address,
+				"swap",
+				serde_json::json!([request.request]),
+			) {
+				Ok(submission) => submission,
+				Err(MwixnetServerError::Protocol(error)) => {
+					let Some(status) = mwixnet_rejection_status(&error) else {
+						if wallet_request_id.is_some() {
+							return Err(MwixnetServerError::Protocol(error).into());
+						}
+						continue;
+					};
+					request.status = status;
+					let mut w_lock = self.wallet_inst.lock();
+					let w = w_lock.lc_provider()?.wallet_inst()?;
+					let mut batch = w.batch_no_mask()?;
+					batch.save_mwixnet_request(&request)?;
+					batch.commit()?;
+					continue;
+				}
+				Err(error) if wallet_request_id.is_some() => return Err(error.into()),
+				Err(_) => continue,
+			};
+			if submission.route_id != request.request.route_id
+				|| submission.wallet_request_id != request.request.wallet_request_id
+				|| submission.swap_req_hash != request.request.hash()
+			{
+				return Err(Error::GenericError(
+					"MWixnet server returned a mismatched submission".into(),
+				));
+			}
+			let server_status = match submission.status {
+				libwallet::mwixnet::SwapSubmissionStatus::Accepted => {
+					libwallet::mwixnet::WalletMwixnetRequestStatus::Accepted
+				}
+				libwallet::mwixnet::SwapSubmissionStatus::Batched => {
+					libwallet::mwixnet::WalletMwixnetRequestStatus::Batched
+				}
+				libwallet::mwixnet::SwapSubmissionStatus::Posting => {
+					libwallet::mwixnet::WalletMwixnetRequestStatus::Posting
+				}
+				libwallet::mwixnet::SwapSubmissionStatus::Posted => {
+					libwallet::mwixnet::WalletMwixnetRequestStatus::Posted
+				}
+				libwallet::mwixnet::SwapSubmissionStatus::Confirmed => {
+					libwallet::mwixnet::WalletMwixnetRequestStatus::Confirmed
+				}
+				libwallet::mwixnet::SwapSubmissionStatus::Rejected => {
+					libwallet::mwixnet::WalletMwixnetRequestStatus::Rejected
+				}
+				libwallet::mwixnet::SwapSubmissionStatus::Cancelled => {
+					libwallet::mwixnet::WalletMwixnetRequestStatus::Cancelled
+				}
+				libwallet::mwixnet::SwapSubmissionStatus::Expired => {
+					libwallet::mwixnet::WalletMwixnetRequestStatus::Expired
+				}
+			};
+			if !matches!(
+				request.status,
+				libwallet::mwixnet::WalletMwixnetRequestStatus::ReclaimPending
+					| libwallet::mwixnet::WalletMwixnetRequestStatus::ConflictObserved
+			) {
+				request.status = server_status;
+			}
+			request.kernel_excess = submission.kernel_excess;
+			let mut w_lock = self.wallet_inst.lock();
+			let w = w_lock.lc_provider()?.wallet_inst()?;
+			let mut batch = w.batch_no_mask()?;
+			batch.save_mwixnet_request(&request)?;
+			batch.commit()?;
+		}
+		{
+			let mut w_lock = self.wallet_inst.lock();
+			let w = w_lock.lc_provider()?.wallet_inst()?;
+			let height = w.w2n_client().get_chain_tip()?.0;
+			owner::update_mwixnet_recovery(w, keychain_mask, height)?;
+		}
+		self.get_mwixnet_requests(wallet_request_id)
+	}
+
+	/// Cancel an accepted route-bound MWixnet request.
+	pub fn cancel_mwixnet_request(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		wallet_request_id: libwallet::mwixnet_protocol::Hash,
+	) -> Result<libwallet::mwixnet::WalletMwixnetRequestInfo, Error> {
+		let (cancel_request, onion, swap_identity) = {
+			let mut w_lock = self.wallet_inst.lock();
+			let w = w_lock.lc_provider()?.wallet_inst()?;
+			let request = owner::create_mwixnet_cancel_req(
+				w,
+				keychain_mask,
+				wallet_request_id,
+				self.doctest_mode,
+			)?;
+			let wallet_request = w
+				.mwixnet_requests()?
+				.into_iter()
+				.find(|entry| entry.request.wallet_request_id == wallet_request_id)
+				.ok_or_else(|| Error::GenericError("MWixnet request not found".into()))?;
+			let route = w
+				.mwixnet_routes()?
+				.into_iter()
+				.find(|route| route.manifest.route_id == wallet_request.request.route_id)
+				.ok_or_else(|| Error::GenericError("MWixnet route not found".into()))?;
+			(
+				request,
+				wallet_request.swap_onion_address,
+				route.manifest.swap_identity,
+			)
+		};
+		let tor_config = crate::tor_config::load(&self.config_path())?;
+		let ack: libwallet::mwixnet::CancelAck = match mwixnet_server_rpc(
+			&tor_config,
+			&onion,
+			"cancel_mwixnet_request",
+			serde_json::json!({ "request": cancel_request }),
+		) {
+			Ok(ack) => ack,
+			Err(MwixnetServerError::Protocol(error)) => {
+				use libwallet::mwixnet_protocol::ProtocolErrorCode;
+				let status = match error.code {
+					ProtocolErrorCode::RequestAlreadyProcessing => {
+						libwallet::mwixnet::WalletMwixnetRequestStatus::Batched
+					}
+					ProtocolErrorCode::RequestPosted => {
+						libwallet::mwixnet::WalletMwixnetRequestStatus::Posted
+					}
+					ProtocolErrorCode::RequestRejected => {
+						libwallet::mwixnet::WalletMwixnetRequestStatus::Rejected
+					}
+					ProtocolErrorCode::RequestExpired => {
+						libwallet::mwixnet::WalletMwixnetRequestStatus::Expired
+					}
+					_ => return Err(MwixnetServerError::Protocol(error).into()),
+				};
+				let mut w_lock = self.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let mut wallet_request = w
+					.mwixnet_requests()?
+					.into_iter()
+					.find(|entry| entry.request.wallet_request_id == wallet_request_id)
+					.ok_or_else(|| Error::GenericError("MWixnet request not found".into()))?;
+				wallet_request.status = status;
+				let mut batch = w.batch_no_mask()?;
+				batch.save_mwixnet_request(&wallet_request)?;
+				batch.commit()?;
+				let height = w.w2n_client().get_chain_tip()?.0;
+				owner::update_mwixnet_recovery(w, keychain_mask, height)?;
+				return w
+					.mwixnet_requests()?
+					.into_iter()
+					.find(|entry| entry.request.wallet_request_id == wallet_request_id)
+					.map(|request| libwallet::mwixnet::WalletMwixnetRequestInfo::from(&request))
+					.ok_or_else(|| Error::GenericError("MWixnet request not found".into()));
+			}
+			Err(error) => return Err(error.into()),
+		};
+		ack.validate(&cancel_request, swap_identity)
+			.map_err(Error::GenericError)?;
+
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		let mut wallet_request = w
+			.mwixnet_requests()?
+			.into_iter()
+			.find(|entry| entry.request.wallet_request_id == wallet_request_id)
+			.ok_or_else(|| Error::GenericError("MWixnet request not found".into()))?;
+		wallet_request.cancel_ack = Some(ack);
+		wallet_request.status = libwallet::mwixnet::WalletMwixnetRequestStatus::Cancelled;
+		let mut batch = w.batch_no_mask()?;
+		batch.save_mwixnet_request(&wallet_request)?;
+		batch.commit()?;
+		let height = w.w2n_client().get_chain_tip()?.0;
+		owner::update_mwixnet_recovery(w, keychain_mask, height)?;
+		w.mwixnet_requests()?
+			.into_iter()
+			.find(|entry| entry.request.wallet_request_id == wallet_request_id)
+			.map(|request| libwallet::mwixnet::WalletMwixnetRequestInfo::from(&request))
+			.ok_or_else(|| Error::GenericError("MWixnet request not found".into()))
+	}
 }
 
 /// attempt to send slate synchronously with TOR
@@ -2729,4 +3368,25 @@ where
 	output.write_all(&message.as_bytes())?;
 	output.sync_all()?;
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::mwixnet_rejection_status;
+	use libwallet::mwixnet::WalletMwixnetRequestStatus;
+	use libwallet::mwixnet_protocol::{ProtocolErrorCode, ProtocolRpcError};
+
+	#[test]
+	fn classifies_mwixnet_rejections() {
+		let status = |code| mwixnet_rejection_status(&ProtocolRpcError::new(code, "test"));
+		assert_eq!(
+			status(ProtocolErrorCode::InvalidMwixnetMessage),
+			Some(WalletMwixnetRequestStatus::Rejected)
+		);
+		assert_eq!(
+			status(ProtocolErrorCode::RequestExpired),
+			Some(WalletMwixnetRequestStatus::Expired)
+		);
+		assert_eq!(status(ProtocolErrorCode::ServerBusy), None);
+	}
 }

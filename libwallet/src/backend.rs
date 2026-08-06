@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::blake2::blake2b::{Blake2b, Blake2bResult};
 
 use crate::{
+	mwixnet::{VerifiedMwixnetRoute, WalletMwixnetRequest},
 	AcctPathMapping, Context, Error, NodeClient, OutputData, ScannedBlockInfo, TxLogEntry,
 	WalletInitStatus,
 };
@@ -49,8 +50,10 @@ const LAST_SCANNED_BLOCK: u8 = b'l';
 const LAST_SCANNED_KEY: &str = "LAST_SCANNED_KEY";
 const WALLET_INIT_STATUS: u8 = b'w';
 const WALLET_INIT_STATUS_KEY: &str = "WALLET_INIT_STATUS";
+const MWIXNET_ROUTE_PREFIX: u8 = b'm';
+const MWIXNET_REQUEST_PREFIX: u8 = b'q';
 
-const DB_PREFIXES: [u8; 9] = [
+const DB_PREFIXES: [u8; 11] = [
 	OUTPUT_PREFIX,
 	DERIV_PREFIX,
 	CONFIRMED_HEIGHT_PREFIX,
@@ -60,6 +63,8 @@ const DB_PREFIXES: [u8; 9] = [
 	ACCOUNT_PATH_MAPPING_PREFIX,
 	LAST_SCANNED_BLOCK,
 	WALLET_INIT_STATUS,
+	MWIXNET_ROUTE_PREFIX,
+	MWIXNET_REQUEST_PREFIX,
 ];
 
 /// Helper to derive XOR keys for storing private transaction keys in the DB
@@ -433,6 +438,58 @@ where
 		))
 	}
 
+	/// Store a fully verified MWixnet route.
+	pub fn save_mwixnet_route(&self, route: &VerifiedMwixnetRoute) -> Result<(), Error> {
+		let mut batch = self.db.batch()?;
+		batch.put_ser(
+			Some(MWIXNET_ROUTE_PREFIX),
+			&route.manifest.route_id.0,
+			route,
+		)?;
+		batch.commit()?;
+		Ok(())
+	}
+
+	/// Delete a cached MWixnet route.
+	pub fn delete_mwixnet_route(&self, route_id: mwixnet_protocol::Hash) -> Result<(), Error> {
+		let mut batch = self.db.batch()?;
+		batch.delete(Some(MWIXNET_ROUTE_PREFIX), &route_id.0)?;
+		batch.commit()?;
+		Ok(())
+	}
+
+	/// Return all fully verified MWixnet routes.
+	pub fn mwixnet_routes(&self) -> Result<Vec<VerifiedMwixnetRoute>, Error> {
+		let protocol_version = self.db.protocol_version();
+		self.db
+			.iter(Some(MWIXNET_ROUTE_PREFIX), move |_, mut value| {
+				ser::deserialize(
+					&mut value,
+					protocol_version,
+					ser::DeserializationMode::default(),
+				)
+				.map_err(Into::into)
+			})?
+			.collect::<Result<Vec<_>, _>>()
+			.map_err(Into::into)
+	}
+
+	/// Return persisted route-bound MWixnet requests.
+	pub fn mwixnet_requests(&self) -> Result<Vec<WalletMwixnetRequest>, Error> {
+		let protocol_version = self.db.protocol_version();
+		self.db
+			.iter(Some(MWIXNET_REQUEST_PREFIX), move |_, mut value| {
+				ser::deserialize(
+					&mut value,
+					protocol_version,
+					ser::DeserializationMode::default(),
+				)
+				.map_err(Into::into)
+			})?
+			.collect::<Result<Vec<_>, _>>()
+			.map_err(Into::into)
+	}
+
 	/// Create a new write batch to update or remove output data.
 	pub fn batch(
 		&mut self,
@@ -465,14 +522,22 @@ where
 
 	/// Next child ID when we want to create a new output, based on current parent.
 	pub fn next_child(&mut self, keychain_mask: Option<&SecretKey>) -> Result<Identifier, Error> {
-		let parent_key_id = self.parent_key_id.clone();
+		self.next_child_for(keychain_mask, &self.parent_key_id.clone())
+	}
+
+	/// Next child ID below the provided account path.
+	pub fn next_child_for(
+		&mut self,
+		keychain_mask: Option<&SecretKey>,
+		parent_key_id: &Identifier,
+	) -> Result<Identifier, Error> {
 		let mut deriv_idx = {
 			let batch = self.db.batch()?;
 			batch
-				.get_ser(Some(DERIV_PREFIX), &self.parent_key_id.to_bytes(), None)?
+				.get_ser(Some(DERIV_PREFIX), &parent_key_id.to_bytes(), None)?
 				.unwrap_or_else(|| 0)
 		};
-		let mut return_path = self.parent_key_id.to_path();
+		let mut return_path = parent_key_id.to_path();
 		return_path.depth += 1;
 		return_path.path[return_path.depth as usize - 1] = ChildNumber::from(deriv_idx);
 		deriv_idx += 1;
@@ -551,6 +616,16 @@ where
 			None => out.key_id.to_bytes().to_vec(),
 		};
 		self.db.put_ser(Some(OUTPUT_PREFIX), &key, &out)?;
+		Ok(())
+	}
+
+	/// Add or update a route-bound MWixnet request.
+	pub fn save_mwixnet_request(&mut self, request: &WalletMwixnetRequest) -> Result<(), Error> {
+		self.db.put_ser(
+			Some(MWIXNET_REQUEST_PREFIX),
+			&request.request.wallet_request_id.0,
+			request,
+		)?;
 		Ok(())
 	}
 

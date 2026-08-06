@@ -339,6 +339,13 @@ pub struct MwixnetArgs {
 	pub params: MixnetReqCreationParams,
 }
 
+pub struct MwixnetRouteArgs {
+	pub route_id: libwallet::mwixnet_protocol::Hash,
+	pub commitment: Commitment,
+	pub request_ttl_blocks: Option<u16>,
+	pub max_total_fee: Option<u64>,
+}
+
 enum MwixnetResponse {
 	Accepted,
 	Rejected(String),
@@ -444,6 +451,72 @@ where
 		tor_post(&tor_config, &rpc_request, &url).map_err(Error::from),
 		tx_id,
 	)
+}
+
+pub fn mwixnet_routes<L, C, K>(owner_api: &mut Owner<L, C, K>) -> Result<(), Error>
+where
+	L: WalletLCProvider<'static, C, K> + 'static,
+	C: NodeClient + 'static,
+	K: keychain::Keychain + 'static,
+{
+	display::mwixnet_routes(owner_api.get_mwixnet_routes(true)?);
+	Ok(())
+}
+
+pub fn mwixnet_requests<L, C, K>(
+	owner_api: &mut Owner<L, C, K>,
+	keychain_mask: Option<&SecretKey>,
+	wallet_request_id: Option<libwallet::mwixnet_protocol::Hash>,
+	refresh: bool,
+) -> Result<(), Error>
+where
+	L: WalletLCProvider<'static, C, K> + 'static,
+	C: NodeClient + 'static,
+	K: keychain::Keychain + 'static,
+{
+	let requests = if refresh {
+		owner_api.refresh_mwixnet_requests(keychain_mask, wallet_request_id)?
+	} else {
+		owner_api.get_mwixnet_requests(wallet_request_id)?
+	};
+	display::mwixnet_requests(requests);
+	Ok(())
+}
+
+pub fn mwixnet_cancel<L, C, K>(
+	owner_api: &mut Owner<L, C, K>,
+	keychain_mask: Option<&SecretKey>,
+	wallet_request_id: libwallet::mwixnet_protocol::Hash,
+) -> Result<(), Error>
+where
+	L: WalletLCProvider<'static, C, K> + 'static,
+	C: NodeClient + 'static,
+	K: keychain::Keychain + 'static,
+{
+	let request = owner_api.cancel_mwixnet_request(keychain_mask, wallet_request_id)?;
+	display::mwixnet_requests(vec![request]);
+	Ok(())
+}
+
+pub fn mwixnet_route<L, C, K>(
+	owner_api: &mut Owner<L, C, K>,
+	keychain_mask: Option<&SecretKey>,
+	args: MwixnetRouteArgs,
+) -> Result<(), Error>
+where
+	L: WalletLCProvider<'static, C, K> + 'static,
+	C: NodeClient + 'static,
+	K: keychain::Keychain + 'static,
+{
+	let request = owner_api.submit_mwixnet_route_req(
+		keychain_mask,
+		&args.commitment,
+		args.route_id,
+		args.request_ttl_blocks,
+		args.max_total_fee,
+	)?;
+	println!("MWixnet request accepted ({:?})", request.wallet_request_id);
+	Ok(())
 }
 
 pub fn send<L, C, K>(

@@ -127,6 +127,22 @@ fn comments() -> HashMap<String, String> {
 		.to_string(),
 	);
 	retval.insert(
+		"mwixnet_max_total_fee".to_string(),
+		"\n#Maximum total fee accepted for a discovered MWixnet route, in nanogrin\n".to_string(),
+	);
+	retval.insert(
+		"mwixnet_request_ttl_blocks".to_string(),
+		"\n#Default lifetime of a route-bound MWixnet request, in blocks\n".to_string(),
+	);
+	retval.insert(
+		"mwixnet_confirmation_depth".to_string(),
+		"\n#Confirmation depth used for MWixnet inputs and recovery transactions\n".to_string(),
+	);
+	retval.insert(
+		"mwixnet_route_allowlist".to_string(),
+		"\n#Optional Ed25519 swap identities accepted for discovered MWixnet routes\n".to_string(),
+	);
+	retval.insert(
 		"[logging]".to_string(),
 		"
 #Type of proxy, eg \"socks4\", \"socks5\", \"http\", \"https\"

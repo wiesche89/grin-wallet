@@ -50,5 +50,6 @@ grin_core = { path = "../grin/core"}
 grin_keychain = { path = "../grin/keychain"}
 grin_util = { path = "../grin/util"}
 grin_store = { path = "../grin/store"}
+mwixnet-protocol = { git = "https://github.com/wiesche89/mwixnet.git", rev = "b7c0ad72e520cdb3ca1cc0ca9ad142a8f520efe1" }
 
 #####

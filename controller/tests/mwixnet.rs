@@ -19,14 +19,19 @@ extern crate grin_wallet_impls as impls;
 
 use grin_core as core;
 use grin_core::core::FeeFields;
+use grin_keychain::{Keychain, SwitchCommitmentType};
 use grin_util as util;
 use grin_util::secp::key::SecretKey;
+use grin_util::ToHex;
 use std::path::PathBuf;
 
 use grin_wallet_libwallet as libwallet;
 use impls::test_framework::{self, LocalWalletClient};
 use libwallet::{
-	mwixnet::{MixnetReqCreationParams, MwixnetServerPublicKey, MAX_MWIXNET_HOPS},
+	mwixnet::{
+		ComSignature, MixnetReqCreationParams, MwixnetServerPublicKey, RouteSwapReq, SwapReq,
+		WalletMwixnetRequest, WalletMwixnetRequestStatus, MAX_MWIXNET_HOPS,
+	},
 	InitTxArgs, OutputStatus, TxLogEntryType,
 };
 use std::sync::atomic::Ordering;
@@ -228,7 +233,7 @@ fn mwixnet_test_impl(test_dir: &'static str) -> Result<(), libwallet::Error> {
 			let creation_tx_id = creation.tx_id.unwrap();
 			let peeled = creation
 				.request
-				.onion
+				.onion()
 				.peel_layer(&server_key_1)
 				.map_err(|e| libwallet::Error::GenericError(e.to_string()))?;
 			assert_eq!(peeled.payload.fee, FeeFields::try_from(params.fee_per_hop)?);
@@ -272,6 +277,205 @@ fn mwixnet_test_impl(test_dir: &'static str) -> Result<(), libwallet::Error> {
 					params.fee_per_hop * params.server_keys.len() as u64
 				)?)
 			);
+
+			// A timed-out route request remains queryable and is retried byte-for-byte.
+			let legacy = match &creation.request {
+				SwapReq::Legacy(request) => request,
+				SwapReq::Route(_) => panic!("expected legacy MWixnet request"),
+			};
+			let wallet_request_id = libwallet::mwixnet_protocol::Hash([7; 32]);
+			let mut route_request = RouteSwapReq {
+				version: libwallet::mwixnet_protocol::MWIXNET_PROTOCOL_VERSION,
+				msg_type: libwallet::mwixnet_protocol::MwixnetType::SwapReq,
+				wallet_request_id,
+				route_id: libwallet::mwixnet_protocol::Hash([8; 32]),
+				manifest_sequence: 1,
+				expires_at_height: bh + 60,
+				onion: legacy.onion.clone(),
+				onion_hash: RouteSwapReq::onion_hash(&legacy.onion),
+				comsig: legacy.comsig.clone(),
+			};
+			{
+				let mut wallet_lock = api.wallet_inst.lock();
+				let w = wallet_lock.lc_provider()?.wallet_inst()?;
+				let input_blind = {
+					let keychain = w.keychain(m)?;
+					keychain.derive_key(
+						last_output.output.value,
+						&last_output.output.key_id,
+						SwitchCommitmentType::Regular,
+					)?
+				};
+				route_request.comsig = ComSignature::sign(
+					last_output.output.value,
+					&input_blind,
+					&route_request.hash().0.to_vec(),
+					false,
+				)
+				.map_err(|e| libwallet::Error::Signature(e.to_string()))?;
+				route_request
+					.validate()
+					.map_err(libwallet::Error::GenericError)?;
+				let mut batch = w.batch_no_mask()?;
+				batch.save_mwixnet_request(&WalletMwixnetRequest {
+					request: route_request.clone(),
+					tx_id: Some(creation_tx_id),
+					input_commitment: last_output.commit.to_hex(),
+					swap_onion_address: libwallet::mwixnet_protocol::OnionAddress([9; 32]),
+					status: WalletMwixnetRequestStatus::Accepted,
+					reclaim_max_fee: 1_000_000_000,
+					confirmation_depth: 10,
+					kernel_excess: None,
+					cancel_request: None,
+					cancel_ack: None,
+					reclaim_tx: None,
+					reclaim_tx_id: None,
+					conflict_observed_height: None,
+				})?;
+				batch.commit()?;
+			}
+
+			let requests = api.get_mwixnet_requests(Some(wallet_request_id))?;
+			assert_eq!(requests.len(), 1);
+			assert_eq!(requests[0].status, WalletMwixnetRequestStatus::Accepted);
+			assert_eq!(requests[0].swap_req_hash, route_request.hash());
+			let persisted_request = {
+				let mut wallet_lock = api.wallet_inst.lock();
+				let w = wallet_lock.lc_provider()?.wallet_inst()?;
+				w.mwixnet_requests()?
+					.into_iter()
+					.find(|request| request.request.wallet_request_id == wallet_request_id)
+					.unwrap()
+					.request
+			};
+			assert_eq!(
+				serde_json::to_vec(&persisted_request).unwrap(),
+				serde_json::to_vec(&route_request).unwrap()
+			);
+			{
+				let mut wallet_lock = api.wallet_inst.lock();
+				let w = wallet_lock.lc_provider()?.wallet_inst()?;
+				libwallet::api_impl::owner::update_mwixnet_recovery(w, m, bh)?;
+				let request = w
+					.mwixnet_requests()?
+					.into_iter()
+					.find(|request| request.request.wallet_request_id == wallet_request_id)
+					.unwrap();
+				assert_eq!(request.status, WalletMwixnetRequestStatus::Accepted);
+				assert!(request.reclaim_tx.is_none());
+			}
+
+			// One unreclaimable request must not abort recovery for the wallet.
+			let unreclaimable_request_id = libwallet::mwixnet_protocol::Hash([6; 32]);
+			{
+				let mut wallet_lock = api.wallet_inst.lock();
+				let w = wallet_lock.lc_provider()?.wallet_inst()?;
+				let mut request = route_request.clone();
+				request.wallet_request_id = unreclaimable_request_id;
+				request.expires_at_height = bh;
+				let input_blind = w.keychain(m)?.derive_key(
+					last_output.output.value,
+					&last_output.output.key_id,
+					SwitchCommitmentType::Regular,
+				)?;
+				request.comsig = ComSignature::sign(
+					last_output.output.value,
+					&input_blind,
+					&request.hash().0.to_vec(),
+					false,
+				)
+				.map_err(|e| libwallet::Error::Signature(e.to_string()))?;
+				let mut batch = w.batch_no_mask()?;
+				batch.save_mwixnet_request(&WalletMwixnetRequest {
+					request,
+					tx_id: Some(creation_tx_id),
+					input_commitment: last_output.commit.to_hex(),
+					swap_onion_address: libwallet::mwixnet_protocol::OnionAddress([9; 32]),
+					status: WalletMwixnetRequestStatus::Expired,
+					reclaim_max_fee: 0,
+					confirmation_depth: 10,
+					kernel_excess: None,
+					cancel_request: None,
+					cancel_ack: None,
+					reclaim_tx: None,
+					reclaim_tx_id: None,
+					conflict_observed_height: None,
+				})?;
+				batch.commit()?;
+				libwallet::api_impl::owner::update_mwixnet_recovery(w, m, bh)?;
+				let request = w
+					.mwixnet_requests()?
+					.into_iter()
+					.find(|request| request.request.wallet_request_id == unreclaimable_request_id)
+					.unwrap();
+				assert!(request.reclaim_tx.is_none());
+			}
+			let outputs = api.retrieve_outputs(mask1, false, false, None)?;
+			assert_eq!(
+				outputs
+					.1
+					.iter()
+					.find(|output| output.commit == last_output.commit)
+					.unwrap()
+					.output
+					.status,
+				OutputStatus::Locked
+			);
+
+			// Repeating cancel after a timeout returns the persisted request unchanged.
+			let first_cancel = {
+				let mut wallet_lock = api.wallet_inst.lock();
+				let w = wallet_lock.lc_provider()?.wallet_inst()?;
+				libwallet::api_impl::owner::create_mwixnet_cancel_req(
+					w,
+					m,
+					wallet_request_id,
+					false,
+				)?
+			};
+			let second_cancel = {
+				let mut wallet_lock = api.wallet_inst.lock();
+				let w = wallet_lock.lc_provider()?.wallet_inst()?;
+				libwallet::api_impl::owner::create_mwixnet_cancel_req(
+					w,
+					m,
+					wallet_request_id,
+					false,
+				)?
+			};
+			assert_eq!(
+				serde_json::to_vec(&first_cancel).unwrap(),
+				serde_json::to_vec(&second_cancel).unwrap()
+			);
+
+			for status in [
+				WalletMwixnetRequestStatus::Batched,
+				WalletMwixnetRequestStatus::Posted,
+			] {
+				{
+					let mut wallet_lock = api.wallet_inst.lock();
+					let w = wallet_lock.lc_provider()?.wallet_inst()?;
+					let mut request = w
+						.mwixnet_requests()?
+						.into_iter()
+						.find(|request| request.request.wallet_request_id == wallet_request_id)
+						.unwrap();
+					request.status = status;
+					request.cancel_request = None;
+					let mut batch = w.batch_no_mask()?;
+					batch.save_mwixnet_request(&request)?;
+					batch.commit()?;
+				}
+				let mut wallet_lock = api.wallet_inst.lock();
+				let w = wallet_lock.lc_provider()?.wallet_inst()?;
+				assert!(libwallet::api_impl::owner::create_mwixnet_cancel_req(
+					w,
+					m,
+					wallet_request_id,
+					false,
+				)
+				.is_err());
+			}
 
 			assert!(api
 				.create_mwixnet_req(m, &params, &last_output.commit, false)

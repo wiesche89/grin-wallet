@@ -159,6 +159,17 @@ pub trait NodeClient: Send + Sync + Clone {
 	/// retrieves the current tip (height, hash) from the specified grin node
 	fn get_chain_tip(&self) -> Result<(u64, String), Error>;
 
+	/// Retrieve MWixnet route announcements from the node.
+	fn get_mwixnet_routes(
+		&self,
+		_cursor: Option<crate::mwixnet_protocol::Hash>,
+		_limit: u16,
+	) -> Result<crate::mwixnet_protocol::NodeRoutePage, Error> {
+		Err(Error::ClientCallback(
+			"MWixnet route discovery is not supported by this node client".into(),
+		))
+	}
+
 	/// Get a kernel and the height of the block it's included in. Returns
 	/// (tx_kernel, height, mmr_index)
 	fn get_kernel(

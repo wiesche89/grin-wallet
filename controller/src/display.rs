@@ -19,10 +19,89 @@ use crate::libwallet::{
 	AcctPathMapping, Error, OutputCommitMapping, OutputStatus, TxLogEntry, ViewWallet, WalletInfo,
 };
 use crate::util::ToHex;
+use chrono::{TimeZone, Utc};
 use grin_wallet_util::OnionV3Address;
 use prettytable;
 use std::io::prelude::Write;
 use term;
+
+fn format_mwixnet_timestamp(timestamp: u64) -> String {
+	Utc.timestamp_opt(timestamp as i64, 0)
+		.single()
+		.map(|time| time.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+		.unwrap_or_else(|| timestamp.to_string())
+}
+
+pub fn mwixnet_routes(routes: Vec<crate::libwallet::mwixnet::WalletRoute>) {
+	println!();
+	println!("MWixnet Routes");
+	let mut table = table!();
+	table.set_titles(row![
+		"Route",
+		"Route Health",
+		"Entry Preflight",
+		"Hops",
+		"Total Fee",
+		"Last Verified",
+		"Valid Until"
+	]);
+	for route in routes {
+		let route_id = format!("{:?}", route.route_id);
+		let entry_preflight = if route.usable {
+			"passed".to_string()
+		} else if matches!(
+			route.status,
+			crate::libwallet::mwixnet_protocol::RouteState::Unavailable
+				| crate::libwallet::mwixnet_protocol::RouteState::Draining
+				| crate::libwallet::mwixnet_protocol::RouteState::Expired
+				| crate::libwallet::mwixnet_protocol::RouteState::Revoked
+		) {
+			"not checked".to_string()
+		} else {
+			route
+				.unusable_reason
+				.clone()
+				.unwrap_or_else(|| "failed".into())
+		};
+		table.add_row(row![
+			&route_id[..12],
+			format!("{:?}", route.status),
+			entry_preflight,
+			route.hop_count,
+			route.total_fee,
+			format_mwixnet_timestamp(route.last_verified),
+			format_mwixnet_timestamp(route.valid_until)
+		]);
+	}
+	table.printstd();
+}
+
+pub fn mwixnet_requests(requests: Vec<crate::libwallet::mwixnet::WalletMwixnetRequestInfo>) {
+	println!();
+	println!("MWixnet Requests");
+	let mut table = table!();
+	table.set_titles(row![
+		"Request",
+		"Status",
+		"Tx",
+		"Route",
+		"Expires at height"
+	]);
+	for request in requests {
+		let route_id = format!("{:?}", request.route_id);
+		table.add_row(row![
+			format!("{:?}", request.wallet_request_id),
+			format!("{:?}", request.status),
+			request
+				.tx_id
+				.map(|id| id.to_string())
+				.unwrap_or_else(|| "-".into()),
+			&route_id[..12],
+			request.expires_at_height
+		]);
+	}
+	table.printstd();
+}
 
 /// Display outputs in a pretty way
 pub fn outputs(

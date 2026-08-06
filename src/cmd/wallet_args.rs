@@ -590,6 +590,68 @@ pub fn parse_mwixnet_args(args: &ArgMatches) -> Result<command::MwixnetArgs, Par
 	})
 }
 
+pub fn parse_mwixnet_route_args(
+	args: &ArgMatches,
+) -> Result<command::MwixnetRouteArgs, ParseError> {
+	let commitment = grin_util::from_hex(parse_required(args, "commit")?).map_err(|error| {
+		ParseError::ArgumentError(format!("Invalid output commitment: {}", error))
+	})?;
+	if commitment.len() != 33 {
+		return Err(ParseError::ArgumentError(
+			"Output commitment must be 33 bytes".into(),
+		));
+	}
+	let route = grin_util::from_hex(parse_required(args, "route")?)
+		.map_err(|error| ParseError::ArgumentError(format!("Invalid route ID: {}", error)))?;
+	let route_id = grin_wallet_libwallet::mwixnet_protocol::Hash(
+		route
+			.try_into()
+			.map_err(|_| ParseError::ArgumentError("Route ID must be 32 bytes".into()))?,
+	);
+	let request_ttl_blocks = args
+		.value_of("request_ttl_blocks")
+		.map(|value| {
+			value
+				.parse()
+				.map_err(|_| ParseError::ArgumentError("request_ttl_blocks must be a u16".into()))
+		})
+		.transpose()?;
+	let max_total_fee = args
+		.value_of("max_total_fee")
+		.map(|value| parse_u64(value, "max_total_fee"))
+		.transpose()?;
+	Ok(command::MwixnetRouteArgs {
+		route_id,
+		commitment: Commitment::from_vec(commitment),
+		request_ttl_blocks,
+		max_total_fee,
+	})
+}
+
+pub fn parse_mwixnet_request_id(
+	args: &ArgMatches,
+) -> Result<Option<grin_wallet_libwallet::mwixnet_protocol::Hash>, ParseError> {
+	args.value_of("request")
+		.map(|request| {
+			let request = grin_util::from_hex(request).map_err(|error| {
+				ParseError::ArgumentError(format!("Invalid wallet request ID: {}", error))
+			})?;
+			Ok(grin_wallet_libwallet::mwixnet_protocol::Hash(
+				request.try_into().map_err(|_| {
+					ParseError::ArgumentError("Wallet request ID must be 32 bytes".into())
+				})?,
+			))
+		})
+		.transpose()
+}
+
+pub fn parse_required_mwixnet_request_id(
+	args: &ArgMatches,
+) -> Result<grin_wallet_libwallet::mwixnet_protocol::Hash, ParseError> {
+	parse_mwixnet_request_id(args)?
+		.ok_or_else(|| ParseError::ArgumentError("Wallet request ID is required".into()))
+}
+
 pub fn parse_receive_args(args: &ArgMatches) -> Result<command::ReceiveArgs, ParseError> {
 	// input file
 	let input_file = match args.is_present("input") {
@@ -1268,10 +1330,29 @@ where
 				test_mode,
 			)
 		}
-		("mwixnet", Some(args)) => {
-			let a = arg_parse!(parse_mwixnet_args(&args));
-			command::mwixnet(owner_api, km, a, tor_config)
-		}
+		("mwixnet", Some(args)) => match args.subcommand() {
+			("routes", Some(_)) => command::mwixnet_routes(owner_api),
+			("status", Some(args)) => {
+				let request = arg_parse!(parse_mwixnet_request_id(args));
+				command::mwixnet_requests(owner_api, km, request, false)
+			}
+			("retry", Some(args)) => {
+				let request = arg_parse!(parse_required_mwixnet_request_id(args));
+				command::mwixnet_requests(owner_api, km, Some(request), true)
+			}
+			("cancel", Some(args)) => {
+				let request = arg_parse!(parse_required_mwixnet_request_id(args));
+				command::mwixnet_cancel(owner_api, km, request)
+			}
+			("send", Some(args)) => {
+				let args = arg_parse!(parse_mwixnet_route_args(args));
+				command::mwixnet_route(owner_api, km, args)
+			}
+			_ => {
+				let a = arg_parse!(parse_mwixnet_args(&args));
+				command::mwixnet(owner_api, km, a, tor_config)
+			}
+		},
 		("receive", Some(args)) => {
 			let a = arg_parse!(parse_receive_args(&args));
 			command::receive(owner_api, km, &global_wallet_args, a, tor_config, test_mode)
