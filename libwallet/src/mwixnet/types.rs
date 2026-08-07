@@ -726,6 +726,78 @@ pub struct VerifiedMwixnetRoute {
 }
 
 impl VerifiedMwixnetRoute {
+	fn validate_announcement_binding(
+		&self,
+		first: &mwixnet_protocol::RouteHop,
+	) -> Result<(), String> {
+		if self.announcement.route_id != self.manifest.route_id
+			|| self.announcement.manifest_sequence != self.manifest.manifest_sequence
+			|| self.announcement.manifest_hash != self.manifest.hash()
+			|| self.announcement.health_hash != self.health.certificate.hash()
+			|| self.announcement.swap_identity != self.manifest.swap_identity
+			|| self.announcement.entry_onion != first.onion_address
+			|| self.announcement.hop_count as usize != self.manifest.ordered_hops.len()
+			|| self.announcement.fee_per_hop != self.manifest.fee_per_hop
+			|| self.announcement.last_verified != self.health.certificate.verified_at
+			|| self.announcement.valid_until > self.health.certificate.expires_at
+		{
+			return Err("MWixnet route announcement does not match".to_string());
+		}
+		let participants = self
+			.manifest
+			.ordered_hops
+			.iter()
+			.map(|hop| hop.identity_public_key)
+			.collect::<Vec<_>>();
+		if self.announcement.participant_identities != participants {
+			return Err("MWixnet route participant list does not match".to_string());
+		}
+		Ok(())
+	}
+
+	fn validate_offer_binding(&self, first: &mwixnet_protocol::RouteHop) -> Result<(), String> {
+		if self.swap_offer.identity_public_key != first.identity_public_key
+			|| self.swap_offer.onion_address != first.onion_address
+			|| self.swap_offer.onion_public_key != first.onion_public_key
+			|| self.manifest.fee_per_hop < self.swap_offer.minimum_fee
+		{
+			return Err("MWixnet swap offer does not match".to_string());
+		}
+		Ok(())
+	}
+
+	fn validate_status_binding(
+		&self,
+		status: &mwixnet_protocol::RouteStatus,
+	) -> Result<(), String> {
+		if status.route_id != self.manifest.route_id
+			|| status.manifest_sequence != self.manifest.manifest_sequence
+			|| status.manifest_hash != self.manifest.hash()
+			|| status.swap_identity != self.manifest.swap_identity
+			|| status.sequence <= self.announcement.sequence
+			|| status.last_verified != self.announcement.last_verified
+			|| status.valid_until > self.announcement.valid_until
+		{
+			return Err("MWixnet route status does not match".to_string());
+		}
+		Ok(())
+	}
+
+	fn validate_revocation_binding(
+		&self,
+		revocation: &mwixnet_protocol::RouteRevocation,
+	) -> Result<(), String> {
+		if revocation.route_id != self.manifest.route_id
+			|| revocation.manifest_sequence != self.manifest.manifest_sequence
+			|| revocation.manifest_hash != self.manifest.hash()
+			|| !self.manifest.acceptances.iter().any(|acceptance| {
+				acceptance.participant_identity == revocation.participant_identity
+			}) {
+			return Err("MWixnet route revocation does not match".to_string());
+		}
+		Ok(())
+	}
+
 	/// Verify all records and their cross-record bindings.
 	pub fn validate(&self, now: u64) -> Result<(), String> {
 		self.announcement
@@ -745,61 +817,21 @@ impl VerifiedMwixnetRoute {
 			.ordered_hops
 			.first()
 			.ok_or_else(|| "route has no swap server".to_string())?;
-		if self.announcement.route_id != self.manifest.route_id
-			|| self.announcement.manifest_sequence != self.manifest.manifest_sequence
-			|| self.announcement.manifest_hash != self.manifest.hash()
-			|| self.announcement.health_hash != self.health.certificate.hash()
-			|| self.announcement.swap_identity != self.manifest.swap_identity
-			|| self.announcement.entry_onion != first.onion_address
-			|| self.announcement.hop_count as usize != self.manifest.ordered_hops.len()
-			|| self.announcement.fee_per_hop != self.manifest.fee_per_hop
-			|| self.announcement.last_verified != self.health.certificate.verified_at
-			|| self.announcement.valid_until > self.health.certificate.expires_at
-			|| self.swap_offer.identity_public_key != first.identity_public_key
-			|| self.swap_offer.onion_address != first.onion_address
-			|| self.swap_offer.onion_public_key != first.onion_public_key
-			|| self.manifest.fee_per_hop < self.swap_offer.minimum_fee
-		{
-			return Err("MWixnet route records do not match".to_string());
-		}
+		self.validate_announcement_binding(first)?;
+		self.validate_offer_binding(first)?;
 		self.manifest
 			.fee_per_hop
 			.checked_mul(self.manifest.ordered_hops.len() as u64)
 			.ok_or_else(|| "MWixnet route fee overflow".to_string())?;
-		let participants = self
-			.manifest
-			.ordered_hops
-			.iter()
-			.map(|hop| hop.identity_public_key)
-			.collect::<Vec<_>>();
-		if self.announcement.participant_identities != participants {
-			return Err("MWixnet route participant list does not match".to_string());
-		}
 		if let Some(status) = &self.status {
 			status.validate(now).map_err(|error| error.to_string())?;
-			if status.route_id != self.manifest.route_id
-				|| status.manifest_sequence != self.manifest.manifest_sequence
-				|| status.manifest_hash != self.manifest.hash()
-				|| status.swap_identity != self.manifest.swap_identity
-				|| status.sequence <= self.announcement.sequence
-				|| status.last_verified != self.announcement.last_verified
-				|| status.valid_until > self.announcement.valid_until
-			{
-				return Err("MWixnet route status does not match".to_string());
-			}
+			self.validate_status_binding(status)?;
 		}
 		for revocation in &self.revocations {
 			revocation
 				.validate(now)
 				.map_err(|error| error.to_string())?;
-			if revocation.route_id != self.manifest.route_id
-				|| revocation.manifest_sequence != self.manifest.manifest_sequence
-				|| revocation.manifest_hash != self.manifest.hash()
-				|| !self.manifest.acceptances.iter().any(|acceptance| {
-					acceptance.participant_identity == revocation.participant_identity
-				}) {
-				return Err("MWixnet route revocation does not match".to_string());
-			}
+			self.validate_revocation_binding(revocation)?;
 		}
 		Ok(())
 	}
@@ -932,20 +964,22 @@ mod tests {
 			commit: secp::commit(amount, &blind).unwrap(),
 			enc_payloads: Vec::new(),
 		};
-		let mut request = RouteSwapReq {
+		let wallet_request_id = mwixnet_protocol::Hash([2; 32]);
+		let route_id = mwixnet_protocol::Hash([3; 32]);
+		let onion_hash = RouteSwapReq::onion_hash(&onion);
+		let request_hash =
+			RouteSwapReq::signing_hash(&wallet_request_id, &route_id, 4, 100, &onion_hash);
+		RouteSwapReq {
 			version: mwixnet_protocol::MWIXNET_PROTOCOL_VERSION,
 			msg_type: mwixnet_protocol::MwixnetType::SwapReq,
-			wallet_request_id: mwixnet_protocol::Hash([2; 32]),
-			route_id: mwixnet_protocol::Hash([3; 32]),
+			wallet_request_id,
+			route_id,
 			manifest_sequence: 4,
 			expires_at_height: 100,
-			onion_hash: RouteSwapReq::onion_hash(&onion),
+			onion_hash,
 			onion,
-			comsig: ComSignature::sign(amount, &blind, &Vec::new(), false).unwrap(),
-		};
-		request.comsig =
-			ComSignature::sign(amount, &blind, &request.hash().0.to_vec(), false).unwrap();
-		request
+			comsig: ComSignature::sign(amount, &blind, &request_hash.0.to_vec(), false).unwrap(),
+		}
 	}
 
 	#[test]
