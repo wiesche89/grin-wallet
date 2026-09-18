@@ -22,8 +22,8 @@ use crate::grin_util::secp::key::{PublicKey, SecretKey};
 use crate::grin_util::secp::pedersen::{Commitment, RangeProof};
 use crate::grin_util::secp::Signature;
 use crate::grin_util::static_secp_instance;
-use ed25519_dalek::PublicKey as DalekPublicKey;
 use ed25519_dalek::Signature as DalekSignature;
+use ed25519_dalek::VerifyingKey as DalekPublicKey;
 use std::convert::TryFrom;
 use uuid::Uuid;
 
@@ -428,8 +428,20 @@ impl<'a> Writeable for ProofWrapRef<'a> {
 
 impl Readable for ProofWrap {
 	fn read<R: Reader>(reader: &mut R) -> Result<ProofWrap, grin_ser::Error> {
-		let saddr = DalekPublicKey::from_bytes(&reader.read_fixed_bytes(32)?).unwrap();
-		let raddr = DalekPublicKey::from_bytes(&reader.read_fixed_bytes(32)?).unwrap();
+		let saddr = DalekPublicKey::from_bytes(
+			&reader
+				.read_fixed_bytes(32)?
+				.try_into()
+				.map_err(|_| grin_ser::Error::CorruptedData)?,
+		)
+		.unwrap();
+		let raddr = DalekPublicKey::from_bytes(
+			&reader
+				.read_fixed_bytes(32)?
+				.try_into()
+				.map_err(|_| grin_ser::Error::CorruptedData)?,
+		)
+		.unwrap();
 		let rsig = match reader.read_u8()? {
 			0 => None,
 			1 | _ => Some(DalekSignature::try_from(&reader.read_fixed_bytes(64)?[..]).unwrap()),
@@ -484,8 +496,12 @@ impl<'de> serde::Deserialize<'de> for SlateV5Bin {
 				E: serde::de::Error,
 			{
 				let mut reader = std::io::Cursor::new(value.to_vec());
-				let s = grin_ser::deserialize(&mut reader, grin_ser::ProtocolVersion(4))
-					.map_err(|err| serde::de::Error::custom(err.to_string()))?;
+				let s = grin_ser::deserialize(
+					&mut reader,
+					grin_ser::ProtocolVersion(4),
+					grin_ser::DeserializationMode::default(),
+				)
+				.map_err(|err| serde::de::Error::custom(err.to_string()))?;
 				Ok(s)
 			}
 		}
@@ -586,8 +602,8 @@ fn slate_v5_serialize_deserialize() {
 	use crate::grin_util::from_hex;
 	use crate::grin_util::secp::key::PublicKey;
 	use crate::{Slate, TxFlow};
-	use grin_wallet_util::grin_core::global::{set_local_chain_type, ChainTypes};
-	use grin_wallet_util::grin_keychain::{ExtKeychain, Keychain, SwitchCommitmentType};
+	use grin_core::global::{set_local_chain_type, ChainTypes};
+	use grin_keychain::{ExtKeychain, Keychain, SwitchCommitmentType};
 	set_local_chain_type(ChainTypes::Mainnet);
 	let slate = Slate::blank(1, TxFlow::Standard);
 	let mut v5 = SlateV5::from(slate);
@@ -672,7 +688,7 @@ fn slate_v5_serialize_deserialize() {
 	let mut v5 = v5_1_copy;
 	let raw_pubkey_str = "d03c09e9c19bb74aa9ea44e0fe5ae237a9bf40bddf0941064a80913a4459c8bb";
 	let b = from_hex(raw_pubkey_str).unwrap();
-	let d_pkey = DalekPublicKey::from_bytes(&b).unwrap();
+	let d_pkey = DalekPublicKey::from_bytes(&b.try_into().unwrap()).unwrap();
 	v5.proof = Some(PaymentInfoV5 {
 		raddr: d_pkey.clone(),
 		saddr: d_pkey.clone(),

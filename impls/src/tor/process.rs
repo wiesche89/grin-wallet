@@ -51,14 +51,14 @@ extern crate timer;
 
 use regex::Regex;
 use std::fs::{self, File};
-use std::io;
 use std::io::Write;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, MAIN_SEPARATOR};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc::channel;
 use std::thread;
-use sysinfo::{Process, ProcessExt, Signal};
+use std::{cmp, io};
+use sysinfo::{Process, ProcessExt, System, SystemExt};
 
 #[cfg(windows)]
 const TOR_EXE_NAME: &str = "tor.exe";
@@ -78,25 +78,16 @@ pub enum Error {
 	Timeout,
 }
 
-#[cfg(windows)]
-fn get_process(pid: i32) -> Process {
-	Process::new(pid as usize, None, 0)
-}
-
-#[cfg(not(windows))]
-fn get_process(pid: i32) -> Process {
-	Process::new(pid, None, 0)
-}
-
 pub struct TorProcess {
 	tor_cmd: String,
 	args: Vec<String>,
 	torrc_path: Option<String>,
 	completion_percent: u8,
-	timeout: u32,
+	timeout: u64,
 	working_dir: Option<String>,
 	pub stdout: Option<BufReader<ChildStdout>>,
 	pub process: Option<Child>,
+	sys: System,
 }
 
 impl TorProcess {
@@ -105,12 +96,18 @@ impl TorProcess {
 			tor_cmd: TOR_EXE_NAME.to_string(),
 			args: vec![],
 			torrc_path: None,
-			completion_percent: 100 as u8,
-			timeout: 0 as u32,
+			completion_percent: 100,
+			timeout: 0,
 			working_dir: None,
 			stdout: None,
 			process: None,
+			sys: System::new(),
 		}
+	}
+
+	fn get_process(&mut self, pid: i32) -> Option<&Process> {
+		self.sys.refresh_all();
+		self.sys.process((pid as usize).into())
 	}
 
 	pub fn tor_cmd(&mut self, tor_cmd: &str) -> &mut Self {
@@ -140,7 +137,7 @@ impl TorProcess {
 		self
 	}
 
-	pub fn timeout(&mut self, timeout: u32) -> &mut Self {
+	pub fn timeout(&mut self, timeout: u64) -> &mut Self {
 		self.timeout = timeout;
 		self
 	}
@@ -164,8 +161,9 @@ impl TorProcess {
 				let pid = pid
 					.parse::<i32>()
 					.map_err(|err| Error::PID(format!("{:?}", err)))?;
-				let process = get_process(pid);
-				let _ = process.kill(Signal::Kill);
+				if let Some(p) = self.get_process(pid) {
+					let _ = p.kill();
+				}
 			}
 		}
 		if let Some(ref torrc_path) = self.torrc_path {
@@ -183,7 +181,7 @@ impl TorProcess {
 			})?;
 
 		if let Some(ref d) = self.working_dir {
-			// split out the process id, so if we don't exit cleanly
+			// Split out the process id, so if we don't exit cleanly
 			// we can take it down on the next run
 			let pid_file_name = format!("{}{}pid", d, MAIN_SEPARATOR);
 			let mut file = File::create(pid_file_name).map_err(Error::IO)?;
@@ -200,10 +198,11 @@ impl TorProcess {
 		let stdout_timeout_tx = stdout_tx.clone();
 
 		let timer = timer::Timer::new();
-		let _guard =
-			timer.schedule_with_delay(chrono::Duration::seconds(self.timeout as i64), move || {
-				stdout_timeout_tx.send(Err(Error::Timeout)).unwrap_or(());
-			});
+		// Keep this below chrono's DateTime range used by timer.
+		let timeout = chrono::Duration::seconds(cmp::min(self.timeout, u32::MAX as u64) as i64);
+		let _guard = timer.schedule_with_delay(timeout, move || {
+			stdout_timeout_tx.send(Err(Error::Timeout)).unwrap_or(());
+		});
 		let stdout_thread = thread::spawn(move || {
 			stdout_tx
 				.send(Self::parse_tor_stdout(stdout, completion_percent))
@@ -227,8 +226,8 @@ impl TorProcess {
 		mut stdout: BufReader<ChildStdout>,
 		completion_perc: u8,
 	) -> Result<BufReader<ChildStdout>, Error> {
-		let re_bootstrap = Regex::new(r"^\[notice\] Bootstrapped (?P<perc>[0-9]+)%(.*): ")
-			.map_err(Error::Regex)?;
+		let re_bootstrap =
+			Regex::new(r"^\[notice] Bootstrapped (?P<perc>[0-9]+)%(.*): ").map_err(Error::Regex)?;
 
 		let timestamp_len = "May 16 02:50:08.792".len();
 		let mut warnings = Vec::new();

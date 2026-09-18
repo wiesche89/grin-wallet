@@ -16,7 +16,7 @@
 //! implementation
 
 use crate::config::{TorConfig, WalletConfig};
-use crate::error::{Error, ErrorKind};
+use crate::error::Error;
 use crate::grin_core::core::hash::Hash;
 use crate::grin_core::core::FeeFields;
 use crate::grin_core::core::{Output, Transaction, TxKernel};
@@ -25,22 +25,21 @@ use crate::grin_core::{global, ser};
 use crate::grin_keychain::{Identifier, Keychain};
 use crate::grin_util::logger::LoggingConfig;
 use crate::grin_util::secp::key::{PublicKey, SecretKey};
-use crate::grin_util::secp::{self, pedersen, Secp256k1};
+use crate::grin_util::secp::{pedersen, Secp256k1};
 use crate::grin_util::{ToHex, ZeroingString};
 use crate::slate_versions::ser as dalek_ser;
 use crate::util::sha3::{Digest, Sha3_256};
-use crate::InitTxArgs;
+use crate::{InitTxArgs, SlateState, WalletBackend};
 use chrono::prelude::*;
-use ed25519_dalek::PublicKey as DalekPublicKey;
 use ed25519_dalek::Signature as DalekSignature;
-use failure::ResultExt;
+use ed25519_dalek::VerifyingKey as DalekPublicKey;
 use rand::rngs::mock::StepRng;
 use rand::thread_rng;
 use serde;
 use serde_json;
 use std::collections::HashMap;
-use std::fmt;
 use std::time::Duration;
+use std::{cmp, fmt};
 use uuid::Uuid;
 
 /// Combined trait to allow dynamic wallet dispatch
@@ -51,7 +50,7 @@ where
 	K: Keychain + 'a,
 {
 	/// Return the stored instance
-	fn lc_provider(&mut self) -> Result<&mut (dyn WalletLCProvider<'a, C, K> + 'a), Error>;
+	fn lc_provider(&mut self) -> Result<&mut dyn WalletLCProvider<'a, C, K>, Error>;
 }
 
 /// Trait for a provider of wallet lifecycle methods
@@ -133,231 +132,7 @@ where
 	fn delete_wallet(&self, name: Option<&str>) -> Result<(), Error>;
 
 	/// return wallet instance
-	fn wallet_inst(&mut self) -> Result<&mut Box<dyn WalletBackend<'a, C, K> + 'a>, Error>;
-}
-
-/// TODO:
-/// Wallets should implement this backend for their storage. All functions
-/// here expect that the wallet instance has instantiated itself or stored
-/// whatever credentials it needs
-pub trait WalletBackend<'ck, C, K>: Send + Sync
-where
-	C: NodeClient + 'ck,
-	K: Keychain + 'ck,
-{
-	/// Set the keychain, which should already be initialized
-	/// Optionally return a token value used to XOR the stored
-	/// key value
-	fn set_keychain(
-		&mut self,
-		k: Box<K>,
-		mask: bool,
-		use_test_rng: bool,
-	) -> Result<Option<SecretKey>, Error>;
-
-	/// Close wallet and remove any stored credentials (TBD)
-	fn close(&mut self) -> Result<(), Error>;
-
-	/// Return the keychain being used. Ensure a cloned copy so it will be dropped
-	/// and zeroized by the caller
-	/// Can optionally take a mask value
-	fn keychain(&self, mask: Option<&SecretKey>) -> Result<K, Error>;
-
-	/// Return the client being used to communicate with the node
-	fn w2n_client(&mut self) -> &mut C;
-
-	/// return the commit for caching if allowed, none otherwise
-	fn calc_commit_for_cache(
-		&mut self,
-		keychain_mask: Option<&SecretKey>,
-		amount: u64,
-		id: &Identifier,
-	) -> Result<Option<String>, Error>;
-
-	/// return the multisig commit sum for caching if allowed, none otherwise
-	fn calc_multisig_commit_for_cache(
-		&mut self,
-		keychain_mask: Option<&SecretKey>,
-		amount: u64,
-		id: &Identifier,
-		partial_commit: &pedersen::Commitment,
-	) -> Result<(Option<pedersen::Commitment>, Option<pedersen::Commitment>), Error>;
-
-	/// Set parent key id by stored account name
-	fn set_parent_key_id_by_name(&mut self, label: &str) -> Result<(), Error>;
-
-	/// The BIP32 path of the parent path to use for all output-related
-	/// functions, (essentially 'accounts' within a wallet.
-	fn set_parent_key_id(&mut self, _: Identifier);
-
-	/// return the parent path
-	fn parent_key_id(&mut self) -> Identifier;
-
-	/// Iterate over all output data stored by the backend
-	fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = OutputData> + 'a>;
-
-	/// Get output data by id
-	fn get(&self, id: &Identifier, mmr_index: &Option<u64>) -> Result<OutputData, Error>;
-
-	/// Get an (Optional) tx log entry by uuid
-	fn get_tx_log_entry(&self, uuid: &Uuid) -> Result<Option<TxLogEntry>, Error>;
-
-	/// Retrieves the private context associated with a given slate id
-	fn get_private_context(
-		&mut self,
-		keychain_mask: Option<&SecretKey>,
-		slate_id: &[u8],
-	) -> Result<Context, Error>;
-
-	/// Iterate over all output data stored by the backend
-	fn tx_log_iter<'a>(&'a self) -> Box<dyn Iterator<Item = TxLogEntry> + 'a>;
-
-	/// Iterate over all stored account paths
-	fn acct_path_iter<'a>(&'a self) -> Box<dyn Iterator<Item = AcctPathMapping> + 'a>;
-
-	/// Gets an account path for a given label
-	fn get_acct_path(&self, label: String) -> Result<Option<AcctPathMapping>, Error>;
-
-	/// Stores a transaction
-	fn store_tx(&self, uuid: &str, tx: &Transaction) -> Result<(), Error>;
-
-	/// Retrieves a stored transaction from a TxLogEntry
-	fn get_stored_tx(&self, uuid: &str) -> Result<Option<Transaction>, Error>;
-
-	/// Create a new write batch to update or remove output data
-	fn batch<'a>(
-		&'a mut self,
-		keychain_mask: Option<&SecretKey>,
-	) -> Result<Box<dyn WalletOutputBatch<K> + 'a>, Error>;
-
-	/// Batch for use when keychain isn't available or required
-	fn batch_no_mask<'a>(&'a mut self) -> Result<Box<dyn WalletOutputBatch<K> + 'a>, Error>;
-
-	/// Return the current child Index
-	fn current_child_index(&mut self, parent_key_id: &Identifier) -> Result<u32, Error>;
-
-	/// Next child ID when we want to create a new output, based on current parent
-	fn next_child(&mut self, keychain_mask: Option<&SecretKey>) -> Result<Identifier, Error>;
-
-	/// Return the current atomic secret index
-	fn current_atomic_id(&mut self) -> Result<Identifier, Error>;
-
-	/// Next atomic ID when we want to create a new atomic secret
-	fn next_atomic_id(&mut self, keychain_mask: Option<&SecretKey>) -> Result<Identifier, Error>;
-
-	/// Get the atomic ID for the atomic swap associated with the given UUID
-	fn get_used_atomic_id(&mut self, id: &Uuid) -> Result<Identifier, Error>;
-
-	/// last verified height of outputs directly descending from the given parent key
-	fn last_confirmed_height(&mut self) -> Result<u64, Error>;
-
-	/// last block scanned during scan or restore
-	fn last_scanned_block(&mut self) -> Result<ScannedBlockInfo, Error>;
-
-	/// Flag whether the wallet needs a full UTXO scan on next update attempt
-	fn init_status(&mut self) -> Result<WalletInitStatus, Error>;
-
-	/// Get the secret for an atomic swap transaction
-	fn get_atomic_secret(
-		&mut self,
-		keychain_mask: Option<&SecretKey>,
-		atomic_id: &Identifier,
-	) -> Result<SecretKey, Error>;
-
-	/// Get the recovered secret for an atomic swap transaction
-	fn get_recovered_atomic_secret(
-		&mut self,
-		keychain_mask: Option<&SecretKey>,
-		atomic_id: &Identifier,
-	) -> Result<SecretKey, Error>;
-}
-
-/// Batch trait to update the output data backend atomically. Trying to use a
-/// batch after commit MAY result in a panic. Due to this being a trait, the
-/// commit method can't take ownership.
-/// TODO: Should these be split into separate batch objects, for outputs,
-/// tx_log entries and meta/details?
-pub trait WalletOutputBatch<K>
-where
-	K: Keychain,
-{
-	/// Return the keychain being used
-	fn keychain(&mut self) -> &mut K;
-
-	/// Add or update data about an output to the backend
-	fn save(&mut self, out: OutputData) -> Result<(), Error>;
-
-	/// Gets output data by id
-	fn get(&self, id: &Identifier, mmr_index: &Option<u64>) -> Result<OutputData, Error>;
-
-	/// Iterate over all output data stored by the backend
-	fn iter(&self) -> Box<dyn Iterator<Item = OutputData>>;
-
-	/// Delete data about an output from the backend
-	fn delete(&mut self, id: &Identifier, mmr_index: &Option<u64>) -> Result<(), Error>;
-
-	/// Save last stored child index of a given parent
-	fn save_child_index(&mut self, parent_key_id: &Identifier, child_n: u32) -> Result<(), Error>;
-
-	/// Save global atomic index under the current keychain mask
-	fn save_atomic_index(&mut self, atomic_idx: u32) -> Result<(), Error>;
-
-	/// Save an atomic index that has been used in an atomic swap
-	fn save_used_atomic_index(&mut self, id: &Uuid, atomic_idx: u32) -> Result<(), Error>;
-
-	/// Save last confirmed height of outputs for a given parent
-	fn save_last_confirmed_height(
-		&mut self,
-		parent_key_id: &Identifier,
-		height: u64,
-	) -> Result<(), Error>;
-
-	/// Save the last PMMR index that was scanned via a scan operation
-	fn save_last_scanned_block(&mut self, block: ScannedBlockInfo) -> Result<(), Error>;
-
-	/// Save flag indicating whether wallet needs a full UTXO scan
-	fn save_init_status(&mut self, value: WalletInitStatus) -> Result<(), Error>;
-
-	/// get next tx log entry for the parent
-	fn next_tx_log_id(&mut self, parent_key_id: &Identifier) -> Result<u32, Error>;
-
-	/// Iterate over tx log data stored by the backend
-	fn tx_log_iter(&self) -> Box<dyn Iterator<Item = TxLogEntry>>;
-
-	/// save a tx log entry
-	fn save_tx_log_entry(&mut self, t: TxLogEntry, parent_id: &Identifier) -> Result<(), Error>;
-
-	/// save an account label -> path mapping
-	fn save_acct_path(&mut self, mapping: AcctPathMapping) -> Result<(), Error>;
-
-	/// Iterate over account names stored in backend
-	fn acct_path_iter(&self) -> Box<dyn Iterator<Item = AcctPathMapping>>;
-
-	/// Save an output as locked in the backend
-	fn lock_output(&mut self, out: &mut OutputData) -> Result<(), Error>;
-
-	/// Saves the private context associated with a slate id
-	fn save_private_context(&mut self, slate_id: &[u8], ctx: &Context) -> Result<(), Error>;
-
-	/// Delete the private context associated with the slate id
-	fn delete_private_context(&mut self, slate_id: &[u8]) -> Result<(), Error>;
-
-	/// Write the wallet data to backend file
-	fn commit(&self) -> Result<(), Error>;
-
-	/// Save secret for an atomic swap transaction
-	fn save_atomic_secret(
-		&mut self,
-		atomic_id: &Identifier,
-		secret: &SecretKey,
-	) -> Result<(), Error>;
-
-	/// Save recovered secret for an atomic swap transaction
-	fn save_recovered_atomic_secret(
-		&mut self,
-		atomic_id: &Identifier,
-		secret: &SecretKey,
-	) -> Result<(), Error>;
+	fn wallet_inst(&mut self) -> Result<&mut WalletBackend<C, K>, Error>;
 }
 
 /// Encapsulate all wallet-node communication functions. No functions within libwallet
@@ -480,6 +255,7 @@ pub struct OutputData {
 	/// Is this a coinbase output? Is it subject to coinbase locktime?
 	pub is_coinbase: bool,
 	/// Is this a multisig output?
+	#[serde(default)]
 	pub is_multisig: bool,
 	/// Optional corresponding internal entry in tx entry log
 	pub tx_log_entry: Option<u32>,
@@ -593,6 +369,10 @@ impl fmt::Display for OutputStatus {
 	}
 }
 
+/// Maximum private transaction context size.
+/// Verified against `max_tx_weight()` below.
+const MAX_CONTEXT_SIZE: usize = 4 * 1024 * 1024;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 /// Holds the context for a single aggsig transaction
 pub struct Context {
@@ -641,7 +421,7 @@ pub struct Context {
 impl Context {
 	/// Create a new context with defaults
 	pub fn new(
-		secp: &secp::Secp256k1,
+		secp: &Secp256k1,
 		parent_key_id: &Identifier,
 		use_test_rng: bool,
 		is_initiator: bool,
@@ -663,7 +443,7 @@ impl Context {
 
 	/// Create a new context with a specific excess
 	pub fn with_excess(
-		secp: &secp::Secp256k1,
+		secp: &Secp256k1,
 		sec_key: SecretKey,
 		parent_key_id: &Identifier,
 		use_test_rng: bool,
@@ -774,13 +554,17 @@ impl Context {
 
 impl ser::Writeable for Context {
 	fn write<W: ser::Writer>(&self, writer: &mut W) -> Result<(), ser::Error> {
-		writer.write_bytes(&serde_json::to_vec(self).map_err(|_| ser::Error::CorruptedData)?)
+		let data = serde_json::to_vec(self).map_err(|_| ser::Error::CorruptedData)?;
+		if data.len() > MAX_CONTEXT_SIZE {
+			return Err(ser::Error::TooLargeReadErr);
+		}
+		writer.write_bytes(&data)
 	}
 }
 
 impl ser::Readable for Context {
 	fn read<R: ser::Reader>(reader: &mut R) -> Result<Context, ser::Error> {
-		let data = reader.read_bytes_len_prefix()?;
+		let data = read_bytes_len_prefix(reader)?;
 		serde_json::from_slice(&data[..]).map_err(|_| ser::Error::CorruptedData)
 	}
 }
@@ -798,7 +582,7 @@ impl BlockIdentifier {
 	/// convert to hex string
 	pub fn from_hex(hex: &str) -> Result<BlockIdentifier, Error> {
 		let hash =
-			Hash::from_hex(hex).context(ErrorKind::GenericError("Invalid hex".to_owned()))?;
+			Hash::from_hex(hex).map_err(|e| Error::GenericError(format!("Invalid hex: {}", e)))?;
 		Ok(BlockIdentifier(hash))
 	}
 }
@@ -913,6 +697,8 @@ pub struct TxLogEntry {
 	pub id: u32,
 	/// Slate transaction this entry is associated with, if any
 	pub tx_slate_id: Option<Uuid>,
+	/// Transaction slate state
+	pub tx_slate_state: Option<SlateState>,
 	/// Transaction type (as above)
 	pub tx_type: TxLogEntryType,
 	/// Time this tx entry was created
@@ -976,10 +762,11 @@ impl TxLogEntry {
 	/// Return a new blank with TS initialised with next entry
 	pub fn new(parent_key_id: Identifier, t: TxLogEntryType, id: u32) -> Self {
 		TxLogEntry {
-			parent_key_id: parent_key_id,
+			parent_key_id,
 			tx_type: t,
-			id: id,
+			id,
 			tx_slate_id: None,
+			tx_slate_state: None,
 			creation_ts: Utc::now(),
 			confirmation_ts: None,
 			confirmed: false,
@@ -1136,6 +923,72 @@ impl ser::Readable for WalletInitStatus {
 	}
 }
 
+/// Utility struct for return values from below
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewWallet {
+	/// Rewind Hash used to retrieve the outputs
+	pub rewind_hash: String,
+	/// All outputs information that belongs to the rewind hash
+	pub output_result: Vec<ViewWalletOutputResult>,
+	/// total balance
+	pub total_balance: u64,
+	/// last pmmr index
+	pub last_pmmr_index: u64,
+}
+/// Utility struct for return values from below
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewWalletOutputResult {
+	///
+	pub commit: String,
+	///
+	pub value: u64,
+	///
+	pub height: u64,
+	///
+	pub mmr_index: u64,
+	///
+	pub is_coinbase: bool,
+	///
+	pub lock_height: u64,
+}
+
+impl ViewWalletOutputResult {
+	pub fn num_confirmations(&self, tip_height: u64) -> u64 {
+		if self.height > tip_height {
+			0
+		} else {
+			1 + (tip_height - self.height)
+		}
+	}
+}
+
+fn read_bytes_len_prefix<R: ser::Reader>(reader: &mut R) -> Result<Vec<u8>, ser::Error> {
+	let len = reader.read_u64()?;
+	if len > MAX_CONTEXT_SIZE as u64 {
+		return Err(ser::Error::TooLargeReadErr);
+	}
+	let mut len = len as usize;
+	match reader.read_limit() {
+		None => reader.read_fixed_bytes(len),
+		Some(limit) => {
+			if limit == 0 {
+				return reader.read_fixed_bytes(len);
+			}
+			let mut data = vec![];
+			loop {
+				if len == 0 {
+					break;
+				}
+				let read_size = cmp::min(len, limit);
+				let read_data = reader.read_fixed_bytes(read_size)?;
+				data.extend_from_slice(&read_data);
+				len -= read_size;
+			}
+			Ok(data)
+		}
+	}
+}
+
 /// Serializes an Option<Duration> to and from a string
 pub mod option_duration_as_secs {
 	use serde::de::Error;
@@ -1173,12 +1026,38 @@ pub mod option_duration_as_secs {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use grin_core::ser::{DeserializationMode, ProtocolVersion, Readable, Reader, StreamingReader};
+	use grin_keychain::{ExtKeychain, ExtKeychainPath};
 	use serde_json::Value;
 
 	#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 	struct TestSer {
 		#[serde(with = "option_duration_as_secs", default)]
 		dur: Option<Duration>,
+	}
+
+	#[test]
+	fn legacy_output_without_multisig_flag() {
+		let output = OutputData {
+			root_key_id: Identifier::zero(),
+			key_id: Identifier::zero(),
+			n_child: 0,
+			commit: None,
+			mmr_index: None,
+			value: 10,
+			status: OutputStatus::Unspent,
+			height: 1,
+			lock_height: 0,
+			is_coinbase: false,
+			is_multisig: false,
+			tx_log_entry: None,
+		};
+		let mut stored = serde_json::to_value(output).unwrap();
+		stored.as_object_mut().unwrap().remove("is_multisig");
+		let restored: OutputData = serde_json::from_value(stored).unwrap();
+		assert!(!restored.is_multisig);
+		assert_eq!(restored.value, 10);
+		assert!(restored.eligible_to_spend(10, 1));
 	}
 
 	#[test]
@@ -1255,5 +1134,95 @@ mod tests {
 		assert!(des_ctx.tau_x.is_none());
 		assert!(des_ctx.tau_one.is_none());
 		assert!(des_ctx.tau_two.is_none());
+	}
+
+	#[test]
+	fn big_context_read() {
+		let protocol_ver = ProtocolVersion(3);
+
+		let create_context = || {
+			let parent = ExtKeychainPath::new(1, 1, 0, 0, 0).to_identifier();
+			let sender_keychain = ExtKeychain::from_random_seed(true).unwrap();
+
+			let mut context = Context::new(sender_keychain.secp(), &parent, false, true);
+			for i in 0..3000 {
+				let key_id = ExtKeychain::derive_key_id(1, 1, i, 0, 0);
+				context.add_output(&key_id, &None, i as u64);
+			}
+			context
+		};
+
+		{
+			let context = create_context();
+			let ser_value = ser::ser_vec(&context, protocol_ver).unwrap();
+			let mut value = ser_value.as_slice();
+			assert!(value.len() > 100_000);
+			let context = ser::deserialize::<Context, &[u8]>(
+				&mut value,
+				protocol_ver,
+				DeserializationMode::Full,
+			);
+			assert!(context.is_ok());
+		}
+
+		// StreamingReader has no per-read limit and reads the complete Context.
+		let context = create_context();
+		let ser_value = ser::ser_vec(&context, protocol_ver).unwrap();
+		let mut value = ser_value.as_slice();
+		let mut streaming_reader = StreamingReader::new(&mut value, protocol_ver);
+		assert!(streaming_reader.read_limit().is_none());
+		let res = Context::read(&mut streaming_reader);
+		assert_eq!(res.unwrap().get_outputs().len(), 3000);
+	}
+
+	#[test]
+	fn context_size_limit() {
+		let protocol_ver = ProtocolVersion(3);
+		let oversized_len = ((MAX_CONTEXT_SIZE + 1) as u64).to_be_bytes();
+		let mut oversized_prefix = oversized_len.as_slice();
+		let read = ser::deserialize::<Context, &[u8]>(
+			&mut oversized_prefix,
+			protocol_ver,
+			DeserializationMode::Full,
+		);
+		assert_eq!(read.unwrap_err(), ser::Error::TooLargeReadErr);
+
+		let parent = ExtKeychainPath::new(1, 1, 0, 0, 0).to_identifier();
+		let sender_keychain = ExtKeychain::from_random_seed(true).unwrap();
+		let mut context = Context::new(sender_keychain.secp(), &parent, false, true);
+		context.late_lock_args = Some(InitTxArgs {
+			src_acct_name: Some("x".repeat(MAX_CONTEXT_SIZE)),
+			..Default::default()
+		});
+
+		assert_eq!(
+			ser::ser_vec(&context, protocol_ver).unwrap_err(),
+			ser::Error::TooLargeReadErr
+		);
+	}
+
+	#[test]
+	fn max_weight_context_size() {
+		global::set_local_chain_type(global::ChainTypes::Mainnet);
+		let max_tx_weight = global::max_tx_weight();
+		let max_inputs = (1..)
+			.take_while(|inputs| Transaction::weight_by_iok(*inputs, 1, 1) <= max_tx_weight)
+			.last()
+			.unwrap();
+
+		let parent = ExtKeychainPath::new(1, 1, 0, 0, 0).to_identifier();
+		let sender_keychain = ExtKeychain::from_random_seed(true).unwrap();
+		let mut context = Context::new(sender_keychain.secp(), &parent, true, true);
+		for i in 0..max_inputs {
+			let key_id = ExtKeychain::derive_key_id(1, 1, i as u32, 0, 0);
+			context.add_input(&key_id, &Some(u64::MAX), u64::MAX);
+		}
+
+		let size = serde_json::to_vec(&context).unwrap().len();
+		println!("max-weight Context: {size} bytes ({max_inputs} inputs)");
+		assert!(
+			size <= MAX_CONTEXT_SIZE,
+			"max-weight Context is {size} bytes, limit is {MAX_CONTEXT_SIZE}"
+		);
 	}
 }

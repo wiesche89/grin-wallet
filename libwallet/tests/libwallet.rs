@@ -12,15 +12,15 @@
 // limitations under the License.
 
 //! core::libtx specific tests
-use grin_wallet_libwallet::Context;
-use grin_wallet_util::grin_core::core::transaction;
-use grin_wallet_util::grin_core::core::FeeFields;
-use grin_wallet_util::grin_core::libtx::{aggsig, proof};
-use grin_wallet_util::grin_keychain::{
+use grin_core::core::transaction;
+use grin_core::core::FeeFields;
+use grin_core::libtx::{aggsig, proof};
+use grin_keychain::{
 	BlindSum, BlindingFactor, ExtKeychain, ExtKeychainPath, Keychain, SwitchCommitmentType,
 };
-use grin_wallet_util::grin_util::secp;
-use grin_wallet_util::grin_util::secp::key::{PublicKey, SecretKey};
+use grin_util::secp;
+use grin_util::secp::key::{PublicKey, SecretKey};
+use grin_wallet_libwallet::Context;
 use rand::thread_rng;
 
 fn kernel_sig_msg() -> secp::Message {
@@ -538,8 +538,8 @@ fn test_rewind_range_proof() {
 
 #[test]
 fn test_atomic_swap_multisig_tx() {
+	use grin_core::global;
 	use grin_wallet_libwallet::{Slate, TxFlow};
-	use grin_wallet_util::grin_core::global;
 
 	global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
 

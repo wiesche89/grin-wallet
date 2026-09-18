@@ -20,8 +20,9 @@
 // 3. Base58 encode bytes from step 2
 // Finally add armor framing and space/newline formatting as desired
 
-use crate::{Error, ErrorKind};
-use grin_wallet_util::{byte_ser, grin_core::global::max_tx_weight};
+use crate::Error;
+use grin_core::global::max_tx_weight;
+use grin_wallet_util::byte_ser;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::str;
@@ -73,7 +74,10 @@ impl SlatepackArmor {
 		// Get the length of the header
 		let header_len = header_bytes.len() + 1;
 		// Skip the length of the header to read for the payload until the next period
-		let payload_bytes = armor_bytes[header_len as usize..]
+		let payload_source = armor_bytes
+			.get(header_len..)
+			.ok_or_else(|| Error::InvalidSlatepackData("Bad armor header".to_string()))?;
+		let payload_bytes = payload_source
 			.iter()
 			.take_while(|byte| **byte != b'.')
 			.cloned()
@@ -81,8 +85,14 @@ impl SlatepackArmor {
 		// Get length of the payload to check the footer framing
 		let payload_len = payload_bytes.len();
 		// Get footer bytes and verify them
-		let consumed_bytes = header_len + payload_len + 1;
-		let footer_bytes = armor_bytes[consumed_bytes as usize..]
+		let consumed_bytes = header_len
+			.checked_add(payload_len)
+			.and_then(|v| v.checked_add(1))
+			.ok_or_else(|| Error::InvalidSlatepackData("Bad armor footer".to_string()))?;
+		let footer_source = armor_bytes
+			.get(consumed_bytes..)
+			.ok_or_else(|| Error::InvalidSlatepackData("Bad armor footer".to_string()))?;
+		let footer_bytes = footer_source
 			.iter()
 			.take_while(|byte| **byte != b'.')
 			.cloned()
@@ -97,9 +107,11 @@ impl SlatepackArmor {
 		// Decode payload from base58
 		let base_decode = bs58::decode(&clean_payload)
 			.into_vec()
-			.map_err(|_| ErrorKind::SlatepackDeser("Bad bytes".into()))?;
-		let error_code = &base_decode[0..4];
-		let slatepack_bytes = &base_decode[4..];
+			.map_err(|_| Error::SlatepackDeser("Bad bytes".into()))?;
+		if base_decode.len() < 4 {
+			return Err(Error::SlatepackDeser("Payload too short".into()));
+		}
+		let (error_code, slatepack_bytes) = base_decode.split_at(4);
 		// Make sure the error check code is valid for the slate data
 		error_check(error_code, slatepack_bytes)?;
 		// Return slate as binary or string
@@ -109,7 +121,7 @@ impl SlatepackArmor {
 	/// Encode an armored slatepack
 	pub fn encode(slatepack: &Slatepack) -> Result<String, Error> {
 		let slatepack_bytes = byte_ser::to_bytes(&SlatepackBin(slatepack.clone()))
-			.map_err(|_| ErrorKind::SlatepackSer)?;
+			.map_err(|_| Error::SlatepackSer)?;
 		let encoded_slatepack = base58check(&slatepack_bytes)?;
 		let formatted_slatepack = format_slatepack(&format!("{}{}", HEADER, encoded_slatepack))?;
 		Ok(format!("{}{}\n", formatted_slatepack, FOOTER))
@@ -122,32 +134,29 @@ fn error_check(error_code: &[u8], slate_bytes: &[u8]) -> Result<(), Error> {
 	if error_code.iter().eq(new_check.iter()) {
 		Ok(())
 	} else {
-		Err(ErrorKind::InvalidSlatepackData(
+		Err(Error::InvalidSlatepackData(
 			"Bad slate error code- some data was corrupted".to_string(),
-		)
-		.into())
+		))
 	}
 }
 
 // Checks header framing bytes and returns an error if they are invalid
 fn check_header(header: &[u8]) -> Result<(), Error> {
-	let framing =
-		str::from_utf8(header).map_err(|_| ErrorKind::SlatepackDeser("Bad bytes".into()))?;
+	let framing = str::from_utf8(header).map_err(|_| Error::SlatepackDeser("Bad bytes".into()))?;
 	if HEADER_REGEX.is_match(framing) {
 		Ok(())
 	} else {
-		Err(ErrorKind::InvalidSlatepackData("Bad armor header".to_string()).into())
+		Err(Error::InvalidSlatepackData("Bad armor header".to_string()))
 	}
 }
 
 // Checks footer framing bytes and returns an error if they are invalid
 fn check_footer(footer: &[u8]) -> Result<(), Error> {
-	let framing =
-		str::from_utf8(footer).map_err(|_| ErrorKind::SlatepackDeser("Bad bytes".into()))?;
+	let framing = str::from_utf8(footer).map_err(|_| Error::SlatepackDeser("Bad bytes".into()))?;
 	if FOOTER_REGEX.is_match(framing) {
 		Ok(())
 	} else {
-		Err(ErrorKind::InvalidSlatepackData("Bad armor footer".to_string()).into())
+		Err(Error::InvalidSlatepackData("Bad armor footer".to_string()))
 	}
 }
 
@@ -190,11 +199,11 @@ fn format_slatepack(slatepack: &str) -> Result<String, Error> {
 
 // Returns the first four bytes of a double sha256 hash of some bytes
 fn generate_check(payload: &[u8]) -> Result<Vec<u8>, Error> {
-	let mut first_hash = Sha256::new();
-	first_hash.input(payload);
-	let mut second_hash = Sha256::new();
-	second_hash.input(first_hash.result());
-	let checksum = second_hash.result();
+	let mut first_hasher = Sha256::new();
+	first_hasher.update(payload);
+	let mut second_hasher = Sha256::new();
+	second_hasher.update(first_hasher.finalize());
+	let checksum = second_hasher.finalize();
 	let check_bytes: Vec<u8> = checksum[0..4].to_vec();
 	Ok(check_bytes)
 }

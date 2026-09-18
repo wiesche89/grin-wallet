@@ -20,6 +20,14 @@ fn comments() -> HashMap<String, String> {
 	let mut retval = HashMap::new();
 
 	retval.insert(
+		"config_file_version".to_string(),
+		"
+#Version of the Generated Configuration File for the Grin Wallet (DO NOT EDIT)
+"
+		.to_string(),
+	);
+
+	retval.insert(
 		"[wallet]".to_string(),
 		"
 #########################################
@@ -66,6 +74,13 @@ fn comments() -> HashMap<String, String> {
 		.to_string(),
 	);
 	retval.insert(
+		"node_api_request_timeout_secs".to_string(),
+		"
+#total timeout for requests to node API
+"
+		.to_string(),
+	);
+	retval.insert(
 		"node_api_secret_path".to_string(),
 		"
 #location of the node api secret for basic auth on the Grin API
@@ -105,16 +120,6 @@ fn comments() -> HashMap<String, String> {
 		.to_string(),
 	);
 	retval.insert(
-		"keybase_notify_ttl".to_string(),
-		"
-#The exploding lifetime for keybase notification on coins received.
-#Unit: Minute. Default value 1440 minutes for one day.
-#Refer to https://keybase.io/blog/keybase-exploding-messages for detail.
-#To disable this notification, set it as 0.
-"
-		.to_string(),
-	);
-	retval.insert(
 		"accept_fee_base".to_string(),
 		"
 #Minimum acceptable fee per unit of transaction weight
@@ -124,6 +129,22 @@ fn comments() -> HashMap<String, String> {
 	retval.insert(
 		"[logging]".to_string(),
 		"
+#Type of proxy, eg \"socks4\", \"socks5\", \"http\", \"https\"
+#transport = \"https\"
+
+#Proxy address, eg IP:PORT or Hostname
+#server = \"\"
+
+#Username for the proxy server authentification
+#user = \"\"
+
+#Password for the proxy server authentification
+#pass = \"\"
+
+#This computer goes through a firewall that only allows connections to certain ports (Optional)
+#allowed_port = [80, 443]
+
+
 #########################################
 ### LOGGING CONFIGURATION             ###
 #########################################
@@ -192,8 +213,24 @@ fn comments() -> HashMap<String, String> {
 		"[tor]".to_string(),
 		"
 #########################################
-### TOR CONFIGURATION (Experimental)  ###
+### TOR CONFIGURATION                 ###
 #########################################
+"
+		.to_string(),
+	);
+
+	retval.insert(
+		"use_integrated".to_string(),
+		"
+#Whether to use integrated Tor library
+"
+		.to_string(),
+	);
+
+	retval.insert(
+		"skip_send_attempt".to_string(),
+		"
+#Whether to skip send attempts (default false)
 "
 		.to_string(),
 	);
@@ -215,14 +252,6 @@ fn comments() -> HashMap<String, String> {
 	);
 
 	retval.insert(
-		"socks_proxy_addr".to_string(),
-		"
-# TOR (SOCKS) proxy server address
-"
-		.to_string(),
-	);
-
-	retval.insert(
 		"send_config_dir".to_string(),
 		"
 #Directory to output TOR configuration to when sending
@@ -230,14 +259,64 @@ fn comments() -> HashMap<String, String> {
 		.to_string(),
 	);
 
+	retval.insert(
+		"request_timeout_secs".to_string(),
+		"
+#Tor request timeout in seconds
+"
+		.to_string(),
+	);
+
+	retval.insert(
+		"bootstrap_timeout_secs".to_string(),
+		"
+#Tor bootstrap timeout in seconds
+"
+		.to_string(),
+	);
+
+	retval.insert(
+		"[tor.bridge]".to_string(),
+		"
+#########################################
+### TOR BRIDGE                        ###
+#########################################
+"
+		.to_string(),
+	);
+
+	retval.insert(
+		"[tor.proxy]".to_string(),
+		"
+#Tor bridge relay: allow to send and receive via TOR in a country where it is censored.
+#Enable it by entering a single bridge line. To disable it, you must comment it.
+#Support of the transport: webtunnel, obfs4, and snowflake.
+#webtunnel, obfs4proxy or snowflake client binary must be installed and on your path.
+#Custom path for client binary
+#bridge_bin_path = \"\"
+
+#For example, the bridge line must be in the following format for obfs4 transport: \"obfs4 [IP:PORT] [FINGERPRINT] cert=[CERT] iat-mode=[IAT-MODE]\"
+#bridge_line = \"\"
+
+#Plugging client option, needed only for snowflake (let it empty if you want to use the default option of tor) or debugging purpose
+#client_option = \"\"
+
+
+#########################################
+### TOR PROXY                         ###
+#########################################
+"
+	.to_string(),
+	);
+
 	retval
 }
 
 fn get_key(line: &str) -> String {
-	if line.contains('[') && line.contains(']') {
+	if line.starts_with('[') && line.ends_with(']') {
 		line.to_owned()
-	} else if line.contains('=') {
-		line.split('=').collect::<Vec<&str>>()[0].trim().to_owned()
+	} else if let Some((key, _)) = line.split_once('=') {
+		key.trim().to_owned()
 	} else {
 		"NOT_FOUND".to_owned()
 	}

@@ -23,17 +23,14 @@
 #![warn(missing_docs)]
 
 use grin_wallet_config as config;
-use grin_wallet_util::grin_core;
-use grin_wallet_util::grin_keychain;
-use grin_wallet_util::grin_store;
-use grin_wallet_util::grin_util;
+
+use grin_core;
+use grin_keychain;
+use grin_util;
 
 use grin_wallet_util as util;
 
 use blake2_rfc as blake2;
-
-use failure;
-extern crate failure_derive;
 
 #[macro_use]
 extern crate serde_derive;
@@ -48,14 +45,16 @@ extern crate strum_macros;
 
 pub mod address;
 pub mod api_impl;
+mod backend;
 mod error;
 mod internal;
+pub mod mwixnet;
 mod slate;
 pub mod slate_versions;
 pub mod slatepack;
 mod types;
 
-pub use crate::error::{Error, ErrorKind};
+pub use crate::error::Error;
 pub use crate::slate::{ParticipantData, Slate, SlateState, TxFlow};
 pub use crate::slate_versions::v4::sig_is_blank;
 pub use crate::slate_versions::{
@@ -67,16 +66,21 @@ pub use crate::slatepack::{
 };
 pub use api_impl::owner_updater::StatusMessage;
 pub use api_impl::types::{
-	BlockFees, InitTxArgs, InitTxSendArgs, IssueInvoiceTxArgs, NodeHeightResult,
-	OutputCommitMapping, PaymentProof, VersionInfo,
+	Amount, BlockFees, BuiltOutput, InitTxArgs, InitTxSendArgs, IssueInvoiceTxArgs,
+	NodeHeightResult, OutputCommitMapping, PaymentProof, RetrieveTxQueryArgs,
+	RetrieveTxQuerySortField, RetrieveTxQuerySortOrder, VersionInfo,
 };
+pub use backend::{WalletBackend, WalletBatch};
 pub use internal::scan::scan;
 pub use internal::tx::recover_atomic_secret;
+pub use internal::updater::{
+	map_wallet_outputs, refresh_outputs, retrieve_info, retrieve_outputs, retrieve_txs,
+};
 pub use slate_versions::ser as dalek_ser;
 pub use types::{
 	AcctPathMapping, BlockIdentifier, CbData, Context, NodeClient, NodeVersionInfo, OutputData,
 	OutputStatus, ScannedBlockInfo, StoredProofInfo, TxLogEntry, TxLogEntryType, TxWrapper,
-	WalletBackend, WalletInfo, WalletInitStatus, WalletInst, WalletLCProvider, WalletOutputBatch,
+	ViewWallet, WalletInfo, WalletInitStatus, WalletInst, WalletLCProvider,
 };
 
 /// Helper for taking a lock on the wallet instance

@@ -13,14 +13,12 @@
 // limitations under the License.
 
 mod file;
-pub mod http;
-mod keybase;
 mod slatepack;
+pub mod tor;
 
 pub use self::file::PathToSlate;
-pub use self::http::{HttpSlateSender, SchemeNotHttp};
-pub use self::keybase::{KeybaseAllChannels, KeybaseChannel};
 pub use self::slatepack::PathToSlatepack;
+pub use self::tor::TorSlateSender;
 
 use crate::config::WalletConfig;
 use crate::libwallet::{Error, Slate};

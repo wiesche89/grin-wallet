@@ -17,12 +17,13 @@ extern crate log;
 extern crate grin_wallet_controller as wallet;
 extern crate grin_wallet_impls as impls;
 
+use grin_core as core;
+use grin_keychain::{Keychain, SwitchCommitmentType};
 use grin_wallet_libwallet as libwallet;
-use grin_wallet_util::grin_core as core;
-use grin_wallet_util::grin_keychain::{Keychain, SwitchCommitmentType};
 
 use impls::test_framework::{self, LocalWalletClient};
 use libwallet::{InitTxArgs, Slate, SlateState, TxFlow};
+use std::path::PathBuf;
 use std::{sync::atomic::Ordering, thread, time::Duration};
 
 #[macro_use]
@@ -70,11 +71,16 @@ fn atomic_tx_impl(test_dir: &'static str) -> Result<(), libwallet::Error> {
 	let reward = core::consensus::REWARD;
 
 	// add some accounts
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1, None, |api, m| {
-		api.create_account_path(m, "mining")?;
-		api.create_account_path(m, "listener")?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1,
+		PathBuf::from(test_dir),
+		|api, m| {
+			api.create_account_path(m, "mining")?;
+			api.create_account_path(m, "listener")?;
+			Ok(())
+		},
+	)?;
 
 	// Get some mining done
 	{
@@ -86,71 +92,111 @@ fn atomic_tx_impl(test_dir: &'static str) -> Result<(), libwallet::Error> {
 		test_framework::award_blocks_to_wallet(&chain, wallet1.clone(), mask1, bh as usize, false);
 
 	// Sanity check wallet 1 contents
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1, None, |api, m| {
-		let (wallet1_refreshed, wallet1_info) = api.retrieve_summary_info(m, true, 1)?;
-		assert!(wallet1_refreshed);
-		assert_eq!(wallet1_info.last_confirmed_height, bh);
-		assert_eq!(wallet1_info.total, bh * reward);
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1,
+		PathBuf::from(test_dir),
+		|api, m| {
+			let (wallet1_refreshed, wallet1_info) = api.retrieve_summary_info(m, true, 1)?;
+			assert!(wallet1_refreshed);
+			assert_eq!(wallet1_info.last_confirmed_height, bh);
+			assert_eq!(wallet1_info.total, bh * reward);
+			Ok(())
+		},
+	)?;
 
 	let mut slate = Slate::blank(2, TxFlow::Atomic);
 
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1, None, |api, m| {
-		// Wallet 1 inititates the main atomic swap transaction
-		let args = InitTxArgs {
-			amount: 5012500000,
-			is_multisig: Some(true),
-			..Default::default()
-		};
-		slate = api.init_send_tx(m, args)?;
-		api.tx_lock_outputs(m, &slate)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1,
+		PathBuf::from(test_dir),
+		|api, m| {
+			// Wallet 1 inititates the main atomic swap transaction
+			let args = InitTxArgs {
+				amount: 5012500000,
+				is_multisig: Some(true),
+				..Default::default()
+			};
+			slate = api.init_send_tx(m, args)?;
+			api.tx_lock_outputs(m, &slate)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Multisig1);
 
-	wallet::controller::foreign_single_use(wallet2.clone(), mask2_i.clone(), |api| {
-		slate = api.receive_tx(&slate, None, None)?;
-		Ok(())
-	})?;
+	wallet::controller::foreign_single_use(
+		wallet2.clone(),
+		PathBuf::from(test_dir),
+		mask2_i.clone(),
+		|api| {
+			slate = api.receive_tx(&slate, None, None)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Multisig2);
 
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1.clone(), None, |api, m| {
-		slate = api.process_multisig_tx(m, &slate)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1.clone(),
+		PathBuf::from(test_dir),
+		|api, m| {
+			slate = api.process_multisig_tx(m, &slate)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Multisig3);
 
-	wallet::controller::foreign_single_use(wallet2.clone(), mask2_i.clone(), |api| {
-		slate = api.finalize_tx(&slate, false)?;
-		Ok(())
-	})?;
+	wallet::controller::foreign_single_use(
+		wallet2.clone(),
+		PathBuf::from(test_dir),
+		mask2_i.clone(),
+		|api| {
+			slate = api.finalize_tx(&slate, false)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Multisig4);
 
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1.clone(), None, |api, m| {
-		slate = api.finalize_tx(m, &slate)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1.clone(),
+		PathBuf::from(test_dir),
+		|api, m| {
+			slate = api.finalize_tx(m, &slate)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Multisig4);
 
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1, None, |api, m| {
-		// Wallet 1 inititates the main atomic swap transaction
-		let args = InitTxArgs {
-			amount: 5000000000,
-			minimum_confirmations: 0,
-			multisig_path: Some(slate.create_multisig_id().to_bip_32_string()),
-			..Default::default()
-		};
-		slate = api.init_atomic_swap(m, args)?;
-		api.tx_lock_outputs(m, &slate)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1,
+		PathBuf::from(test_dir),
+		|api, m| {
+			// Wallet 1 inititates the main atomic swap transaction
+			let args = InitTxArgs {
+				amount: 5000000000,
+				minimum_confirmations: 0,
+				multisig_path: Some(slate.create_multisig_id().to_bip_32_string()),
+				..Default::default()
+			};
+			slate = api.init_atomic_swap(m, args)?;
+			api.tx_lock_outputs(m, &slate)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Atomic1);
 
-	wallet::controller::foreign_single_use(wallet2.clone(), mask2_i.clone(), |api| {
-		slate = api.receive_atomic_tx(&slate, None, None)?;
-		Ok(())
-	})?;
+	wallet::controller::foreign_single_use(
+		wallet2.clone(),
+		PathBuf::from(test_dir),
+		mask2_i.clone(),
+		|api| {
+			slate = api.receive_atomic_tx(&slate, None, None)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Atomic2);
 
 	// Get the receiver's atomic secret created in `receive_atomic_tx`
@@ -167,25 +213,35 @@ fn atomic_tx_impl(test_dir: &'static str) -> Result<(), libwallet::Error> {
 		)?
 	};
 
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1.clone(), None, |api, m| {
-		// wallet 1 creates the first partial signature on the atomic swap
-		slate = api.countersign_atomic_swap(&slate, m, None)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1.clone(),
+		PathBuf::from(test_dir),
+		|api, m| {
+			// wallet 1 creates the first partial signature on the atomic swap
+			slate = api.countersign_atomic_swap(&slate, m, None)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Atomic3);
 
 	// wallet 2 finalizes and posts the atomic swap
-	wallet::controller::foreign_single_use(wallet2.clone(), mask2_i.clone(), |api| {
-		slate = api.finalize_tx(&slate, false)?;
-		Ok(())
-	})?;
+	wallet::controller::foreign_single_use(
+		wallet2.clone(),
+		PathBuf::from(test_dir),
+		mask2_i.clone(),
+		|api| {
+			slate = api.finalize_tx(&slate, false)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Atomic4);
 
 	let rec_atomic_secret = {
 		let mut w_lock = wallet1.lock();
 		let w = w_lock.lc_provider()?.wallet_inst()?;
 		let tx = slate.tx_or_err()?;
-		libwallet::recover_atomic_secret(&mut **w, mask1, &slate, &tx.kernels()[0])?
+		libwallet::recover_atomic_secret(w, mask1, &slate, &tx.kernels()[0])?
 	};
 
 	assert_eq!(rec_atomic_secret, atomic_secret);
@@ -237,11 +293,16 @@ fn atomic_refund_tx_impl(test_dir: &'static str) -> Result<(), libwallet::Error>
 	let reward = core::consensus::REWARD;
 
 	// add some accounts
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1, None, |api, m| {
-		api.create_account_path(m, "mining")?;
-		api.create_account_path(m, "listener")?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1,
+		PathBuf::from(test_dir),
+		|api, m| {
+			api.create_account_path(m, "mining")?;
+			api.create_account_path(m, "listener")?;
+			Ok(())
+		},
+	)?;
 
 	// Get some mining done
 	{
@@ -253,75 +314,115 @@ fn atomic_refund_tx_impl(test_dir: &'static str) -> Result<(), libwallet::Error>
 		test_framework::award_blocks_to_wallet(&chain, wallet1.clone(), mask1, bh as usize, false);
 
 	// Sanity check wallet 1 contents
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1, None, |api, m| {
-		let (wallet1_refreshed, wallet1_info) = api.retrieve_summary_info(m, true, 1)?;
-		assert!(wallet1_refreshed);
-		assert_eq!(wallet1_info.last_confirmed_height, bh);
-		assert_eq!(wallet1_info.total, bh * reward);
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1,
+		PathBuf::from(test_dir),
+		|api, m| {
+			let (wallet1_refreshed, wallet1_info) = api.retrieve_summary_info(m, true, 1)?;
+			assert!(wallet1_refreshed);
+			assert_eq!(wallet1_info.last_confirmed_height, bh);
+			assert_eq!(wallet1_info.total, bh * reward);
+			Ok(())
+		},
+	)?;
 
 	let mut slate = Slate::blank(2, TxFlow::Atomic);
 
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1, None, |api, m| {
-		// Wallet 1 inititates the main atomic swap transaction
-		let args = InitTxArgs {
-			amount: 5012500000,
-			is_multisig: Some(true),
-			..Default::default()
-		};
-		slate = api.init_send_tx(m, args)?;
-		api.tx_lock_outputs(m, &slate)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1,
+		PathBuf::from(test_dir),
+		|api, m| {
+			// Wallet 1 inititates the main atomic swap transaction
+			let args = InitTxArgs {
+				amount: 5012500000,
+				is_multisig: Some(true),
+				..Default::default()
+			};
+			slate = api.init_send_tx(m, args)?;
+			api.tx_lock_outputs(m, &slate)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Multisig1);
 
-	wallet::controller::foreign_single_use(wallet2.clone(), mask2_i.clone(), |api| {
-		slate = api.receive_tx(&slate, None, None)?;
-		Ok(())
-	})?;
+	wallet::controller::foreign_single_use(
+		wallet2.clone(),
+		PathBuf::from(test_dir),
+		mask2_i.clone(),
+		|api| {
+			slate = api.receive_tx(&slate, None, None)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Multisig2);
 
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1.clone(), None, |api, m| {
-		slate = api.process_multisig_tx(m, &slate)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1.clone(),
+		PathBuf::from(test_dir),
+		|api, m| {
+			slate = api.process_multisig_tx(m, &slate)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Multisig3);
 
-	wallet::controller::foreign_single_use(wallet2.clone(), mask2_i.clone(), |api| {
-		slate = api.finalize_tx(&slate, false)?;
-		Ok(())
-	})?;
+	wallet::controller::foreign_single_use(
+		wallet2.clone(),
+		PathBuf::from(test_dir),
+		mask2_i.clone(),
+		|api| {
+			slate = api.finalize_tx(&slate, false)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Multisig4);
 
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1.clone(), None, |api, m| {
-		slate = api.finalize_tx(m, &slate)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1.clone(),
+		PathBuf::from(test_dir),
+		|api, m| {
+			slate = api.finalize_tx(m, &slate)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Multisig4);
 
 	let _ =
 		test_framework::award_blocks_to_wallet(&chain, wallet1.clone(), mask1, bh as usize, false);
 
-	wallet::controller::owner_single_use(Some(wallet2.clone()), mask2.clone(), None, |api, m| {
-		// Wallet 2 inititates the refund atomic swap transaction
-		let args = InitTxArgs {
-			amount: 5000000000,
-			late_lock: Some(true),
-			minimum_confirmations: 0,
-			multisig_path: Some(slate.create_multisig_id().to_bip_32_string()),
-			..Default::default()
-		};
-		slate = api.init_atomic_swap(m, args)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet2.clone(),
+		mask2.clone(),
+		PathBuf::from(test_dir),
+		|api, m| {
+			// Wallet 2 inititates the refund atomic swap transaction
+			let args = InitTxArgs {
+				amount: 5000000000,
+				late_lock: Some(true),
+				minimum_confirmations: 0,
+				multisig_path: Some(slate.create_multisig_id().to_bip_32_string()),
+				..Default::default()
+			};
+			slate = api.init_atomic_swap(m, args)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Atomic1);
 
-	wallet::controller::foreign_single_use(wallet1.clone(), mask1_i.clone(), |api| {
-		api.doctest_mode = true;
-		slate = api.receive_atomic_tx(&slate, None, None)?;
-		Ok(())
-	})?;
+	wallet::controller::foreign_single_use(
+		wallet1.clone(),
+		PathBuf::from(test_dir),
+		mask1_i.clone(),
+		|api| {
+			api.doctest_mode = true;
+			slate = api.receive_atomic_tx(&slate, None, None)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Atomic2);
 
 	// Get the sender's atomic secret created in `receive_atomic_tx`
@@ -335,26 +436,36 @@ fn atomic_refund_tx_impl(test_dir: &'static str) -> Result<(), libwallet::Error>
 			.derive_key(slate.amount, &atomic_id, SwitchCommitmentType::Regular)?
 	};
 
-	wallet::controller::owner_single_use(Some(wallet2.clone()), mask2.clone(), None, |api, m| {
-		// wallet 1 creates the first partial signature on the atomic swap
-		slate = api.countersign_atomic_swap(&slate, m, None)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet2.clone(),
+		mask2.clone(),
+		PathBuf::from(test_dir),
+		|api, m| {
+			// wallet 1 creates the first partial signature on the atomic swap
+			slate = api.countersign_atomic_swap(&slate, m, None)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Atomic3);
 
 	// wallet 2 finalizes and posts the atomic swap
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1.clone(), None, |api, m| {
-		api.tx_lock_outputs(m, &slate)?;
-		slate = api.finalize_atomic_swap(m, &slate)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1.clone(),
+		PathBuf::from(test_dir),
+		|api, m| {
+			api.tx_lock_outputs(m, &slate)?;
+			slate = api.finalize_atomic_swap(m, &slate)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Atomic4);
 
 	let rec_atomic_secret = {
 		let mut w_lock = wallet2.lock();
 		let w = w_lock.lc_provider()?.wallet_inst()?;
 		let tx = slate.tx_or_err()?;
-		libwallet::recover_atomic_secret(&mut **w, mask2, &slate, &tx.kernels()[0])?
+		libwallet::recover_atomic_secret(w, mask2, &slate, &tx.kernels()[0])?
 	};
 
 	assert_eq!(rec_atomic_secret, atomic_secret);
@@ -406,11 +517,16 @@ fn atomic_end_to_end_tx_impl(test_dir: &'static str) -> Result<(), libwallet::Er
 	let reward = core::consensus::REWARD;
 
 	// add some accounts
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1, None, |api, m| {
-		api.create_account_path(m, "mining")?;
-		api.create_account_path(m, "listener")?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1,
+		PathBuf::from(test_dir),
+		|api, m| {
+			api.create_account_path(m, "mining")?;
+			api.create_account_path(m, "listener")?;
+			Ok(())
+		},
+	)?;
 
 	// Get some mining done
 	{
@@ -422,71 +538,111 @@ fn atomic_end_to_end_tx_impl(test_dir: &'static str) -> Result<(), libwallet::Er
 		test_framework::award_blocks_to_wallet(&chain, wallet1.clone(), mask1, bh as usize, false);
 
 	// Sanity check wallet 1 contents
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1, None, |api, m| {
-		let (wallet1_refreshed, wallet1_info) = api.retrieve_summary_info(m, true, 1)?;
-		assert!(wallet1_refreshed);
-		assert_eq!(wallet1_info.last_confirmed_height, bh);
-		assert_eq!(wallet1_info.total, bh * reward);
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1,
+		PathBuf::from(test_dir),
+		|api, m| {
+			let (wallet1_refreshed, wallet1_info) = api.retrieve_summary_info(m, true, 1)?;
+			assert!(wallet1_refreshed);
+			assert_eq!(wallet1_info.last_confirmed_height, bh);
+			assert_eq!(wallet1_info.total, bh * reward);
+			Ok(())
+		},
+	)?;
 
 	let mut slate = Slate::blank(2, TxFlow::Atomic);
 
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1, None, |api, m| {
-		// Wallet 1 inititates the main atomic swap transaction
-		let args = InitTxArgs {
-			amount: 5012500000,
-			is_multisig: Some(true),
-			..Default::default()
-		};
-		slate = api.init_send_tx(m, args)?;
-		api.tx_lock_outputs(m, &slate)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1,
+		PathBuf::from(test_dir),
+		|api, m| {
+			// Wallet 1 inititates the main atomic swap transaction
+			let args = InitTxArgs {
+				amount: 5012500000,
+				is_multisig: Some(true),
+				..Default::default()
+			};
+			slate = api.init_send_tx(m, args)?;
+			api.tx_lock_outputs(m, &slate)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Multisig1);
 
-	wallet::controller::foreign_single_use(wallet2.clone(), mask2_i.clone(), |api| {
-		slate = api.receive_tx(&slate, None, None)?;
-		Ok(())
-	})?;
+	wallet::controller::foreign_single_use(
+		wallet2.clone(),
+		PathBuf::from(test_dir),
+		mask2_i.clone(),
+		|api| {
+			slate = api.receive_tx(&slate, None, None)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Multisig2);
 
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1.clone(), None, |api, m| {
-		slate = api.process_multisig_tx(m, &slate)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1.clone(),
+		PathBuf::from(test_dir),
+		|api, m| {
+			slate = api.process_multisig_tx(m, &slate)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Multisig3);
 
-	wallet::controller::foreign_single_use(wallet2.clone(), mask2_i.clone(), |api| {
-		slate = api.finalize_tx(&slate, false)?;
-		Ok(())
-	})?;
+	wallet::controller::foreign_single_use(
+		wallet2.clone(),
+		PathBuf::from(test_dir),
+		mask2_i.clone(),
+		|api| {
+			slate = api.finalize_tx(&slate, false)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Multisig4);
 
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1.clone(), None, |api, m| {
-		slate = api.finalize_tx(m, &slate)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1.clone(),
+		PathBuf::from(test_dir),
+		|api, m| {
+			slate = api.finalize_tx(m, &slate)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Multisig4);
 	let multisig_path = slate.create_multisig_id().to_bip_32_string();
-	wallet::controller::owner_single_use(Some(wallet2.clone()), mask2.clone(), None, |api, m| {
-		// Wallet 2 inititates the refund atomic swap transaction
-		let args = InitTxArgs {
-			amount: 5000000000,
-			late_lock: Some(true),
-			multisig_path: Some(multisig_path.clone()),
-			..Default::default()
-		};
-		slate = api.init_atomic_swap(m, args)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet2.clone(),
+		mask2.clone(),
+		PathBuf::from(test_dir),
+		|api, m| {
+			// Wallet 2 inititates the refund atomic swap transaction
+			let args = InitTxArgs {
+				amount: 5000000000,
+				late_lock: Some(true),
+				multisig_path: Some(multisig_path.clone()),
+				..Default::default()
+			};
+			slate = api.init_atomic_swap(m, args)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Atomic1);
 
-	wallet::controller::foreign_single_use(wallet1.clone(), mask1_i.clone(), |api| {
-		api.doctest_mode = true;
-		slate = api.receive_atomic_tx(&slate, None, None)?;
-		Ok(())
-	})?;
+	wallet::controller::foreign_single_use(
+		wallet1.clone(),
+		PathBuf::from(test_dir),
+		mask1_i.clone(),
+		|api| {
+			api.doctest_mode = true;
+			slate = api.receive_atomic_tx(&slate, None, None)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Atomic2);
 
 	// Get the sender's atomic secret created in `receive_atomic_tx`
@@ -500,15 +656,20 @@ fn atomic_end_to_end_tx_impl(test_dir: &'static str) -> Result<(), libwallet::Er
 			.derive_key(slate.amount, &id, SwitchCommitmentType::Regular)?
 	};
 
-	wallet::controller::owner_single_use(Some(wallet2.clone()), mask2.clone(), None, |api, m| {
-		// wallet 1 creates the first partial signature on the atomic swap
-		slate = api.countersign_atomic_swap(&slate, m, None)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet2.clone(),
+		mask2.clone(),
+		PathBuf::from(test_dir),
+		|api, m| {
+			// wallet 1 creates the first partial signature on the atomic swap
+			slate = api.countersign_atomic_swap(&slate, m, None)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Atomic3);
 
 	/* Don't finalize and lock funds, since this locks the outputs used for the main transaction
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1.clone(), None, |api, m| {
+	wallet::controller::owner_single_use(wallet1.clone(), mask1.clone(), PathBuf::from(test_dir), |api, m| {
 		api.tx_lock_outputs(m, &slate)?;
 		slate = api.finalize_atomic_swap(m, &slate)?;
 		Ok(())
@@ -519,30 +680,40 @@ fn atomic_end_to_end_tx_impl(test_dir: &'static str) -> Result<(), libwallet::Er
 		let mut w_lock = wallet2.lock();
 		let w = w_lock.lc_provider()?.wallet_inst()?;
 		let tx = slate.tx_or_err()?;
-		libwallet::recover_atomic_secret(&mut **w, mask2, &slate, &tx.kernels()[0])?
+		libwallet::recover_atomic_secret(w, mask2, &slate, &tx.kernels()[0])?
 	};
 
 	assert_eq!(rec_atomic_secret, atomic_secret);
 	*/
 
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1, None, |api, m| {
-		// Wallet 1 inititates the main atomic swap transaction
-		let args = InitTxArgs {
-			amount: 500000000,
-			minimum_confirmations: 0,
-			multisig_path: Some(multisig_path),
-			..Default::default()
-		};
-		slate = api.init_atomic_swap(m, args)?;
-		api.tx_lock_outputs(m, &slate)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1,
+		PathBuf::from(test_dir),
+		|api, m| {
+			// Wallet 1 inititates the main atomic swap transaction
+			let args = InitTxArgs {
+				amount: 500000000,
+				minimum_confirmations: 0,
+				multisig_path: Some(multisig_path),
+				..Default::default()
+			};
+			slate = api.init_atomic_swap(m, args)?;
+			api.tx_lock_outputs(m, &slate)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Atomic1);
 
-	wallet::controller::foreign_single_use(wallet2.clone(), mask2_i.clone(), |api| {
-		slate = api.receive_atomic_tx(&slate, None, None)?;
-		Ok(())
-	})?;
+	wallet::controller::foreign_single_use(
+		wallet2.clone(),
+		PathBuf::from(test_dir),
+		mask2_i.clone(),
+		|api| {
+			slate = api.receive_atomic_tx(&slate, None, None)?;
+			Ok(())
+		},
+	)?;
 
 	// Create atomic secret, this is created during the refund transaction
 	// This is one of the keys locking the multisig transaction on the other chain
@@ -556,25 +727,35 @@ fn atomic_end_to_end_tx_impl(test_dir: &'static str) -> Result<(), libwallet::Er
 
 	assert_eq!(slate.state, SlateState::Atomic2);
 
-	wallet::controller::owner_single_use(Some(wallet1.clone()), mask1.clone(), None, |api, m| {
-		// wallet 1 creates the first partial signature on the atomic swap
-		slate = api.countersign_atomic_swap(&slate, m, None)?;
-		Ok(())
-	})?;
+	wallet::controller::owner_single_use(
+		wallet1.clone(),
+		mask1.clone(),
+		PathBuf::from(test_dir),
+		|api, m| {
+			// wallet 1 creates the first partial signature on the atomic swap
+			slate = api.countersign_atomic_swap(&slate, m, None)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Atomic3);
 
 	// wallet 2 finalizes and posts the atomic swap
-	wallet::controller::foreign_single_use(wallet2.clone(), mask2_i.clone(), |api| {
-		slate = api.finalize_tx(&slate, false)?;
-		Ok(())
-	})?;
+	wallet::controller::foreign_single_use(
+		wallet2.clone(),
+		PathBuf::from(test_dir),
+		mask2_i.clone(),
+		|api| {
+			slate = api.finalize_tx(&slate, false)?;
+			Ok(())
+		},
+	)?;
 	assert_eq!(slate.state, SlateState::Atomic4);
 
 	let rec_atomic_secret = {
 		let mut w_lock = wallet1.lock();
 		let w = w_lock.lc_provider()?.wallet_inst()?;
 		let tx = slate.tx_or_err()?;
-		libwallet::recover_atomic_secret(&mut **w, mask1, &slate, &tx.kernels()[0])?
+		libwallet::recover_atomic_secret(w, mask1, &slate, &tx.kernels()[0])?
 	};
 
 	assert_eq!(rec_atomic_secret, atomic_secret);

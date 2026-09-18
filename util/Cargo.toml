@@ -1,54 +1,24 @@
 [package]
 name = "grin_wallet_util"
-version = "5.1.0-alpha.1"
+version = "5.5.0"
 authors = ["Grin Developers <mimblewimble@lists.launchpad.net>"]
 description = "Util, for generic utilities and to re-export grin crates"
 license = "Apache-2.0"
 repository = "https://github.com/mimblewimble/grin-wallet"
 keywords = [ "crypto", "grin", "mimblewimble" ]
 workspace = ".."
-edition = "2018"
+edition = "2021"
 
 [dependencies]
-rand = "0.6"
 serde = "1"
 serde_derive = "1"
-ed25519-dalek = "1.0.0-pre.4"
+ed25519-dalek = "2"
 data-encoding = "2"
 sha3 = "0.8"
+thiserror = "1"
 
-# For Release
-#grin_core = "4.0.0"
-#grin_keychain = "4.0.0"
-#grin_chain = "4.0.0"
-#grin_util = "4.0.0"
-#grin_api = "4.0.0"
-#grin_store = "4.0.0"
+##### Grin Imports
 
-# For beta release
+grin_util = { workspace = true }
 
-# grin_core = { git = "https://github.com/mimblewimble/grin", tag = "v5.0.0-beta.2"}
-# grin_keychain = { git = "https://github.com/mimblewimble/grin", tag = "v5.0.0-beta.2" }
-# grin_chain = { git = "https://github.com/mimblewimble/grin", tag = "v5.0.0-beta.2" }
-# grin_util = { git = "https://github.com/mimblewimble/grin", tag = "v5.0.0-beta.2" }
-# grin_api = { git = "https://github.com/mimblewimble/grin", tag = "v5.0.0-beta.2" }
-# grin_store = { git = "https://github.com/mimblewimble/grin", tag = "v5.0.0-beta.2" }
-
-# For bleeding edge
-grin_core = { git = "https://github.com/geneferneau/grin", branch = "atomic" }
-grin_keychain = { git = "https://github.com/geneferneau/grin", branch = "atomic" }
-grin_chain = { git = "https://github.com/geneferneau/grin", branch = "atomic" }
-grin_util = { git = "https://github.com/geneferneau/grin", branch = "atomic" }
-grin_api = { git = "https://github.com/geneferneau/grin", branch = "atomic" }
-grin_store = { git = "https://github.com/geneferneau/grin", branch = "atomic" }
-
-# For local testing
-# grin_core = { path = "../../grin/core"}
-# grin_keychain = { path = "../../grin/keychain"}
-# grin_chain = { path = "../../grin/chain"}
-# grin_util = { path = "../../grin/util"}
-# grin_api = { path = "../../grin/api"}
-# grin_store = { path = "../../grin/store"}
-
-[dev-dependencies]
-pretty_assertions = "0.6"
+######

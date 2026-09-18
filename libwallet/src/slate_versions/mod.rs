@@ -41,8 +41,8 @@ pub mod v5_bin;
 /// The most recent version of the slate
 pub const CURRENT_SLATE_VERSION: u16 = 5;
 
-/// The grin block header this slate is intended to be compatible with
-pub const GRIN_BLOCK_HEADER_VERSION: u16 = 3;
+/// The latest grin block header version this wallet supports
+pub const GRIN_BLOCK_HEADER_VERSION: u16 = 5;
 
 /// Existing versions of the slate
 #[derive(EnumIter, Serialize, Deserialize, Clone, Debug, PartialEq, PartialOrd, Eq, Ord)]
@@ -74,10 +74,31 @@ impl VersionedSlate {
 	}
 
 	/// convert this slate type to a specified older version
-	pub fn into_version(slate: Slate, version: SlateVersion) -> Result<VersionedSlate, Error> {
+	pub fn into_version(mut slate: Slate, version: SlateVersion) -> Result<VersionedSlate, Error> {
 		match version {
-			SlateVersion::V4 => Ok(VersionedSlate::V4(slate.into())),
-			SlateVersion::V5 => Ok(VersionedSlate::V5(slate.into())),
+			SlateVersion::V4 => {
+				use crate::SlateState;
+				if slate.is_multisig()
+					|| slate.multisig_key_id.is_some()
+					|| !matches!(
+						slate.state,
+						SlateState::Unknown
+							| SlateState::Standard1
+							| SlateState::Standard2
+							| SlateState::Standard3
+							| SlateState::Invoice1
+							| SlateState::Invoice2
+							| SlateState::Invoice3
+					) {
+					return Err(Error::SlateVersion(4));
+				}
+				slate.version_info.version = 4;
+				Ok(VersionedSlate::V4(slate.into()))
+			}
+			SlateVersion::V5 => {
+				slate.version_info.version = 5;
+				Ok(VersionedSlate::V5(slate.into()))
+			}
 		}
 	}
 }
@@ -138,6 +159,29 @@ impl VersionedCoinbase {
 		match version {
 			SlateVersion::V4 => VersionedCoinbase::V4(cb.into()),
 			SlateVersion::V5 => VersionedCoinbase::V5(cb.into()),
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::TxFlow;
+
+	#[test]
+	fn v4_conversion_preserves_standard_slates_but_rejects_swap_flows() {
+		let standard = Slate::blank(2, TxFlow::Standard);
+		let id = standard.id;
+		let v4 = VersionedSlate::into_version(standard, SlateVersion::V4).unwrap();
+		let json = serde_json::to_string(&v4).unwrap();
+		let decoded: VersionedSlate = serde_json::from_str(&json).unwrap();
+		assert!(matches!(decoded, VersionedSlate::V4(_)));
+		assert_eq!(Slate::from(v4).id, id);
+		for flow in [TxFlow::Atomic, TxFlow::Multisig] {
+			assert!(matches!(
+				VersionedSlate::into_version(Slate::blank(2, flow), SlateVersion::V4),
+				Err(Error::SlateVersion(4))
+			));
 		}
 	}
 }

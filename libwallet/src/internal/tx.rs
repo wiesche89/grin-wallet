@@ -18,24 +18,22 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::io::Cursor;
 use uuid::Uuid;
 
-use crate::grin_core::consensus::valid_header_version;
-use crate::grin_core::core::{HeaderVersion, TxKernel};
+use crate::grin_core::consensus::header_version;
 use crate::grin_keychain::{Identifier, Keychain, SwitchCommitmentType};
 use crate::grin_util::secp::key::SecretKey;
 use crate::grin_util::secp::pedersen;
 use crate::grin_util::Mutex;
 use crate::internal::{selection, updater};
 use crate::slate::{Slate, TxFlow};
-use crate::types::{Context, NodeClient, StoredProofInfo, TxLogEntryType, WalletBackend};
+use crate::types::{Context, NodeClient, StoredProofInfo, TxLogEntryType};
 use crate::util::OnionV3Address;
-use crate::InitTxArgs;
-use crate::{address, Error, ErrorKind};
-use ed25519_dalek::Keypair as DalekKeypair;
-use ed25519_dalek::PublicKey as DalekPublicKey;
-use ed25519_dalek::SecretKey as DalekSecretKey;
+use crate::{address, Error};
+use crate::{InitTxArgs, WalletBackend};
 use ed25519_dalek::Signature as DalekSignature;
+use ed25519_dalek::SigningKey as DalekSecretKey;
+use ed25519_dalek::VerifyingKey as DalekPublicKey;
 use ed25519_dalek::{Signer, Verifier};
-use grin_wallet_util::grin_core::core::FeeFields;
+use grin_core::core::{FeeFields, TxKernel};
 
 // static for incrementing test UUIDs
 lazy_static! {
@@ -44,8 +42,8 @@ lazy_static! {
 
 /// Creates a new slate for a transaction, can be called by anyone involved in
 /// the transaction (sender(s), receiver(s))
-pub fn new_tx_slate<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn new_tx_slate<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	amount: u64,
 	tx_flow: TxFlow,
 	num_participants: u8,
@@ -53,9 +51,8 @@ pub fn new_tx_slate<'a, T: ?Sized, C, K>(
 	ttl_blocks: Option<u64>,
 ) -> Result<Slate, Error>
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
 	let current_height = wallet.w2n_client().get_chain_tip()?.0;
 	let mut slate = Slate::blank(num_participants, tx_flow);
@@ -72,17 +69,7 @@ where
 	}
 	slate.amount = amount;
 
-	if valid_header_version(current_height, HeaderVersion(1)) {
-		slate.version_info.block_header_version = 1;
-	}
-
-	if valid_header_version(current_height, HeaderVersion(2)) {
-		slate.version_info.block_header_version = 2;
-	}
-
-	if valid_header_version(current_height, HeaderVersion(3)) {
-		slate.version_info.block_header_version = 3;
-	}
+	slate.version_info.block_header_version = header_version(current_height).0;
 
 	// Set the features explicitly to 0 here.
 	// This will generate a Plain kernel (rather than a HeightLocked kernel).
@@ -92,14 +79,16 @@ where
 }
 
 /// Estimates locked amount and fee for the transaction without creating one
-pub fn estimate_send_tx<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn estimate_send_tx<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	amount: u64,
+	amount_includes_fee: bool,
 	minimum_confirmations: u64,
 	max_outputs: usize,
 	num_change_outputs: usize,
 	selection_strategy_is_use_all: bool,
+	refresh_outputs: bool,
 	parent_key_id: &Identifier,
 ) -> Result<
 	(
@@ -109,14 +98,15 @@ pub fn estimate_send_tx<'a, T: ?Sized, C, K>(
 	Error,
 >
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
 	// Get lock height
 	let current_height = wallet.w2n_client().get_chain_tip()?.0;
 	// ensure outputs we're selecting are up to date
-	updater::refresh_outputs(wallet, keychain_mask, parent_key_id, false)?;
+	if refresh_outputs {
+		updater::refresh_outputs(wallet, keychain_mask, parent_key_id, false)?;
+	}
 
 	// Sender selects outputs into a new slate and save our corresponding keys in
 	// a transaction context. The secret key in our transaction context will be
@@ -128,6 +118,7 @@ where
 	let (_coins, total, _amount, fee) = selection::select_coins_and_fee(
 		wallet,
 		amount,
+		amount_includes_fee,
 		current_height,
 		minimum_confirmations,
 		max_outputs,
@@ -140,8 +131,8 @@ where
 }
 
 /// Add inputs to the slate (effectively becoming the sender)
-pub fn add_inputs_to_atomic_slate<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn add_inputs_to_atomic_slate<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	slate: &mut Slate,
 	current_height: u64,
@@ -154,16 +145,15 @@ pub fn add_inputs_to_atomic_slate<'a, T: ?Sized, C, K>(
 	use_test_rng: bool,
 ) -> Result<Context, Error>
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
 	// sender should always refresh outputs
 	updater::refresh_outputs(wallet, keychain_mask, parent_key_id, false)?;
 	let is_initiator = atomic_secret.is_none();
 
 	if slate.multisig_key_id.is_none() {
-		return Err(ErrorKind::GenericError("missing multisig key id".into()).into());
+		return Err(Error::GenericError("missing multisig key id".into()).into());
 	}
 
 	// Sender selects outputs into a new slate and save our corresponding keys in
@@ -189,6 +179,7 @@ where
 		multisig_key_id.as_ref(),
 		use_test_rng,
 		is_initiator,
+		false,
 	)?;
 
 	context.sec_atomic = atomic_secret;
@@ -199,8 +190,8 @@ where
 }
 
 /// Add inputs to the slate (effectively becoming the sender)
-pub fn add_inputs_to_slate<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn add_inputs_to_slate<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	slate: &mut Slate,
 	current_height: u64,
@@ -208,18 +199,21 @@ pub fn add_inputs_to_slate<'a, T: ?Sized, C, K>(
 	max_outputs: usize,
 	num_change_outputs: usize,
 	selection_strategy_is_use_all: bool,
+	refresh_outputs: bool,
 	parent_key_id: &Identifier,
 	is_initiator: bool,
 	is_multisig: bool,
 	use_test_rng: bool,
+	amount_includes_fee: bool,
 ) -> Result<Context, Error>
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
-	// sender should always refresh outputs
-	updater::refresh_outputs(wallet, keychain_mask, parent_key_id, false)?;
+	// Refresh unless the caller already updated the wallet state.
+	if refresh_outputs {
+		updater::refresh_outputs(wallet, keychain_mask, parent_key_id, false)?;
+	}
 
 	// Sender selects outputs into a new slate and save our corresponding keys in
 	// a transaction context. The secret key in our transaction context will be
@@ -243,6 +237,7 @@ where
 		None,
 		use_test_rng,
 		is_initiator,
+		amount_includes_fee,
 	)?;
 
 	if is_multisig {
@@ -275,8 +270,8 @@ where
 }
 
 /// Add receiver output to the slate
-pub fn add_output_to_slate<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn add_output_to_slate<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	slate: &mut Slate,
 	current_height: u64,
@@ -285,9 +280,8 @@ pub fn add_output_to_slate<'a, T: ?Sized, C, K>(
 	use_test_rng: bool,
 ) -> Result<Context, Error>
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
 	let keychain = wallet.keychain(keychain_mask)?;
 	// create an output using the amount in the slate
@@ -328,8 +322,8 @@ where
 }
 
 /// Add receiver output to the atomic slate
-pub fn add_output_to_atomic_slate<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn add_output_to_atomic_slate<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	slate: &mut Slate,
 	current_height: u64,
@@ -338,9 +332,8 @@ pub fn add_output_to_atomic_slate<'a, T: ?Sized, C, K>(
 	use_test_rng: bool,
 ) -> Result<Context, Error>
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
 	let keychain = wallet.keychain(keychain_mask)?;
 	let is_initiator = atomic_secret.is_none();
@@ -374,8 +367,8 @@ where
 }
 
 /// Create context, without adding inputs to slate
-pub fn create_late_lock_context<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn create_late_lock_context<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	slate: &mut Slate,
 	current_height: u64,
@@ -384,18 +377,20 @@ pub fn create_late_lock_context<'a, T: ?Sized, C, K>(
 	use_test_rng: bool,
 ) -> Result<Context, Error>
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
-	// sender should always refresh outputs
-	updater::refresh_outputs(wallet, keychain_mask, parent_key_id, false)?;
+	// Refresh unless the caller already updated the wallet state.
+	if init_tx_args.refresh_outputs_from_node {
+		updater::refresh_outputs(wallet, keychain_mask, parent_key_id, false)?;
+	}
 
 	// we're just going to run a selection to get the potential fee,
 	// but this won't be locked
 	let (_coins, _total, _amount, fee) = selection::select_coins_and_fee(
 		wallet,
 		init_tx_args.amount,
+		init_tx_args.amount_includes_fee.unwrap_or(false),
 		current_height,
 		init_tx_args.minimum_confirmations,
 		init_tx_args.max_outputs as usize,
@@ -432,16 +427,15 @@ where
 }
 
 /// Complete a transaction
-pub fn complete_tx<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn complete_tx<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	slate: &mut Slate,
 	context: &Context,
 ) -> Result<(), Error>
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
 	// when self sending invoice tx, use initiator nonce to finalize
 	let (sec_key, sec_nonce) = {
@@ -465,16 +459,15 @@ where
 }
 
 /// Complete an atomic swap transaction
-pub fn complete_atomic_tx<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn complete_atomic_tx<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	slate: &mut Slate,
 	context: &Context,
 ) -> Result<(), Error>
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
 	// Final transaction can be built by anyone at this stage
 	trace!("Slate to finalize is: {}", slate);
@@ -483,16 +476,15 @@ where
 }
 
 /// Recover atomic secret from final signature and adaptor signature
-pub fn recover_atomic_secret<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn recover_atomic_secret<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	slate: &Slate,
 	tx_kernel: &TxKernel,
 ) -> Result<SecretKey, Error>
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
 	let full_sig = tx_kernel.excess_sig.clone();
 	let keychain = wallet.keychain(keychain_mask)?;
@@ -504,7 +496,7 @@ where
 	let part_sig = match slate.participant_data[pdata_idx].part_sig {
 		Some(ref s) => s,
 		None => {
-			return Err(ErrorKind::Signature(
+			return Err(Error::Signature(
 				"Could not recover partial signature from atomic swap slate".into(),
 			)
 			.into())
@@ -539,17 +531,16 @@ where
 }
 
 /// Rollback outputs associated with a transaction in the wallet
-pub fn cancel_tx<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn cancel_tx<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	parent_key_id: &Identifier,
 	tx_id: Option<u32>,
 	tx_slate_id: Option<Uuid>,
 ) -> Result<(), Error>
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
 	let mut tx_id_string = String::new();
 	if let Some(tx_id) = tx_id {
@@ -557,17 +548,24 @@ where
 	} else if let Some(tx_slate_id) = tx_slate_id {
 		tx_id_string = tx_slate_id.to_string();
 	}
-	let tx_vec = updater::retrieve_txs(wallet, tx_id, tx_slate_id, Some(&parent_key_id), false)?;
+	let tx_vec = updater::retrieve_txs(
+		wallet,
+		tx_id,
+		tx_slate_id,
+		None,
+		Some(&parent_key_id),
+		false,
+	)?;
 	if tx_vec.len() != 1 {
-		return Err(ErrorKind::TransactionDoesntExist(tx_id_string).into());
+		return Err(Error::TransactionDoesntExist(tx_id_string));
 	}
 	let tx = tx_vec[0].clone();
 	match tx.tx_type {
 		TxLogEntryType::TxSent | TxLogEntryType::TxReceived | TxLogEntryType::TxReverted => {}
-		_ => return Err(ErrorKind::TransactionNotCancellable(tx_id_string).into()),
+		_ => return Err(Error::TransactionNotCancellable(tx_id_string)),
 	}
 	if tx.confirmed {
-		return Err(ErrorKind::TransactionNotCancellable(tx_id_string).into());
+		return Err(Error::TransactionNotCancellable(tx_id_string));
 	}
 	// get outputs associated with tx
 	let res = updater::retrieve_outputs(
@@ -583,20 +581,19 @@ where
 }
 
 /// Update the stored transaction (this update needs to happen when the TX is finalised)
-pub fn update_stored_tx<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn update_stored_tx<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	context: &Context,
 	slate: &Slate,
 	is_invoiced: bool,
 ) -> Result<(), Error>
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
 	// finalize command
-	let tx_vec = updater::retrieve_txs(wallet, None, Some(slate.id), None, false)?;
+	let tx_vec = updater::retrieve_txs(wallet, None, Some(slate.id), None, None, false)?;
 	let mut tx = None;
 	// don't want to assume this is the right tx, in case of self-sending
 	for t in tx_vec {
@@ -611,7 +608,7 @@ where
 	}
 	let mut tx = match tx {
 		Some(t) => t,
-		None => return Err(ErrorKind::TransactionDoesntExist(slate.id.to_string()).into()),
+		None => return Err(Error::TransactionDoesntExist(slate.id.to_string())),
 	};
 	let parent_key = tx.parent_key_id.clone();
 	{
@@ -620,10 +617,7 @@ where
 	}
 
 	if let Some(ref p) = slate.clone().payment_proof {
-		let derivation_index = match context.payment_proof_derivation_index {
-			Some(i) => i,
-			None => 0,
-		};
+		let derivation_index = context.payment_proof_derivation_index.unwrap_or_else(|| 0);
 		let keychain = wallet.keychain(keychain_mask)?;
 		let parent_key_id = wallet.parent_key_id();
 		let excess = slate.calc_excess(keychain.secp())?;
@@ -690,85 +684,75 @@ pub fn create_payment_proof_signature(
 	sec_key: SecretKey,
 ) -> Result<DalekSignature, Error> {
 	let msg = payment_proof_message(amount, kernel_commitment, sender_address)?;
-	let d_skey = match DalekSecretKey::from_bytes(&sec_key.0) {
-		Ok(k) => k,
-		Err(e) => {
-			return Err(ErrorKind::ED25519Key(format!("{}", e)).into());
-		}
-	};
-	let pub_key: DalekPublicKey = (&d_skey).into();
-	let keypair = DalekKeypair {
-		public: pub_key,
-		secret: d_skey,
-	};
-	Ok(keypair.sign(&msg))
+	let d_skey = DalekSecretKey::from_bytes(&sec_key.0);
+	Ok(d_skey.sign(&msg))
 }
 
 /// Verify all aspects of a completed payment proof on the current slate
-pub fn verify_slate_payment_proof<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn verify_slate_payment_proof<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	parent_key_id: &Identifier,
 	context: &Context,
 	slate: &Slate,
 ) -> Result<(), Error>
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
-	let tx_vec = updater::retrieve_txs(wallet, None, Some(slate.id), Some(parent_key_id), false)?;
+	let tx_vec = updater::retrieve_txs(
+		wallet,
+		None,
+		Some(slate.id),
+		None,
+		Some(parent_key_id),
+		false,
+	)?;
 	if tx_vec.is_empty() {
-		return Err(ErrorKind::PaymentProof(
+		return Err(Error::PaymentProof(
 			"TxLogEntry with original proof info not found (is account correct?)".to_owned(),
-		)
-		.into());
+		));
 	}
 
 	let orig_proof_info = tx_vec[0].clone().payment_proof;
 
 	if orig_proof_info.is_some() && slate.payment_proof.is_none() {
-		return Err(ErrorKind::PaymentProof(
+		return Err(Error::PaymentProof(
 			"Expected Payment Proof for this Transaction is not present".to_owned(),
-		)
-		.into());
+		));
 	}
 
 	if let Some(ref p) = slate.clone().payment_proof {
 		let orig_proof_info = match orig_proof_info {
 			Some(p) => p.clone(),
 			None => {
-				return Err(ErrorKind::PaymentProof(
+				return Err(Error::PaymentProof(
 					"Original proof info not stored in tx".to_owned(),
-				)
-				.into());
+				));
 			}
 		};
 		let keychain = wallet.keychain(keychain_mask)?;
 		let index = match context.payment_proof_derivation_index {
 			Some(i) => i,
 			None => {
-				return Err(ErrorKind::PaymentProof(
+				return Err(Error::PaymentProof(
 					"Payment proof derivation index required".to_owned(),
-				)
-				.into());
+				));
 			}
 		};
 		let orig_sender_sk =
 			address::address_from_derivation_path(&keychain, parent_key_id, index)?;
 		let orig_sender_address = OnionV3Address::from_private(&orig_sender_sk.0)?;
 		if p.sender_address != orig_sender_address.to_ed25519()? {
-			return Err(ErrorKind::PaymentProof(
+			return Err(Error::PaymentProof(
 				"Sender address on slate does not match original sender address".to_owned(),
-			)
-			.into());
+			));
 		}
 
 		if orig_proof_info.receiver_address != p.receiver_address {
-			return Err(ErrorKind::PaymentProof(
+			return Err(Error::PaymentProof(
 				"Recipient address on slate does not match original recipient address".to_owned(),
-			)
-			.into());
+			));
 		}
 		let msg = payment_proof_message(
 			slate.amount,
@@ -778,15 +762,14 @@ where
 		let sig = match p.receiver_signature {
 			Some(s) => s,
 			None => {
-				return Err(ErrorKind::PaymentProof(
+				return Err(Error::PaymentProof(
 					"Recipient did not provide requested proof signature".to_owned(),
-				)
-				.into());
+				));
 			}
 		};
 
 		if p.receiver_address.verify(&msg, &sig).is_err() {
-			return Err(ErrorKind::PaymentProof("Invalid proof signature".to_owned()).into());
+			return Err(Error::PaymentProof("Invalid proof signature".to_owned()));
 		};
 	}
 	Ok(())
@@ -797,7 +780,7 @@ mod test {
 	use super::*;
 	use rand::rngs::mock::StepRng;
 
-	use crate::grin_core::core::{FeeFields, KernelFeatures};
+	use crate::grin_core::core::{FeeFields, KernelFeatures, TxKernel};
 	use crate::grin_core::libtx::{build, ProofBuilder};
 	use crate::grin_keychain::{
 		BlindSum, BlindingFactor, ExtKeychain, ExtKeychainPath, Keychain, SwitchCommitmentType,
@@ -841,7 +824,7 @@ mod test {
 		let secp = secp_inst.lock();
 		let mut test_rng = StepRng::new(1_234_567_890_u64, 1);
 		let sec_key = secp::key::SecretKey::new(&secp, &mut test_rng);
-		let d_skey = DalekSecretKey::from_bytes(&sec_key.0).unwrap();
+		let d_skey = DalekSecretKey::from_bytes(&sec_key.0);
 
 		let address: DalekPublicKey = (&d_skey).into();
 

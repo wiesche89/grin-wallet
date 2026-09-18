@@ -14,21 +14,21 @@
 
 //! Client functions, implementations of the NodeClient trait
 
+use super::resp_types::*;
 use crate::api::{self, LocatedTxKernel, OutputListing, OutputPrintable};
-use crate::core::core::{Transaction, TxKernel};
-use crate::libwallet::{NodeClient, NodeVersionInfo};
-use futures::stream::FuturesUnordered;
-use futures::TryStreamExt;
-use std::collections::HashMap;
-use std::env;
-
+use crate::client_utils::json_rpc::*;
 use crate::client_utils::{Client, RUNTIME};
+use crate::core::core::{Transaction, TxKernel};
 use crate::libwallet;
+use crate::libwallet::{NodeClient, NodeVersionInfo};
 use crate::util::secp::pedersen;
 use crate::util::ToHex;
-
-use super::resp_types::*;
-use crate::client_utils::json_rpc::*;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
+use std::collections::HashMap;
+use std::env;
+use std::net::SocketAddr;
+use std::time::Duration;
 
 const ENDPOINT: &str = "/v2/foreign";
 
@@ -45,11 +45,27 @@ impl HTTPNodeClient {
 	pub fn new(
 		node_url: &str,
 		node_api_secret: Option<String>,
+		request_timeout: Duration,
 	) -> Result<HTTPNodeClient, libwallet::Error> {
+		Self::new_proxy(node_url, node_api_secret, None, request_timeout)
+	}
+
+	/// Create a new client with proxy
+	pub fn new_proxy(
+		node_url: &str,
+		node_api_secret: Option<String>,
+		proxy: Option<(SocketAddr, &'static str)>,
+		request_timeout: Duration,
+	) -> Result<HTTPNodeClient, libwallet::Error> {
+		let client = if let Some((a, s)) = proxy {
+			Client::with_proxy(a, s, request_timeout)
+		} else {
+			Client::new(request_timeout)
+		};
 		Ok(HTTPNodeClient {
-			client: Client::new().map_err(|_| libwallet::ErrorKind::Node)?,
+			client: client.map_err(|_| libwallet::Error::Node)?,
 			node_url: node_url.to_owned(),
-			node_api_secret: node_api_secret,
+			node_api_secret,
 			node_version_info: None,
 		})
 	}
@@ -74,7 +90,7 @@ impl HTTPNodeClient {
 			Err(e) => {
 				let report = format!("Error calling {}: {}", method, e);
 				error!("{}", report);
-				Err(libwallet::ErrorKind::ClientCallback(report).into())
+				Err(libwallet::Error::ClientCallback(report))
 			}
 			Ok(inner) => match inner.clone().into_result() {
 				Ok(r) => Ok(r),
@@ -82,7 +98,7 @@ impl HTTPNodeClient {
 					error!("{:?}", inner);
 					let report = format!("Unable to parse response for {}: {}", method, e);
 					error!("{}", report);
-					Err(libwallet::ErrorKind::ClientCallback(report).into())
+					Err(libwallet::Error::ClientCallback(report))
 				}
 			},
 		}
@@ -93,16 +109,23 @@ impl NodeClient for HTTPNodeClient {
 	fn node_url(&self) -> &str {
 		&self.node_url
 	}
-	fn node_api_secret(&self) -> Option<String> {
-		self.node_api_secret.clone()
-	}
-
 	fn set_node_url(&mut self, node_url: &str) {
 		self.node_url = node_url.to_owned();
 	}
 
+	fn node_api_secret(&self) -> Option<String> {
+		self.node_api_secret.clone()
+	}
+
 	fn set_node_api_secret(&mut self, node_api_secret: Option<String>) {
 		self.node_api_secret = node_api_secret;
+	}
+
+	/// Posts a transaction to a grin node
+	fn post_tx(&self, tx: &Transaction, fluff: bool) -> Result<(), libwallet::Error> {
+		let params = json!([tx, fluff]);
+		self.send_json_request::<serde_json::Value>("push_transaction", &params)?;
+		Ok(())
 	}
 
 	fn get_version_info(&mut self) -> Option<NodeVersionInfo> {
@@ -121,27 +144,21 @@ impl NodeClient for HTTPNodeClient {
 				// If node isn't available, allow offline functions
 				// unfortunately have to parse string due to error structure
 				let err_string = format!("{}", e);
-				if err_string.contains("404") {
-					return Some(NodeVersionInfo {
+				return if err_string.contains("404") {
+					Some(NodeVersionInfo {
 						node_version: "1.0.0".into(),
 						block_header_version: 1,
 						verified: Some(false),
-					});
+					})
 				} else {
-					error!("Unable to contact Node to get version info: {}", e);
-					return None;
-				}
+					error!("Unable to contact Node to get version info: {}, check your node is running", e);
+					warn!("Warning: a) Node is offline, or b) 'node_api_secret_path' in 'grin-wallet.toml' is set incorrectly");
+					None
+				};
 			}
 		};
 		self.node_version_info = Some(retval.clone());
 		Some(retval)
-	}
-
-	/// Posts a transaction to a grin node
-	fn post_tx(&self, tx: &Transaction, fluff: bool) -> Result<(), libwallet::Error> {
-		let params = json!([tx, fluff]);
-		self.send_json_request::<serde_json::Value>("push_transaction", &params)?;
-		Ok(())
 	}
 
 	/// Return the chain tip from a given node
@@ -170,7 +187,7 @@ impl NodeClient for HTTPNodeClient {
 			Err(e) => {
 				let report = format!("Error calling {}: {}", method, e);
 				error!("{}", report);
-				Err(libwallet::ErrorKind::ClientCallback(report).into())
+				Err(libwallet::Error::ClientCallback(report))
 			}
 			Ok(inner) => match inner.clone().into_result::<LocatedTxKernel>() {
 				Ok(r) => Ok(Some((r.tx_kernel, r.height, r.mmr_index))),
@@ -181,7 +198,7 @@ impl NodeClient for HTTPNodeClient {
 					} else {
 						let report = format!("Unable to parse response for {}: {}", method, e);
 						error!("{}", report);
-						Err(libwallet::ErrorKind::ClientCallback(report).into())
+						Err(libwallet::Error::ClientCallback(report))
 					}
 				}
 			},
@@ -207,7 +224,7 @@ impl NodeClient for HTTPNodeClient {
 			.collect();
 
 		// going to leave this here even though we're moving
-		// to the json RPC api to keep the functionality of
+		// to the JSON RPC api to keep the functionality of
 		// parallelizing larger requests. Will raise default
 		// from 200 to 500, however
 		let chunk_default = 500;
@@ -230,6 +247,7 @@ impl NodeClient for HTTPNodeClient {
 
 		let url = format!("{}{}", self.node_url(), ENDPOINT);
 		let api_secret = self.node_api_secret();
+		let cl = self.client.clone();
 		let task = async move {
 			let params: Vec<_> = query_params
 				.chunks(chunk_size)
@@ -241,20 +259,34 @@ impl NodeClient for HTTPNodeClient {
 				reqs.push(build_request("get_outputs", p));
 			}
 
-			let mut tasks = Vec::with_capacity(params.len());
-			for req in &reqs {
-				tasks.push(self.client.post_async::<Request, Response>(
-					url.as_str(),
-					req,
-					api_secret.clone(),
-				));
-			}
+			let mut outputs = Vec::new();
 
-			let task: FuturesUnordered<_> = tasks.into_iter().collect();
-			task.try_collect().await
+			let max_num_requests = 16;
+			for req_chunks in reqs.chunks(max_num_requests) {
+				let mut tasks = vec![];
+				for req in req_chunks {
+					tasks.push(cl.post_async::<Request, Response>(
+						url.as_str(),
+						req,
+						api_secret.clone(),
+					));
+				}
+				let mut task: FuturesUnordered<_> = tasks.into_iter().collect();
+				while let Some(item) = task.next().await {
+					match item {
+						Ok(i) => outputs.push(i),
+						Err(e) => return Err(e),
+					}
+				}
+			}
+			Ok(outputs)
 		};
 
-		let res: Result<Vec<_>, _> = RUNTIME.lock().unwrap().block_on(task);
+		let rt = RUNTIME.clone();
+		let res: Result<Vec<_>, _> =
+			std::thread::spawn(move || rt.block_on(async move { task.await }))
+				.join()
+				.unwrap();
 
 		let results: Vec<OutputPrintable> = match res {
 			Ok(resps) => {
@@ -265,7 +297,7 @@ impl NodeClient for HTTPNodeClient {
 						Err(e) => {
 							let report = format!("Unable to parse response for get_outputs: {}", e);
 							error!("{}", report);
-							return Err(libwallet::ErrorKind::ClientCallback(report).into());
+							return Err(libwallet::Error::ClientCallback(report));
 						}
 					};
 				}
@@ -274,7 +306,7 @@ impl NodeClient for HTTPNodeClient {
 			Err(e) => {
 				let report = format!("Getting outputs by id: {}", e);
 				error!("Outputs by id failed: {}", e);
-				return Err(libwallet::ErrorKind::ClientCallback(report).into());
+				return Err(libwallet::Error::ClientCallback(report));
 			}
 		};
 
@@ -283,7 +315,7 @@ impl NodeClient for HTTPNodeClient {
 				Some(h) => h,
 				None => {
 					let msg = format!("Missing block height for output {:?}", out.commit);
-					return Err(libwallet::ErrorKind::ClientCallback(msg).into());
+					return Err(libwallet::Error::ClientCallback(msg));
 				}
 			};
 			api_outputs.insert(
@@ -340,7 +372,7 @@ impl NodeClient for HTTPNodeClient {
 						out.commit, out, e
 					);
 					error!("{}", msg);
-					return Err(libwallet::ErrorKind::ClientCallback(msg).into());
+					return Err(libwallet::Error::ClientCallback(msg));
 				}
 			};
 			let block_height = match out.block_height {
@@ -351,7 +383,7 @@ impl NodeClient for HTTPNodeClient {
 						out.commit, out
 					);
 					error!("{}", msg);
-					return Err(libwallet::ErrorKind::ClientCallback(msg).into());
+					return Err(libwallet::Error::ClientCallback(msg));
 				}
 			};
 			api_outputs.push((
@@ -415,8 +447,8 @@ mod tests {
 		}
 	}
 
-	// Wallet will "push" a transaction to node, serializing the transaction as json.
-	// We are testing the json structure is what we expect here.
+	// Wallet will "push" a transaction to node, serializing the transaction as JSON.
+	// We are testing the JSON structure is what we expect here.
 	#[test]
 	fn test_transaction_json_ser_deser() {
 		let tx1 = tx1i1o_v2_compatible();

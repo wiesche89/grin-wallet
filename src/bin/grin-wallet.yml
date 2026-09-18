@@ -48,6 +48,24 @@ subcommands:
             short: c
             long: create
             takes_value: true
+  - rewind_hash:
+      about: Return the hash of the wallet root public key.
+  - scan_rewind_hash:
+      about: Scan the UTXO set and return the outputs and the total of grin owned by a view wallet rewind hash.
+      args:
+        - rewind_hash:
+              help: Rewind hash of the wallet to be scanned in order to retrieve all the outputs and balance.
+              index: 1
+        - start_height:
+            help: If given, the first block from which to start the scan (default 1)
+            short: h
+            long: start_height
+            takes_value: true
+        - backwards_from_tip:
+            help: If given, start scan b blocks back from the tip
+            short: b
+            long: backwards_from_tip,
+            takes_value: true
   - listen:
       about: Runs the wallet in listening mode waiting for transactions
       args:
@@ -56,20 +74,16 @@ subcommands:
             short: l
             long: port
             takes_value: true
-        - method:
-            help: Which method to use for communication
-            short: m
-            long: method
-            possible_values:
-              - http
-              - keybase
-            default_value: http
-            takes_value: true
         - no_tor:
             help: Don't start Tor listener when starting HTTP listener
             short: n
             long: no_tor
             takes_value: false
+        - bridge:
+            help: Enable bridge relay with TOR listener
+            short: g
+            long: bridge
+            takes_value: true
   - owner_api:
       about: Runs the wallet's local web API
       args:
@@ -86,7 +100,7 @@ subcommands:
       about: Builds a transaction to send coins and sends to the recipient via the Slatepack workflow
       args:
         - amount:
-            help: Number of coins to send with optional fraction, e.g. 12.423
+            help: Number of coins to send with optional fraction, e.g. 12.423. Keyword 'max' will send maximum amount.
             index: 1
         - minimum_confirmations:
             help: Minimum number of confirmations required for an output to be spendable
@@ -121,7 +135,7 @@ subcommands:
             default_value: "1"
             takes_value: true
         - dest:
-            help: Intended recipient's Slatepack Address (or http listener address (DEPRECATED))
+            help: Intended recipient's Slatepack Address
             short: d
             long: dest
             takes_value: true
@@ -152,6 +166,18 @@ subcommands:
             short: u
             long: outfile
             takes_value: true
+        - bridge:
+            help: Enable tor bridge relay when sending via Slatepack workflow
+            short: g
+            long: bridge
+            takes_value: true
+        - slatepack_qr:
+            help: Show slatepack data as QR code
+            short: q
+            long: slatepack_qr
+        - amount_includes_fee:
+            help: Transaction amount includes transaction fee. Recipient will receive (amount - fee).
+            long: amount_includes_fee
   - unpack:
       about: Unpack and display an armored Slatepack Message, decrypting if possible
       args:
@@ -177,8 +203,17 @@ subcommands:
             short: u
             long: outfile
             takes_value: true
+        - bridge:
+            help: Enable tor bridge relay when receiving via Slatepack workflow
+            short: g
+            long: bridge
+            takes_value: true
+        - slatepack_qr:
+            help: Show slatepack data as QR code
+            short: q
+            long: slatepack_qr
   - process_multisig:
-      about: Processes a Slatepack Message to perform step 1 + 2 in multisig bulletproof building 
+      about: Processes a Slatepack Message to perform step 1 + 2 in multisig bulletproof building
       args:
         - input:
             help: File containing a Slatepack Message
@@ -215,6 +250,10 @@ subcommands:
             short: u
             long: outfile
             takes_value: true
+        - slatepack_qr:
+            help: Show slatepack data as QR code
+            short: q
+            long: slatepack_qr
   - invoice:
       about: Initialize an invoice transaction, outputting a Slatepack Message with the result
       args:
@@ -231,6 +270,10 @@ subcommands:
             short: u
             long: outfile
             takes_value: true
+        - slatepack_qr:
+            help: Show slatepack data as QR code
+            short: q
+            long: slatepack_qr
   - pay:
       about: Spend coins to pay the provided invoice transaction
       args:
@@ -277,6 +320,15 @@ subcommands:
             short: u
             long: outfile
             takes_value: true
+        - bridge:
+            help: Enable tor bridge relay when paying invoice.
+            short: g
+            long: bridge
+            takes_value: true
+        - slatepack_qr:
+            help: Show slatepack data as QR code
+            short: q
+            long: slatepack_qr
   - send_atomic:
       about: Builds an atomic swap main transaction to send coins and sends to the recipient via the Slatepack workflow
       args:
@@ -441,6 +493,11 @@ subcommands:
             help: If specified, display transaction with given TxID UUID and all associated Inputs/Outputs
             short: t
             long: txid
+            takes_value: true
+        - count:
+            help: Maximum number of transactions to show
+            short: c
+            long: count
             takes_value: true
   - post:
       about: Posts a finalized transaction to the chain

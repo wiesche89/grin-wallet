@@ -131,7 +131,7 @@ pub mod ov3_serde {
 /// Serializes an ed25519 PublicKey to and from hex
 pub mod dalek_seckey_serde {
 	use crate::grin_util::{from_hex, ToHex};
-	use ed25519_dalek::SecretKey as DalekSecretKey;
+	use ed25519_dalek::SigningKey as DalekSecretKey;
 	use serde::{Deserialize, Deserializer, Serializer};
 
 	///
@@ -151,7 +151,9 @@ pub mod dalek_seckey_serde {
 		String::deserialize(deserializer)
 			.and_then(|string| from_hex(&string).map_err(|err| Error::custom(err.to_string())))
 			.and_then(|bytes: Vec<u8>| {
-				DalekSecretKey::from_bytes(&bytes).map_err(|err| Error::custom(err.to_string()))
+				let b = <&[u8; 32]>::try_from(bytes.as_slice())
+					.map_err(|_| Error::custom("Error deserializing secret key"))?;
+				Ok(DalekSecretKey::from_bytes(b))
 			})
 	}
 }
@@ -159,7 +161,7 @@ pub mod dalek_seckey_serde {
 /// Serializes an ed25519 PublicKey to and from hex
 pub mod dalek_pubkey_serde {
 	use crate::grin_util::{from_hex, ToHex};
-	use ed25519_dalek::PublicKey as DalekPublicKey;
+	use ed25519_dalek::VerifyingKey as DalekPublicKey;
 	use serde::{Deserialize, Deserializer, Serializer};
 
 	///
@@ -179,12 +181,17 @@ pub mod dalek_pubkey_serde {
 		String::deserialize(deserializer)
 			.and_then(|string| from_hex(&string).map_err(|err| Error::custom(err.to_string())))
 			.and_then(|bytes: Vec<u8>| {
-				DalekPublicKey::from_bytes(&bytes).map_err(|err| Error::custom(err.to_string()))
+				let b = <&[u8; 32]>::try_from(bytes.as_slice())
+					.map_err(|_| Error::custom("Error deserializing public key"))?;
+				Ok(match DalekPublicKey::from_bytes(b) {
+					Ok(pk) => pk,
+					Err(e) => return Err(Error::custom(format!("{:?}", e))),
+				})
 			})
 	}
 }
 
-/// Serializes an x25519 PublicKey to and from hex
+/// Serializes a x25519 PublicKey to and from hex
 pub mod dalek_xpubkey_serde {
 	use crate::grin_util::{from_hex, ToHex};
 	use serde::{Deserialize, Deserializer, Serializer};
@@ -217,7 +224,7 @@ pub mod dalek_xpubkey_serde {
 /// Serializes an ed25519 PublicKey to and from base64
 pub mod dalek_pubkey_base64 {
 	use base64;
-	use ed25519_dalek::PublicKey as DalekPublicKey;
+	use ed25519_dalek::VerifyingKey as DalekPublicKey;
 	use serde::{Deserialize, Deserializer, Serializer};
 
 	///
@@ -239,7 +246,12 @@ pub mod dalek_pubkey_base64 {
 				base64::decode(&string).map_err(|err| Error::custom(err.to_string()))
 			})
 			.and_then(|bytes: Vec<u8>| {
-				DalekPublicKey::from_bytes(&bytes).map_err(|err| Error::custom(err.to_string()))
+				let b = <&[u8; 32]>::try_from(bytes.as_slice())
+					.map_err(|_| Error::custom("Error deserializing public key"))?;
+				Ok(match DalekPublicKey::from_bytes(b) {
+					Ok(pk) => pk,
+					Err(e) => return Err(Error::custom(format!("{:?}", e))),
+				})
 			})
 	}
 }
@@ -247,7 +259,7 @@ pub mod dalek_pubkey_base64 {
 /// Serializes an Option<ed25519_dalek::PublicKey> to and from hex
 pub mod option_dalek_pubkey_base64 {
 	use base64;
-	use ed25519_dalek::PublicKey as DalekPublicKey;
+	use ed25519_dalek::VerifyingKey as DalekPublicKey;
 	use serde::de::Error;
 	use serde::{Deserialize, Deserializer, Serializer};
 
@@ -287,7 +299,7 @@ pub mod option_dalek_pubkey_base64 {
 
 /// Serializes an Option<ed25519_dalek::PublicKey> to and from hex
 pub mod option_dalek_pubkey_serde {
-	use ed25519_dalek::PublicKey as DalekPublicKey;
+	use ed25519_dalek::VerifyingKey as DalekPublicKey;
 	use serde::de::Error;
 	use serde::{Deserialize, Deserializer, Serializer};
 
@@ -386,8 +398,8 @@ pub mod dalek_sig_serde {
 		String::deserialize(deserializer)
 			.and_then(|string| from_hex(&string).map_err(|err| Error::custom(err.to_string())))
 			.and_then(|bytes: Vec<u8>| {
-				let mut b = [0u8; 64];
-				b.copy_from_slice(&bytes[0..64]);
+				let b = <[u8; 64]>::try_from(bytes.as_slice())
+					.map_err(|_| Error::custom("invalid signature length"))?;
 				DalekSignature::try_from(b).map_err(|err| Error::custom(err.to_string()))
 			})
 	}
@@ -422,8 +434,8 @@ pub mod option_dalek_sig_serde {
 			Some(string) => from_hex(&string)
 				.map_err(|err| Error::custom(err.to_string()))
 				.and_then(|bytes: Vec<u8>| {
-					let mut b = [0u8; 64];
-					b.copy_from_slice(&bytes[0..64]);
+					let b = <[u8; 64]>::try_from(bytes.as_slice())
+						.map_err(|_| Error::custom("invalid signature length"))?;
 					DalekSignature::try_from(b)
 						.map(Some)
 						.map_err(|err| Error::custom(err.to_string()))
@@ -461,8 +473,8 @@ pub mod option_dalek_sig_base64 {
 			Some(string) => base64::decode(&string)
 				.map_err(|err| Error::custom(err.to_string()))
 				.and_then(|bytes: Vec<u8>| {
-					let mut b = [0u8; 64];
-					b.copy_from_slice(&bytes[0..64]);
+					let b = <[u8; 64]>::try_from(bytes.as_slice())
+						.map_err(|_| Error::custom("invalid signature length"))?;
 					DalekSignature::try_from(b)
 						.map(Some)
 						.map_err(|err| Error::custom(err.to_string()))
@@ -544,7 +556,8 @@ pub mod version_info_v5 {
 				return Err(Error::custom("Cannot parse version"));
 			}
 			match u16::from_str_radix(v[0], 10) {
-				Ok(u) => retval.version = u,
+				Ok(5) => retval.version = 5,
+				Ok(_) => return Err(Error::custom("Expected slate version 5")),
 				Err(e) => return Err(Error::custom(format!("Cannot parse version: {}", e))),
 			}
 			match u16::from_str_radix(v[1], 10) {
@@ -700,11 +713,10 @@ mod test {
 	use rand::rngs::mock::StepRng;
 
 	use crate::grin_util::{secp, static_secp_instance};
-	use ed25519_dalek::Keypair;
-	use ed25519_dalek::PublicKey as DalekPublicKey;
-	use ed25519_dalek::SecretKey as DalekSecretKey;
 	use ed25519_dalek::Signature as DalekSignature;
 	use ed25519_dalek::Signer;
+	use ed25519_dalek::SigningKey as DalekSecretKey;
+	use ed25519_dalek::VerifyingKey as DalekPublicKey;
 	use serde::Deserialize;
 
 	use serde_json;
@@ -727,15 +739,10 @@ mod test {
 			let secp = secp_inst.lock();
 			let mut test_rng = StepRng::new(1234567890u64, 1);
 			let sec_key = secp::key::SecretKey::new(&secp, &mut test_rng);
-			let d_skey = DalekSecretKey::from_bytes(&sec_key.0).unwrap();
+			let d_skey = DalekSecretKey::from_bytes(&sec_key.0);
 			let d_pub_key: DalekPublicKey = (&d_skey).into();
 
-			let keypair = Keypair {
-				public: d_pub_key,
-				secret: d_skey,
-			};
-
-			let d_sig = keypair.sign("test sig".as_bytes());
+			let d_sig = d_skey.sign("test sig".as_bytes());
 			println!("D sig: {:?}", d_sig);
 
 			SerTest {

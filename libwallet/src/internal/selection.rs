@@ -16,8 +16,7 @@
 
 use rand::thread_rng;
 
-use crate::address;
-use crate::error::{Error, ErrorKind};
+use crate::error::Error;
 use crate::grin_core::core::{amount_to_hr_string, Output, OutputFeatures};
 use crate::grin_core::libtx::{
 	build,
@@ -32,6 +31,9 @@ use crate::internal::keys;
 use crate::slate::{Slate, SlateState};
 use crate::types::*;
 use crate::util::OnionV3Address;
+use crate::{address, WalletBackend};
+use grin_core::core::Transaction;
+use grin_core::global;
 use std::collections::HashMap;
 use std::convert::TryInto;
 
@@ -40,8 +42,8 @@ use std::convert::TryInto;
 /// and saves the private wallet identifiers of our selected outputs
 /// into our transaction context
 
-pub fn build_send_tx<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn build_send_tx<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain: &K,
 	keychain_mask: Option<&SecretKey>,
 	slate: &mut Slate,
@@ -55,16 +57,17 @@ pub fn build_send_tx<'a, T: ?Sized, C, K>(
 	multisig_key_id: Option<&Identifier>,
 	use_test_nonce: bool,
 	is_initiator: bool,
+	amount_includes_fee: bool,
 ) -> Result<Context, Error>
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
 	let (elems, inputs, change_amounts_derivations, fee) = select_send_tx(
 		wallet,
 		keychain_mask,
 		slate.amount,
+		amount_includes_fee,
 		current_height,
 		minimum_confirmations,
 		max_outputs,
@@ -74,9 +77,16 @@ where
 		multisig_key_id,
 		false,
 	)?;
+	if amount_includes_fee {
+		slate.amount = slate.amount.checked_sub(fee).ok_or(Error::GenericError(
+			"Transaction amount is too small to include fee".to_string(),
+		))?;
+	};
 
 	if fixed_fee.map(|f| fee != f).unwrap_or(false) {
-		return Err(ErrorKind::Fee("The initially selected fee is not sufficient".into()).into());
+		return Err(Error::Fee(
+			"The initially selected fee is not sufficient".into(),
+		));
 	}
 
 	// Update the fee on the slate so we account for this when building the tx.
@@ -95,7 +105,7 @@ where
 	context.amount = slate.amount;
 
 	// Store our private identifiers for each input
-	for input in inputs {
+	for input in &inputs {
 		context.add_input(&input.key_id, &input.mmr_index, input.value);
 	}
 
@@ -115,8 +125,8 @@ where
 
 /// Locks all corresponding outputs in the context, creates
 /// change outputs and tx log entry
-pub fn lock_tx_context<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn lock_tx_context<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	slate: &Slate,
 	current_height: u64,
@@ -124,9 +134,8 @@ pub fn lock_tx_context<'a, T: ?Sized, C, K>(
 	excess_override: Option<pedersen::Commitment>,
 ) -> Result<(), Error>
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
 	let mut output_commits: HashMap<Identifier, (Option<String>, u64)> = HashMap::new();
 	// Store cached commits before locking wallet
@@ -155,6 +164,7 @@ where
 		let log_id = batch.next_tx_log_id(&parent_key_id)?;
 		let mut t = TxLogEntry::new(parent_key_id.clone(), TxLogEntryType::TxSent, log_id);
 		t.tx_slate_id = Some(slate_id);
+		t.tx_slate_state = Some(slate.state.clone());
 		let filename = format!("{}.grintx", slate_id);
 		t.stored_tx = Some(filename);
 		t.fee = context.fee;
@@ -174,7 +184,7 @@ where
 		let mut amount_debited = 0;
 		t.num_inputs = lock_inputs.len();
 		for id in lock_inputs {
-			let mut coin = batch.get(&id.0, &id.1).unwrap();
+			let mut coin = batch.get(&id.0, &id.1)?;
 			coin.tx_log_entry = Some(log_id);
 			amount_debited += coin.value;
 			batch.lock_output(&mut coin)?;
@@ -187,7 +197,7 @@ where
 			let sender_address_path = match context.payment_proof_derivation_index {
 				Some(p) => p,
 				None => {
-					return Err(ErrorKind::PaymentProof(
+					return Err(Error::PaymentProof(
 						"Payment proof derivation index required".to_owned(),
 					)
 					.into());
@@ -217,11 +227,11 @@ where
 				root_key_id: parent_key_id.clone(),
 				key_id: id.clone(),
 				n_child: id.to_path().last_path_index(),
-				commit: commit,
+				commit,
 				mmr_index: None,
 				value: change_amount,
 				status: OutputStatus::Unconfirmed,
-				height: height,
+				height,
 				lock_height: 0,
 				is_coinbase: false,
 				is_multisig: slate.is_multisig(),
@@ -242,8 +252,8 @@ where
 /// Creates a new output in the wallet for the recipient,
 /// returning the key of the fresh output
 /// Also creates a new transaction containing the output
-pub fn build_recipient_output<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn build_recipient_output<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	slate: &mut Slate,
 	current_height: u64,
@@ -252,9 +262,8 @@ pub fn build_recipient_output<'a, T: ?Sized, C, K>(
 	is_initiator: bool,
 ) -> Result<(Identifier, Context, TxLogEntry), Error>
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
 	let is_multisig = slate
 		.participant_data
@@ -286,13 +295,13 @@ where
 			.participant_data
 			.iter()
 			.find(|d| d.public_nonce != public_nonce)
-			.ok_or(Error::from(ErrorKind::GenericError(
+			.ok_or(Error::from(Error::GenericError(
 				"missing other participant data".into(),
 			)))?;
 
-		let oth_partial_commit = data.part_commit.ok_or(Error::from(ErrorKind::Commit(
-			"missing partial commit".into(),
-		)))?;
+		let oth_partial_commit = data
+			.part_commit
+			.ok_or(Error::from(Error::Commit("missing partial commit".into())))?;
 
 		// calculate the commit sum of the participants' partial commits
 		let (partial_commit, commit_sum) = wallet.calc_multisig_commit_for_cache(
@@ -343,6 +352,7 @@ where
 	let log_id = batch.next_tx_log_id(&parent_key_id)?;
 	let mut t = TxLogEntry::new(parent_key_id.clone(), TxLogEntryType::TxReceived, log_id);
 	t.tx_slate_id = Some(slate_id);
+	t.tx_slate_state = Some(slate.state.clone());
 	t.amount_credited = amount;
 	t.num_outputs = 1;
 	t.ttl_cutoff_height = match slate.ttl_cutoff_height {
@@ -359,10 +369,10 @@ where
 		key_id: key_id_inner.clone(),
 		mmr_index: None,
 		n_child: key_id_inner.to_path().last_path_index(),
-		commit: commit,
+		commit,
 		value: amount,
 		status: OutputStatus::Unconfirmed,
-		height: height,
+		height,
 		lock_height: 0,
 		is_coinbase: false,
 		is_multisig: slate.is_multisig(),
@@ -377,10 +387,11 @@ where
 /// Builds a transaction to send to someone from the HD seed associated with the
 /// wallet and the amount to send. Handles reading through the wallet data file,
 /// selecting outputs to spend and building the change.
-pub fn select_send_tx<'a, T: ?Sized, C, K, B>(
-	wallet: &mut T,
+pub fn select_send_tx<C, K, B>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	amount: u64,
+	amount_includes_fee: bool,
 	current_height: u64,
 	minimum_confirmations: u64,
 	max_outputs: usize,
@@ -399,14 +410,14 @@ pub fn select_send_tx<'a, T: ?Sized, C, K, B>(
 	Error,
 >
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 	B: ProofBuild,
 {
 	let (coins, _total, amount, fee) = select_coins_and_fee(
 		wallet,
 		amount,
+		amount_includes_fee,
 		current_height,
 		minimum_confirmations,
 		max_outputs,
@@ -431,9 +442,10 @@ where
 }
 
 /// Select outputs and calculating fee.
-pub fn select_coins_and_fee<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn select_coins_and_fee<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	amount: u64,
+	amount_includes_fee: bool,
 	current_height: u64,
 	minimum_confirmations: u64,
 	max_outputs: usize,
@@ -451,9 +463,8 @@ pub fn select_coins_and_fee<'a, T: ?Sized, C, K>(
 	Error,
 >
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
 	// select some spendable coins from the wallet
 	let (max_outputs, mut coins) = select_coins(
@@ -465,36 +476,37 @@ where
 		selection_strategy_is_use_all,
 		parent_key_id,
 		multisig_key_id,
-	);
+	)?;
 
 	// sender is responsible for setting the fee on the partial tx
-	// recipient should double check the fee calculation and not blindly trust the
+	// recipient should double-check the fee calculation and not blindly trust the
 	// sender
 
 	// First attempt to spend without change
 	let mut fee = tx_fee(coins.len(), 1, 1);
 	let mut total: u64 = coins.iter().map(|c| c.value).sum();
-	let mut amount_with_fee = amount + fee;
+	let mut amount_with_fee = match amount_includes_fee {
+		true => amount,
+		false => amount + fee,
+	};
 
 	if total == 0 {
-		return Err(ErrorKind::NotEnoughFunds {
+		return Err(Error::NotEnoughFunds {
 			available: 0,
 			available_disp: amount_to_hr_string(0, false),
-			needed: amount_with_fee as u64,
-			needed_disp: amount_to_hr_string(amount_with_fee as u64, false),
-		}
-		.into());
+			needed: amount_with_fee,
+			needed_disp: amount_to_hr_string(amount_with_fee, false),
+		});
 	}
 
 	// The amount with fee is more than the total values of our max outputs
 	if total < amount_with_fee && coins.len() == max_outputs {
-		return Err(ErrorKind::NotEnoughFunds {
+		return Err(Error::NotEnoughFunds {
 			available: total,
 			available_disp: amount_to_hr_string(total, false),
-			needed: amount_with_fee as u64,
-			needed_disp: amount_to_hr_string(amount_with_fee as u64, false),
-		}
-		.into());
+			needed: amount_with_fee,
+			needed_disp: amount_to_hr_string(amount_with_fee, false),
+		});
 	}
 
 	let num_outputs = change_outputs + 1;
@@ -502,20 +514,22 @@ where
 	// We need to add a change address or amount with fee is more than total
 	if total != amount_with_fee {
 		fee = tx_fee(coins.len(), num_outputs, 1);
-		amount_with_fee = amount + fee;
+		amount_with_fee = match amount_includes_fee {
+			true => amount,
+			false => amount + fee,
+		};
 
 		// Here check if we have enough outputs for the amount including fee otherwise
 		// look for other outputs and check again
 		while total < amount_with_fee {
 			// End the loop if we have selected all the outputs and still not enough funds
 			if coins.len() == max_outputs {
-				return Err(ErrorKind::NotEnoughFunds {
-					available: total as u64,
+				return Err(Error::NotEnoughFunds {
+					available: total,
 					available_disp: amount_to_hr_string(total, false),
-					needed: amount_with_fee as u64,
-					needed_disp: amount_to_hr_string(amount_with_fee as u64, false),
-				}
-				.into());
+					needed: amount_with_fee,
+					needed_disp: amount_to_hr_string(amount_with_fee, false),
+				});
 			}
 
 			// select some spendable coins from the wallet
@@ -528,20 +542,115 @@ where
 				selection_strategy_is_use_all,
 				parent_key_id,
 				multisig_key_id,
-			)
+			)?
 			.1;
 			fee = tx_fee(coins.len(), num_outputs, 1);
 			total = coins.iter().map(|c| c.value).sum();
-			amount_with_fee = amount + fee;
+			amount_with_fee = match amount_includes_fee {
+				true => amount,
+				false => amount + fee,
+			};
 		}
 	}
-	Ok((coins, total, amount, fee))
+
+	let input_len = coins.len();
+	let output_len = if total == amount_with_fee {
+		1
+	} else {
+		change_outputs + 1
+	};
+	let tx_weight = Transaction::weight_by_iok(input_len as u64, output_len as u64, 1u64);
+	let max_tx_weight = global::max_tx_weight();
+	if tx_weight > max_tx_weight {
+		let (max_amount, max_inputs) = max_spendable_amount(
+			&coins,
+			output_len as u64,
+			max_tx_weight,
+			amount_includes_fee,
+		);
+		error!(
+			"Transaction weight {}, exceeds global max_tx_weight {}, can send maximum {}, send such amount to yourself for outputs consolidation",
+			tx_weight, max_tx_weight, amount_to_hr_string(max_amount, true)
+		);
+		let fee = tx_fee(max_inputs as usize, 1, 1);
+		return Err(Error::BigAmountError(max_amount, fee, max_inputs));
+	}
+
+	// If original amount includes fee, the new amount should
+	// be reduced, to accommodate the fee.
+	let new_amount = match amount_includes_fee {
+		true => amount.checked_sub(fee).ok_or(Error::GenericError(
+			"Transaction amount is too small to include fee".to_string(),
+		))?,
+		false => amount,
+	};
+	Ok((coins, total, new_amount, fee))
+}
+
+fn max_spendable_amount(
+	outputs: &[OutputData],
+	output_len: u64,
+	max_tx_weight: u64,
+	amount_includes_fee: bool,
+) -> (u64, u32) {
+	let mut values: Vec<u64> = outputs
+		.iter()
+		.map(|output| output.value)
+		.enumerate()
+		.take_while(|(index, _)| {
+			Transaction::weight_by_iok(*index as u64 + 1, output_len, 1) <= max_tx_weight
+		})
+		.map(|(_, value)| value)
+		.collect();
+
+	// sort outputs by decreasing value to calculate the best fee
+	values.sort_by(|a, b| b.cmp(a));
+
+	let mut total_value = 0;
+	let mut amount = 0;
+	let mut inputs = 0;
+	for (index, value) in values.into_iter().enumerate() {
+		let inputs_len = index + 1;
+		total_value += value;
+		if total_value > tx_fee(inputs_len, 1, 1) {
+			amount = total_value;
+			inputs = inputs_len as u32;
+		}
+	}
+
+	let amount = if amount_includes_fee {
+		amount
+	} else {
+		amount.saturating_sub(tx_fee(inputs as usize, 1, 1))
+	};
+	(amount, inputs)
+}
+
+fn eligible_outputs<C, K>(
+	wallet: &WalletBackend<C, K>,
+	current_height: u64,
+	minimum_confirmations: u64,
+	parent_key_id: &Identifier,
+	multisig_key_id: Option<&Identifier>,
+) -> Result<Vec<OutputData>, Error>
+where
+	C: NodeClient,
+	K: Keychain,
+{
+	let key_id = multisig_key_id.unwrap_or(parent_key_id);
+	Ok(wallet
+		.iter()?
+		.filter(|output| {
+			(output.root_key_id == *key_id || output.key_id == *key_id)
+				&& output.eligible_to_spend(current_height, minimum_confirmations)
+		})
+		.collect())
 }
 
 /// Selects inputs and change for a transaction
-pub fn inputs_and_change<'a, T: ?Sized, C, K, B>(
+pub fn inputs_and_change<C, K, B>(
 	coins: &[OutputData],
-	wallet: &mut T,
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	amount: u64,
 	fee: u64,
@@ -555,9 +664,8 @@ pub fn inputs_and_change<'a, T: ?Sized, C, K, B>(
 	Error,
 >
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 	B: ProofBuild,
 {
 	let mut parts = vec![];
@@ -602,7 +710,7 @@ where
 				part_change
 			};
 
-			let change_key = wallet.next_child(keychain_mask).unwrap();
+			let change_key = wallet.next_child(keychain_mask)?;
 
 			change_amounts_derivations.push((change_amount, change_key.clone(), None));
 			parts.push(build::output(change_amount, change_key));
@@ -617,10 +725,8 @@ where
 /// max_outputs). Alternative strategy is to spend smallest outputs first
 /// but only as many as necessary. When we introduce additional strategies
 /// we should pass something other than a bool in.
-/// TODO: Possibly move this into another trait to be owned by a wallet?
-
-pub fn select_coins<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn select_coins<C, K>(
+	wallet: &WalletBackend<C, K>,
 	amount: u64,
 	current_height: u64,
 	minimum_confirmations: u64,
@@ -628,23 +734,20 @@ pub fn select_coins<'a, T: ?Sized, C, K>(
 	select_all: bool,
 	parent_key_id: &Identifier,
 	multisig_key_id: Option<&Identifier>,
-) -> (usize, Vec<OutputData>)
+) -> Result<(usize, Vec<OutputData>), Error>
 //    max_outputs_available, Outputs
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
 	// first find all eligible outputs based on number of confirmations
-	let key_id = multisig_key_id.unwrap_or(parent_key_id);
-	let mut eligible = vec![];
-	for out in wallet.iter() {
-		if (out.root_key_id == *key_id || out.key_id == *key_id)
-			&& out.eligible_to_spend(current_height, minimum_confirmations)
-		{
-			eligible.push(out.clone());
-		}
-	}
+	let mut eligible = eligible_outputs(
+		wallet,
+		current_height,
+		minimum_confirmations,
+		parent_key_id,
+		multisig_key_id,
+	)?;
 
 	let max_available = eligible.len();
 
@@ -663,7 +766,7 @@ where
 		for window in eligible.windows(max_outputs) {
 			let windowed_eligibles = window.to_vec();
 			if let Some(outputs) = select_from(amount, select_all, windowed_eligibles) {
-				return (max_available, outputs);
+				return Ok((max_available, outputs));
 			}
 		}
 		// Not exist in any window of which total amount >= amount.
@@ -674,20 +777,20 @@ where
 				"Extending maximum number of outputs. {} outputs selected.",
 				outputs.len()
 			);
-			return (max_available, outputs);
+			return Ok((max_available, outputs));
 		}
 	} else if let Some(outputs) = select_from(amount, select_all, eligible.clone()) {
-		return (max_available, outputs);
+		return Ok((max_available, outputs));
 	}
 
 	// we failed to find a suitable set of outputs to spend,
 	// so return the largest amount we can so we can provide guidance on what is
 	// possible
 	eligible.reverse();
-	(
+	Ok((
 		max_available,
 		eligible.iter().take(max_outputs).cloned().collect(),
-	)
+	))
 }
 
 fn select_from(amount: u64, select_all: bool, outputs: Vec<OutputData>) -> Option<Vec<OutputData>> {
@@ -714,28 +817,27 @@ fn select_from(amount: u64, select_all: bool, outputs: Vec<OutputData>) -> Optio
 	}
 }
 
-/// Repopulates output in the slate's tranacstion
+/// Repopulates output in the slate's transaction
 /// with outputs from the stored context
 /// change outputs and tx log entry
 /// Remove the explicitly stored excess
-pub fn repopulate_tx<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn repopulate_tx<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	slate: &mut Slate,
 	context: &Context,
 	update_fee: bool,
 ) -> Result<(), Error>
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
 	// restore the original amount, fee
 	slate.amount = context.amount;
 	if update_fee {
 		slate.fee_fields = context
 			.fee
-			.ok_or_else(|| ErrorKind::Fee("Missing fee fields".into()))?;
+			.ok_or_else(|| Error::Fee("Missing fee fields".into()))?;
 	}
 
 	let keychain = wallet.keychain(keychain_mask)?;
@@ -744,16 +846,21 @@ where
 	slate.add_participant_info(&keychain, &context, None)?;
 
 	let mut parts = vec![];
-	for (id, _, value) in &context.get_inputs() {
-		let input = wallet.iter().find(|out| out.key_id == *id);
+	for (id, mmr_index, value) in &context.get_inputs() {
+		let input = match wallet.get(id, mmr_index) {
+			Ok(o) => Some(o),
+			Err(_) => wallet.iter()?.find(|out| out.key_id == *id),
+		};
 		if let Some(i) = input {
 			if i.is_coinbase {
 				parts.push(build::coinbase_input(*value, i.key_id.clone()));
 			} else if i.is_multisig {
-				let commit_str = i.commit.ok_or(Error::from(ErrorKind::GenericError(
+				let commit_str = i.commit.ok_or(Error::from(Error::GenericError(
 					"missing multisig output commitment".into(),
 				)))?;
-				let commit = pedersen::Commitment::from_hex(&commit_str)?;
+				let commit = pedersen::Commitment::from_vec(
+					from_hex(&commit_str).map_err(|e| Error::GenericError(e.to_string()))?,
+				);
 				parts.push(build::multisig_input(*value, i.key_id.clone(), commit));
 			} else {
 				parts.push(build::input(*value, i.key_id.clone()));
@@ -761,7 +868,7 @@ where
 		}
 	}
 	for (id, _, value) in &context.get_outputs() {
-		let output = wallet.iter().find(|out| out.key_id == *id);
+		let output = wallet.iter()?.find(|out| out.key_id == *id);
 		if let Some(i) = output {
 			parts.push(build::output(*value, i.key_id.clone()));
 		}
@@ -772,16 +879,15 @@ where
 	Ok(())
 }
 
-pub fn finalize_multisig_bulletproof<'a, T: ?Sized, C, K>(
-	wallet: &mut T,
+pub fn finalize_multisig_bulletproof<C, K>(
+	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	slate: &mut Slate,
 	context: &mut Context,
 ) -> Result<Option<SecretKey>, Error>
 where
-	T: WalletBackend<'a, C, K>,
-	C: NodeClient + 'a,
-	K: Keychain + 'a,
+	C: NodeClient,
+	K: Keychain,
 {
 	let keychain = wallet.keychain(keychain_mask)?;
 	let secp = keychain.secp();
@@ -790,7 +896,7 @@ where
 		.participant_data
 		.iter()
 		.find(|d| d.public_nonce != pub_nonce)
-		.ok_or(Error::from(ErrorKind::GenericError(
+		.ok_or(Error::from(Error::GenericError(
 			"missing other participant data".into(),
 		)))?;
 
@@ -800,33 +906,30 @@ where
 
 	let amount = slate.amount;
 	let out = wallet
-		.iter()
+		.iter()?
 		.find(|o| o.key_id == key_id)
-		.ok_or(Error::from(ErrorKind::GenericError(
+		.ok_or(Error::from(Error::GenericError(
 			"missing multisig output".into(),
 		)))?;
-	let commit_str = out
-		.commit
-		.as_ref()
-		.ok_or(Error::from(ErrorKind::GenericError(
-			"missing multisig output commit".into(),
-		)))?;
-	let commit_hex = from_hex(&commit_str)
-		.map_err(|e| ErrorKind::GenericError(format!("invalid hex: {}", e)))?;
+	let commit_str = out.commit.as_ref().ok_or(Error::from(Error::GenericError(
+		"missing multisig output commit".into(),
+	)))?;
+	let commit_hex =
+		from_hex(&commit_str).map_err(|e| Error::GenericError(format!("invalid hex: {}", e)))?;
 	let commit = pedersen::Commitment::from_vec(commit_hex);
 
 	let is_initiator_final = context.tau_x.is_some();
 	if !is_initiator_final {
-		let tau_one = context.tau_one.ok_or(Error::from(ErrorKind::GenericError(
+		let tau_one = context.tau_one.ok_or(Error::from(Error::GenericError(
 			"missing tau one multisig key".into(),
 		)))?;
-		let tau_two = context.tau_two.ok_or(Error::from(ErrorKind::GenericError(
+		let tau_two = context.tau_two.ok_or(Error::from(Error::GenericError(
 			"missing tau two multisig key".into(),
 		)))?;
-		let oth_tau_one = oth_data.tau_one.ok_or(Error::from(ErrorKind::GenericError(
+		let oth_tau_one = oth_data.tau_one.ok_or(Error::from(Error::GenericError(
 			"missing other tau one multisig key".into(),
 		)))?;
-		let oth_tau_two = oth_data.tau_two.ok_or(Error::from(ErrorKind::GenericError(
+		let oth_tau_two = oth_data.tau_two.ok_or(Error::from(Error::GenericError(
 			"missing other tau two multisig key".into(),
 		)))?;
 		context.tau_one = Some(PublicKey::from_combination(
@@ -856,7 +959,7 @@ where
 	let mut tau_x_sum = context
 		.tau_x
 		.clone()
-		.ok_or(Error::from(ErrorKind::GenericError(
+		.ok_or(Error::from(Error::GenericError(
 			"missing local tau x".into(),
 		)))?;
 	// Save for receiver to add to the slate, can be ignored for initiator finalization
@@ -864,7 +967,7 @@ where
 	let oth_tau_x = oth_data
 		.tau_x
 		.as_ref()
-		.ok_or(Error::from(ErrorKind::GenericError(
+		.ok_or(Error::from(Error::GenericError(
 			"missing other tau x".into(),
 		)))?;
 	tau_x_sum.add_assign(secp, oth_tau_x)?;
@@ -884,7 +987,7 @@ where
 			0,
 			None,
 		)?
-		.ok_or(Error::from(ErrorKind::GenericError(
+		.ok_or(Error::from(Error::GenericError(
 			"error creating final multisig proof".into(),
 		)))?;
 
@@ -909,4 +1012,137 @@ where
 	slate.state = SlateState::Multisig4;
 
 	Ok(ret_tau_x)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn output(value: u64) -> OutputData {
+		OutputData {
+			root_key_id: Identifier::zero(),
+			key_id: Identifier::zero(),
+			n_child: 0,
+			commit: None,
+			mmr_index: None,
+			value,
+			status: OutputStatus::Unspent,
+			height: 0,
+			lock_height: 0,
+			is_coinbase: false,
+			is_multisig: false,
+			tx_log_entry: None,
+		}
+	}
+
+	#[test]
+	fn max_spendable_uses_all_outputs() {
+		global::set_local_accept_fee_base(1);
+
+		let selected = vec![output(100), output(200)];
+		let eligible = vec![output(100), output(200), output(10000)];
+		let output_len = 1;
+		let max_weight = Transaction::weight_by_iok(2, output_len, 1);
+		assert_eq!(
+			max_spendable_amount(&selected, output_len, max_weight, true),
+			(300, 2)
+		);
+		assert_eq!(
+			max_spendable_amount(&eligible, output_len, max_weight, true),
+			(300, 2)
+		);
+
+		let max_weight = Transaction::weight_by_iok(3, output_len, 1);
+		assert_eq!(
+			max_spendable_amount(&eligible, output_len, max_weight, true),
+			(10300, 3)
+		);
+	}
+
+	#[test]
+	fn max_spendable_fee_amount() {
+		global::set_local_accept_fee_base(1);
+
+		// Can not make txs when fee equals amount and not enough outputs.
+		{
+			let fee = tx_fee(2, 1, 1);
+			let coins = vec![output(13), output(13)];
+			let output_len = 2;
+			let max_weight = Transaction::weight_by_iok(2, output_len, 1);
+			assert_eq!(fee, coins.iter().map(|o| o.value).sum::<u64>());
+			assert_eq!(
+				max_spendable_amount(&coins, output_len, max_weight, false),
+				(0, 0)
+			);
+		}
+
+		// Can not make txs when fee more than amount and not enough outputs.
+		{
+			let fee = tx_fee(2, 1, 1);
+			let coins = vec![output(12), output(13)];
+			let output_len = 2;
+			let max_weight = Transaction::weight_by_iok(2, output_len, 1);
+			assert!(fee > coins.iter().map(|o| o.value).sum::<u64>());
+			assert_eq!(
+				max_spendable_amount(&coins, output_len, max_weight, false),
+				(0, 0)
+			);
+		}
+
+		// Select not all outputs to cover fee.
+		{
+			let fee = tx_fee(3, 1, 1);
+			let coins = vec![output(fee), output(1), output(1)];
+			let output_len = 2;
+			let max_weight = Transaction::weight_by_iok(2, output_len, 1);
+			assert_eq!(
+				max_spendable_amount(&coins, output_len, max_weight, false),
+				(2, 2)
+			);
+		}
+	}
+
+	#[test]
+	fn max_spendable_excludes_fee() {
+		global::set_local_accept_fee_base(500_000);
+		let coins = vec![output(1_000_000_000), output(2_000_000_000)];
+		let output_len = 2;
+		let max_weight = Transaction::weight_by_iok(2, output_len, 1);
+
+		assert_eq!(
+			max_spendable_amount(&coins, output_len, max_weight, false),
+			(3_000_000_000 - tx_fee(2, 1, 1), 2)
+		);
+	}
+
+	#[test]
+	fn covers_fee_with_multiple_outputs() {
+		global::set_local_accept_fee_base(1);
+		let coins = vec![output(20), output(20)];
+		let output_len = 1;
+		let max_weight = Transaction::weight_by_iok(2, output_len, 1);
+
+		assert_eq!(
+			max_spendable_amount(&coins, output_len, max_weight, true),
+			(40, 2)
+		);
+		assert_eq!(
+			max_spendable_amount(&coins, output_len, max_weight, false),
+			(40 - tx_fee(2, 1, 1), 2)
+		);
+	}
+
+	#[test]
+	fn sorts_large_values() {
+		global::set_local_accept_fee_base(1);
+		let high_value = 1_u64 << 63;
+		let coins = vec![output(1), output(high_value)];
+		let output_len = 1;
+		let max_weight = Transaction::weight_by_iok(2, output_len, 1);
+
+		assert_eq!(
+			max_spendable_amount(&coins, output_len, max_weight, true),
+			(high_value + 1, 2)
+		);
+	}
 }

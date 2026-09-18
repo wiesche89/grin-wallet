@@ -26,8 +26,8 @@ use clap::App;
 use std::thread;
 use std::time::Duration;
 
+use grin_keychain::ExtKeychain;
 use grin_wallet_impls::DefaultLCProvider;
-use grin_wallet_util::grin_keychain::ExtKeychain;
 
 mod common;
 use common::{clean_output_dir, execute_command, initial_setup_wallet, instantiate_wallet, setup};
@@ -59,7 +59,7 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	// add wallet to proxy
 	//let wallet1 = test_framework::create_wallet(&format!("{}/wallet1", test_dir), client1.clone());
 	let config1 = initial_setup_wallet(test_dir, "wallet1");
-	let wallet_config1 = config1.clone().members.unwrap().wallet;
+	let wallet_config1 = config1.clone().members.wallet;
 
 	let (wallet1, mask1_i) = instantiate_wallet(
 		wallet_config1.clone(),
@@ -80,7 +80,7 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	execute_command(&app, test_dir, "wallet2", &client2, arg_vec.clone())?;
 
 	let config2 = initial_setup_wallet(test_dir, "wallet2");
-	let wallet_config2 = config2.clone().members.unwrap().wallet;
+	let wallet_config2 = config2.clone().members.wallet;
 	let (wallet2, mask2_i) = instantiate_wallet(
 		wallet_config2.clone(),
 		client2.clone(),
@@ -127,14 +127,14 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	execute_command(&app, test_dir, "wallet2", &client2, arg_vec.clone())?;
 
 	// Mine a bit into wallet 1 so we have something to send
-	let wallet_config1 = config1.clone().members.unwrap().wallet;
+	let wallet_config1 = config1.clone().members.wallet;
 	let (wallet1, mask1_i) =
 		instantiate_wallet(wallet_config1, client1.clone(), "password1", "default")?;
 	let mask1 = (&mask1_i).as_ref();
 	grin_wallet_controller::controller::owner_single_use(
-		Some(wallet1.clone()),
+		wallet1.clone(),
 		mask1,
-		None,
+		config1.config_file_path.clone(),
 		|api, m| {
 			api.set_active_account(m, "mining")?;
 			Ok(())
@@ -142,14 +142,14 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	)?;
 
 	// Mine a bit into wallet 2 so we have something to send
-	let wallet_config2 = config2.clone().members.unwrap().wallet;
+	let wallet_config2 = config2.clone().members.wallet;
 	let (wallet2, mask2_i) =
 		instantiate_wallet(wallet_config2, client2.clone(), "password2", "default")?;
 	let mask2 = (&mask2_i).as_ref();
 	grin_wallet_controller::controller::owner_single_use(
-		Some(wallet2.clone()),
+		wallet2.clone(),
 		mask2,
-		None,
+		config2.config_file_path.clone(),
 		|api, m| {
 			api.set_active_account(m, "account_1")?;
 			Ok(())
@@ -447,6 +447,6 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 fn wallet_command_line() {
 	let test_dir = "target/test_output/command_line_atomic";
 	if let Err(e) = command_line_test_impl(test_dir) {
-		panic!("Libwallet Error: {} - {}", e, e.backtrace().unwrap());
+		panic!("Libwallet Error: {}", e);
 	}
 }

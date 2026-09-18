@@ -17,7 +17,7 @@ use std::fs::{metadata, File};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
-use crate::libwallet::{slatepack, Error, ErrorKind, Slate, Slatepack, SlatepackBin, Slatepacker};
+use crate::libwallet::{slatepack, Error, Slate, Slatepack, SlatepackBin, Slatepacker};
 use crate::{SlateGetter, SlatePutter};
 use grin_wallet_util::byte_ser;
 
@@ -48,7 +48,7 @@ impl<'a> PathToSlatepack<'a> {
 				"Data is invalid length: {} | min: {}, max: {} |",
 				len, min_len, max_len
 			);
-			return Err(ErrorKind::SlatepackDeser(msg).into());
+			return Err(Error::SlatepackDeser(msg));
 		}
 		let mut pub_tx_f = File::open(&self.pathbuf)?;
 		let mut data = Vec::new();
@@ -73,13 +73,13 @@ impl<'a> SlatePutter for PathToSlatepack<'a> {
 			} else {
 				pub_tx.write_all(
 					&byte_ser::to_bytes(&SlatepackBin(slatepack))
-						.map_err(|_| ErrorKind::SlatepackSer)?,
+						.map_err(|_| Error::SlatepackSer)?,
 				)?;
 			}
 		} else {
 			pub_tx.write_all(
 				serde_json::to_string_pretty(&slatepack)
-					.map_err(|_| ErrorKind::SlateSer)?
+					.map_err(|_| Error::SlateSer)?
 					.as_bytes(),
 			)?;
 		}
@@ -101,10 +101,10 @@ mod tests {
 	use super::*;
 	use std::fs;
 
-	use grin_wallet_util::grin_core::global;
+	use grin_core::global;
 
 	fn clean_output_dir(test_dir: &str) {
-		let _ = remove_dir_all::remove_dir_all(test_dir);
+		let _ = fs::remove_dir_all(test_dir);
 	}
 
 	fn setup(test_dir: &str) {

@@ -12,20 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use bech32::{self, ToBase32};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 /// Slatepack Types + Serialization implementation
-use ed25519_dalek::SecretKey as edSecretKey;
+use ed25519_dalek::SigningKey as edSecretKey;
 use sha2::{Digest, Sha512};
 use x25519_dalek::StaticSecret;
 
 use crate::dalek_ser;
 use crate::grin_core::ser::{self, Readable, Reader, Writeable, Writer};
-use crate::{Error, ErrorKind, CURRENT_SLATE_VERSION};
+use crate::{Error, CURRENT_SLATE_VERSION};
 use grin_wallet_util::byte_ser;
 
 use super::SlatepackAddress;
 
-use std::convert::TryInto;
 use std::fmt;
 use std::io::{Cursor, Read, Write};
 
@@ -147,7 +147,7 @@ impl Slatepack {
 
 		// Create encrypted metadata, which will be length prefixed
 		let bin_meta = SlatepackEncMetadataBin(self.encrypted_meta.clone());
-		let mut to_encrypt = byte_ser::to_bytes(&bin_meta).map_err(|_| ErrorKind::SlatepackSer)?;
+		let mut to_encrypt = byte_ser::to_bytes(&bin_meta).map_err(|_| Error::SlatepackSer)?;
 
 		if self.future_test_mode {
 			Slatepack::pad_test_data(&mut to_encrypt);
@@ -158,8 +158,8 @@ impl Slatepack {
 		let rec_keys: Result<Vec<_>, _> = recipients
 			.into_iter()
 			.map(|addr| {
-				let key = age::keys::RecipientKey::X25519((&addr).try_into()?);
-				Ok(key)
+				let recp_key: age::x25519::Recipient = addr.to_age_pubkey_str()?.parse()?;
+				Ok(Box::new(recp_key) as Box<dyn age::Recipient>)
 			})
 			.collect();
 
@@ -170,7 +170,7 @@ impl Slatepack {
 
 		let encryptor = age::Encryptor::with_recipients(keys);
 		let mut encrypted = vec![];
-		let mut writer = encryptor.wrap_output(&mut encrypted, age::Format::Binary)?;
+		let mut writer = encryptor.wrap_output(&mut encrypted)?;
 		writer.write_all(&to_encrypt)?;
 		writer.finish()?;
 		self.payload = encrypted.to_vec();
@@ -190,28 +190,43 @@ impl Slatepack {
 		let mut b = [0u8; 32];
 		b.copy_from_slice(&dec_key.as_bytes()[0..32]);
 		let mut hasher = Sha512::new();
-		hasher.input(b);
-		let result = hasher.result();
+		hasher.update(b);
+		let result = hasher.finalize();
 		b.copy_from_slice(&result[0..32]);
 
 		let x_dec_secret = StaticSecret::from(b);
-		let key = age::keys::SecretKey::X25519(x_dec_secret);
+		let x_dec_secret_bech32 =
+			bech32::encode("age-secret-key-", (&x_dec_secret).to_bytes().to_base32())?;
+		let key: age::x25519::Identity = x_dec_secret_bech32.parse()?;
 
 		let decryptor = match age::Decryptor::new(&self.payload[..])? {
 			age::Decryptor::Recipients(d) => d,
 			_ => unreachable!(),
 		};
 		let mut decrypted = vec![];
-		let mut reader = decryptor.decrypt(&[key.into()])?;
+		let mut reader = decryptor.decrypt(std::iter::once(&key as &dyn age::Identity))?;
 		reader.read_to_end(&mut decrypted)?;
 		// Parse encrypted metadata from payload, first 4 bytes of decrypted payload
 		// will be encrypted metadata length
+		if decrypted.len() < 4 {
+			return Err(Error::SlatepackDeser(
+				"Encrypted payload missing metadata length".into(),
+			));
+		}
 		let mut len_bytes = [0u8; 4];
 		len_bytes.copy_from_slice(&decrypted[0..4]);
 		let meta_len = Cursor::new(len_bytes).read_u32::<BigEndian>()?;
-		self.payload = decrypted.split_off(meta_len as usize + 4);
+		let payload_start = (meta_len as usize)
+			.checked_add(4)
+			.ok_or_else(|| Error::SlatepackDeser("Encrypted metadata length overflow".into()))?;
+		if payload_start > decrypted.len() {
+			return Err(Error::SlatepackDeser(
+				"Encrypted metadata length exceeds payload".into(),
+			));
+		}
+		self.payload = decrypted.split_off(payload_start);
 		let meta = byte_ser::from_bytes::<SlatepackEncMetadataBin>(&decrypted)
-			.map_err(|_| ErrorKind::SlatepackSer)?
+			.map_err(|_| Error::SlatepackSer)?
 			.0;
 		self.sender = meta.sender;
 		self.encrypted_meta.recipients = meta.recipients;
@@ -292,6 +307,7 @@ impl<'de> serde::Deserialize<'de> for SlatepackBin {
 				let s = ser::deserialize(
 					&mut reader,
 					ser::ProtocolVersion(CURRENT_SLATE_VERSION as u32),
+					ser::DeserializationMode::default(),
 				)
 				.map_err(|err| serde::de::Error::custom(err.to_string()))?;
 				Ok(s)
@@ -527,6 +543,7 @@ impl<'de> serde::Deserialize<'de> for SlatepackEncMetadataBin {
 				let s = ser::deserialize(
 					&mut reader,
 					ser::ProtocolVersion(CURRENT_SLATE_VERSION as u32),
+					ser::DeserializationMode::default(),
 				)
 				.map_err(|err| serde::de::Error::custom(err.to_string()))?;
 				Ok(s)
@@ -759,15 +776,15 @@ fn slatepack_bin_future() -> Result<(), grin_wallet_util::byte_ser::Error> {
 fn slatepack_encrypted_meta() -> Result<(), Error> {
 	use crate::grin_core::global;
 	use crate::{Slate, SlateVersion, TxFlow, VersionedBinSlate, VersionedSlate};
-	use ed25519_dalek::PublicKey as edDalekPublicKey;
-	use ed25519_dalek::SecretKey as edDalekSecretKey;
+	use ed25519_dalek::SigningKey as edDalekSecretKey;
+	use ed25519_dalek::VerifyingKey as edDalekPublicKey;
 	use rand::{thread_rng, Rng};
 	use std::convert::TryFrom;
 	global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
 
 	let sec_key_bytes: [u8; 32] = thread_rng().gen();
 
-	let ed_sec_key = edDalekSecretKey::from_bytes(&sec_key_bytes).unwrap();
+	let ed_sec_key = edDalekSecretKey::from_bytes(&sec_key_bytes);
 	let ed_pub_key = edDalekPublicKey::from(&ed_sec_key);
 	let addr = SlatepackAddress::new(&ed_pub_key);
 
@@ -782,8 +799,8 @@ fn slatepack_encrypted_meta() -> Result<(), Error> {
 
 	let v_slate =
 		VersionedSlate::into_version(Slate::blank(2, TxFlow::Standard), SlateVersion::V4)?;
-	let bin_slate = VersionedBinSlate::try_from(v_slate).map_err(|_| ErrorKind::SlatepackSer)?;
-	slatepack.payload = byte_ser::to_bytes(&bin_slate).map_err(|_| ErrorKind::SlatepackSer)?;
+	let bin_slate = VersionedBinSlate::try_from(v_slate).map_err(|_| Error::SlatepackSer)?;
+	slatepack.payload = byte_ser::to_bytes(&bin_slate).map_err(|_| Error::SlatepackSer)?;
 
 	let orig_sp = slatepack.clone();
 
@@ -809,15 +826,15 @@ fn slatepack_encrypted_meta() -> Result<(), Error> {
 fn slatepack_encrypted_meta_future() -> Result<(), Error> {
 	use crate::grin_core::global;
 	use crate::{Slate, SlateVersion, TxFlow, VersionedBinSlate, VersionedSlate};
-	use ed25519_dalek::PublicKey as edDalekPublicKey;
-	use ed25519_dalek::SecretKey as edDalekSecretKey;
+	use ed25519_dalek::SigningKey as edDalekSecretKey;
+	use ed25519_dalek::VerifyingKey as edDalekPublicKey;
 	use rand::{thread_rng, Rng};
 	use std::convert::TryFrom;
 	global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
 
 	let sec_key_bytes: [u8; 32] = thread_rng().gen();
 
-	let ed_sec_key = edDalekSecretKey::from_bytes(&sec_key_bytes).unwrap();
+	let ed_sec_key = edDalekSecretKey::from_bytes(&sec_key_bytes);
 	let ed_pub_key = edDalekPublicKey::from(&ed_sec_key);
 	let addr = SlatepackAddress::new(&ed_pub_key);
 
@@ -832,8 +849,8 @@ fn slatepack_encrypted_meta_future() -> Result<(), Error> {
 
 	let v_slate =
 		VersionedSlate::into_version(Slate::blank(2, TxFlow::Standard), SlateVersion::V4)?;
-	let bin_slate = VersionedBinSlate::try_from(v_slate).map_err(|_| ErrorKind::SlatepackSer)?;
-	slatepack.payload = byte_ser::to_bytes(&bin_slate).map_err(|_| ErrorKind::SlatepackSer)?;
+	let bin_slate = VersionedBinSlate::try_from(v_slate).map_err(|_| Error::SlatepackSer)?;
+	slatepack.payload = byte_ser::to_bytes(&bin_slate).map_err(|_| Error::SlatepackSer)?;
 
 	let orig_sp = slatepack.clone();
 
@@ -851,6 +868,56 @@ fn slatepack_encrypted_meta_future() -> Result<(), Error> {
 	assert!(slatepack.sender.is_some());
 
 	assert_eq!(orig_sp, slatepack);
+
+	Ok(())
+}
+
+#[cfg(test)]
+fn slatepack_test_decryption_key() -> (edSecretKey, SlatepackAddress) {
+	use ed25519_dalek::VerifyingKey as edDalekPublicKey;
+	use rand::{thread_rng, Rng};
+
+	let sec_key_bytes: [u8; 32] = thread_rng().gen();
+	let ed_sec_key = edSecretKey::from_bytes(&sec_key_bytes);
+	let ed_pub_key = edDalekPublicKey::from(&ed_sec_key);
+	let addr = SlatepackAddress::new(&ed_pub_key);
+
+	(ed_sec_key, addr)
+}
+
+#[cfg(test)]
+fn encrypt_plaintext_to_slatepack_recipient(
+	recipient: &SlatepackAddress,
+	plaintext: &[u8],
+) -> Result<Vec<u8>, Error> {
+	let recp_key: age::x25519::Recipient = recipient.to_age_pubkey_str()?.parse()?;
+	let keys = vec![Box::new(recp_key) as Box<dyn age::Recipient>];
+	let encryptor = age::Encryptor::with_recipients(keys);
+	let mut encrypted = vec![];
+	let mut writer = encryptor.wrap_output(&mut encrypted)?;
+	writer.write_all(plaintext)?;
+	writer.finish()?;
+	Ok(encrypted)
+}
+
+#[test]
+fn slatepack_decrypt_rejects_malformed_plaintexts() -> Result<(), Error> {
+	use crate::grin_core::global;
+
+	global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+	let (ed_sec_key, addr) = slatepack_test_decryption_key();
+
+	for plaintext in vec![vec![], vec![0], vec![0, 0, 0], vec![0xff; 4]] {
+		let mut slatepack = Slatepack {
+			mode: 1,
+			payload: encrypt_plaintext_to_slatepack_recipient(&addr, &plaintext)?,
+			..Slatepack::default()
+		};
+		assert!(matches!(
+			slatepack.try_decrypt_payload(Some(&ed_sec_key)),
+			Err(Error::SlatepackDeser(_))
+		));
+	}
 
 	Ok(())
 }

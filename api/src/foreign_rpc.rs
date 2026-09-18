@@ -16,12 +16,14 @@
 
 use crate::keychain::Keychain;
 use crate::libwallet::{
-	self, BlockFees, CbData, ErrorKind, InitTxArgs, IssueInvoiceTxArgs, NodeClient,
-	NodeVersionInfo, Slate, SlateVersion, TxFlow, VersionInfo, VersionedCoinbase, VersionedSlate,
-	WalletLCProvider,
+	self, BlockFees, CbData, Error, InitTxArgs, IssueInvoiceTxArgs, NodeClient, NodeVersionInfo,
+	Slate, SlateVersion, TxFlow, VersionInfo, VersionedCoinbase, VersionedSlate, WalletLCProvider,
 };
 use crate::{Foreign, ForeignCheckMiddlewareFn};
 use easy_jsonrpc_mw;
+use grin_wallet_config::initial_setup_wallet;
+use libwallet::SlatepackAddress;
+use std::path::PathBuf;
 
 /// Public definition used to generate Foreign jsonrpc api.
 /// * When running `grin-wallet listen` with defaults, the V2 api is available at
@@ -63,7 +65,7 @@ pub trait ForeignRpc {
 	# ,false, 0, false, TxFlow::Standard);
 	```
 	*/
-	fn check_version(&self) -> Result<VersionInfo, ErrorKind>;
+	fn check_version(&self) -> Result<VersionInfo, Error>;
 
 	/**
 	Networked Legacy (non-secure token) version of [Foreign::build_coinbase](struct.Foreign.html#method.build_coinbase).
@@ -112,7 +114,7 @@ pub trait ForeignRpc {
 	```
 	*/
 
-	fn build_coinbase(&self, block_fees: &BlockFees) -> Result<VersionedCoinbase, ErrorKind>;
+	fn build_coinbase(&self, block_fees: &BlockFees) -> Result<VersionedCoinbase, Error>;
 
 	/**
 	;Networked version of [Foreign::receive_tx](struct.Foreign.html#method.receive_tx).
@@ -191,7 +193,7 @@ pub trait ForeignRpc {
 		slate: VersionedSlate,
 		dest_acct_name: Option<String>,
 		dest: Option<String>,
-	) -> Result<VersionedSlate, ErrorKind>;
+	) -> Result<VersionedSlate, Error>;
 
 	/**
 	;Networked version of [Foreign::receive_atomic_tx](struct.Foreign.html#method.receive_atomic_tx).
@@ -270,7 +272,7 @@ pub trait ForeignRpc {
 		slate: VersionedSlate,
 		dest_acct_name: Option<String>,
 		dest: Option<String>,
-	) -> Result<VersionedSlate, ErrorKind>;
+	) -> Result<VersionedSlate, Error>;
 
 	/**
 
@@ -364,7 +366,7 @@ pub trait ForeignRpc {
 	# ,false, 5, true, TxFlow::Invoice);
 	```
 	*/
-	fn finalize_tx(&self, slate: VersionedSlate) -> Result<VersionedSlate, ErrorKind>;
+	fn finalize_tx(&self, slate: VersionedSlate) -> Result<VersionedSlate, Error>;
 }
 
 impl<'a, L, C, K> ForeignRpc for Foreign<'a, L, C, K>
@@ -373,12 +375,12 @@ where
 	C: NodeClient + 'a,
 	K: Keychain + 'a,
 {
-	fn check_version(&self) -> Result<VersionInfo, ErrorKind> {
-		Foreign::check_version(self).map_err(|e| e.kind())
+	fn check_version(&self) -> Result<VersionInfo, Error> {
+		Foreign::check_version(self)
 	}
 
-	fn build_coinbase(&self, block_fees: &BlockFees) -> Result<VersionedCoinbase, ErrorKind> {
-		let cb: CbData = Foreign::build_coinbase(self, block_fees).map_err(|e| e.kind())?;
+	fn build_coinbase(&self, block_fees: &BlockFees) -> Result<VersionedCoinbase, Error> {
+		let cb: CbData = Foreign::build_coinbase(self, block_fees)?;
 		Ok(VersionedCoinbase::into_version(cb, SlateVersion::V5))
 	}
 
@@ -387,17 +389,26 @@ where
 		in_slate: VersionedSlate,
 		dest_acct_name: Option<String>,
 		dest: Option<String>,
-	) -> Result<VersionedSlate, ErrorKind> {
+	) -> Result<VersionedSlate, Error> {
 		let v = in_slate.version();
 		let slate_from = Slate::from(in_slate);
+		let dest = match dest {
+			None => None,
+			Some(a) => match SlatepackAddress::try_from(a.as_str()) {
+				Ok(d) => Some(d),
+				Err(_) => {
+					error!("Error parsing Slatepack address: {}", a);
+					None
+				}
+			},
+		};
 		let out_slate = Foreign::receive_tx(
 			self,
 			&slate_from,
 			dest_acct_name.as_ref().map(String::as_str),
 			dest,
-		)
-		.map_err(|e| e.kind())?;
-		Ok(VersionedSlate::into_version(out_slate, v).map_err(|e| e.kind())?)
+		)?;
+		Ok(VersionedSlate::into_version(out_slate, v)?)
 	}
 
 	fn receive_atomic_tx(
@@ -405,7 +416,7 @@ where
 		in_slate: VersionedSlate,
 		dest_acct_name: Option<String>,
 		dest: Option<String>,
-	) -> Result<VersionedSlate, ErrorKind> {
+	) -> Result<VersionedSlate, Error> {
 		let v = in_slate.version();
 		let slate_from = Slate::from(in_slate);
 		let out_slate = Foreign::receive_atomic_tx(
@@ -413,16 +424,14 @@ where
 			&slate_from,
 			dest_acct_name.as_ref().map(String::as_str),
 			dest,
-		)
-		.map_err(|e| e.kind())?;
-		Ok(VersionedSlate::into_version(out_slate, v).map_err(|e| e.kind())?)
+		)?;
+		Ok(VersionedSlate::into_version(out_slate, v)?)
 	}
 
-	fn finalize_tx(&self, in_slate: VersionedSlate) -> Result<VersionedSlate, ErrorKind> {
+	fn finalize_tx(&self, in_slate: VersionedSlate) -> Result<VersionedSlate, Error> {
 		let v = in_slate.version();
-		let out_slate =
-			Foreign::finalize_tx(self, &Slate::from(in_slate), true).map_err(|e| e.kind())?;
-		Ok(VersionedSlate::into_version(out_slate, v).map_err(|e| e.kind())?)
+		let out_slate = Foreign::finalize_tx(self, &Slate::from(in_slate), true)?;
+		Ok(VersionedSlate::into_version(out_slate, v)?)
 	}
 }
 
@@ -432,7 +441,7 @@ fn test_check_middleware(
 	_slate: Option<&Slate>,
 ) -> Result<(), libwallet::Error> {
 	// TODO: Implement checks
-	// return Err(ErrorKind::GenericError("Test Rejection".into()))?
+	// return Err(Error::GenericError("Test Rejection".into()))?
 	Ok(())
 }
 
@@ -446,14 +455,14 @@ pub fn run_doctest_foreign(
 	tx_flow: TxFlow,
 ) -> Result<Option<serde_json::Value>, String> {
 	use easy_jsonrpc_mw::Handler;
+	use grin_keychain::ExtKeychain;
 	use grin_wallet_impls::test_framework::{self, LocalWalletClient, WalletProxy};
 	use grin_wallet_impls::{DefaultLCProvider, DefaultWalletImpl};
 	use grin_wallet_libwallet::{api_impl, WalletInst};
-	use grin_wallet_util::grin_keychain::ExtKeychain;
 
 	use crate::core::global;
 	use crate::core::global::ChainTypes;
-	use grin_wallet_util::grin_util as util;
+	use grin_util as util;
 
 	use std::sync::Arc;
 	use util::Mutex;
@@ -463,7 +472,15 @@ pub fn run_doctest_foreign(
 
 	util::init_test_logger();
 	let _ = fs::remove_dir_all(test_dir);
-	global::set_local_chain_type(ChainTypes::AutomatedTesting);
+	global::set_global_chain_type(ChainTypes::AutomatedTesting);
+
+	let _ = fs::create_dir_all(test_dir);
+	let config = initial_setup_wallet(
+		&ChainTypes::AutomatedTesting,
+		Some(PathBuf::from(test_dir)),
+		false,
+	)
+	.unwrap();
 
 	let mut wallet_proxy: WalletProxy<
 		DefaultLCProvider<LocalWalletClient, ExtKeychain>,
@@ -482,7 +499,6 @@ pub fn run_doctest_foreign(
 		Box::new(DefaultWalletImpl::<LocalWalletClient>::new(client1.clone()).unwrap())
 			as Box<
 				dyn WalletInst<
-					'static,
 					DefaultLCProvider<LocalWalletClient, ExtKeychain>,
 					LocalWalletClient,
 					ExtKeychain,
@@ -517,7 +533,6 @@ pub fn run_doctest_foreign(
 		Box::new(DefaultWalletImpl::<LocalWalletClient>::new(client2.clone()).unwrap())
 			as Box<
 				dyn WalletInst<
-					'static,
 					DefaultLCProvider<LocalWalletClient, ExtKeychain>,
 					LocalWalletClient,
 					ExtKeychain,
@@ -579,23 +594,21 @@ pub fn run_doctest_foreign(
 			is_multisig: Some(true),
 			..Default::default()
 		};
-		let mut sl = api_impl::owner::init_send_tx(&mut **w, mask1.as_ref(), args, true).unwrap();
+		let mut sl = api_impl::owner::init_send_tx(w, mask1.as_ref(), args, true).unwrap();
 		{
 			let mut w_lock = wallet2.lock();
 			let w2 = w_lock.lc_provider().unwrap().wallet_inst().unwrap();
-			sl =
-				api_impl::foreign::receive_tx(&mut **w2, mask2.as_ref(), &sl, None, false).unwrap();
+			sl = api_impl::foreign::receive_tx(w2, mask2.as_ref(), &sl, None, false).unwrap();
 
 			// Spit out slate for input to finalize_tx
 			println!("LOCKING TX");
-			api_impl::owner::tx_lock_outputs(&mut **w, mask1.as_ref(), &sl).unwrap();
+			api_impl::owner::tx_lock_outputs(w, mask1.as_ref(), &sl).unwrap();
 
-			sl =
-				api_impl::owner::process_multisig_tx(&mut **w, mask1.as_ref(), &sl, false).unwrap();
-			sl = api_impl::foreign::finalize_tx(&mut **w2, mask2.as_ref(), &sl, false).unwrap();
+			sl = api_impl::owner::process_multisig_tx(w, mask1.as_ref(), &sl, false).unwrap();
+			sl = api_impl::foreign::finalize_tx(w2, mask2.as_ref(), &sl, false).unwrap();
 		}
 
-		let _ = api_impl::owner::finalize_tx(&mut **w, mask1.as_ref(), &sl).unwrap();
+		let _ = api_impl::owner::finalize_tx(w, mask1.as_ref(), &sl).unwrap();
 	}
 
 	if do_tx {
@@ -609,8 +622,7 @@ pub fn run_doctest_foreign(
 						amount,
 						..Default::default()
 					};
-					api_impl::owner::issue_invoice_tx(&mut **w, (&mask2).as_ref(), args, true)
-						.unwrap()
+					api_impl::owner::issue_invoice_tx(w, (&mask2).as_ref(), args, true).unwrap()
 				};
 				slate = {
 					let mut w_lock = wallet1.lock();
@@ -624,14 +636,8 @@ pub fn run_doctest_foreign(
 						selection_strategy_is_use_all: true,
 						..Default::default()
 					};
-					api_impl::owner::process_invoice_tx(
-						&mut **w,
-						(&mask1).as_ref(),
-						&slate,
-						args,
-						true,
-					)
-					.unwrap()
+					api_impl::owner::process_invoice_tx(w, (&mask1).as_ref(), &slate, args, true)
+						.unwrap()
 				};
 				println!("INIT INVOICE SLATE");
 				// Spit out slate for input to finalize_tx
@@ -651,7 +657,7 @@ pub fn run_doctest_foreign(
 					..Default::default()
 				};
 				let slate =
-					api_impl::owner::init_send_tx(&mut **w, (&mask1).as_ref(), args, true).unwrap();
+					api_impl::owner::init_send_tx(w, (&mask1).as_ref(), args, true).unwrap();
 				println!("INIT SLATE");
 				// Spit out slate for input to finalize_tx
 				println!("{}", serde_json::to_string_pretty(&slate).unwrap());
@@ -671,8 +677,7 @@ pub fn run_doctest_foreign(
 					..Default::default()
 				};
 				let slate =
-					api_impl::owner::init_atomic_swap(&mut **w, (&mask1).as_ref(), args, true)
-						.unwrap();
+					api_impl::owner::init_atomic_swap(w, (&mask1).as_ref(), args, true).unwrap();
 				println!("INIT SLATE");
 				// Spit out slate for input to finalize_tx
 				println!("{}", serde_json::to_string_pretty(&slate).unwrap());
@@ -684,10 +689,20 @@ pub fn run_doctest_foreign(
 	}
 
 	let mut api_foreign = match tx_flow {
-		TxFlow::Standard | TxFlow::Atomic | TxFlow::Multisig => {
-			Foreign::new(wallet1, mask1, Some(test_check_middleware), true)
-		}
-		TxFlow::Invoice => Foreign::new(wallet2, mask2, Some(test_check_middleware), true),
+		TxFlow::Standard | TxFlow::Atomic | TxFlow::Multisig => Foreign::new(
+			wallet1,
+			config.config_file_path,
+			mask1,
+			Some(test_check_middleware),
+			true,
+		),
+		TxFlow::Invoice => Foreign::new(
+			wallet2,
+			config.config_file_path,
+			mask2,
+			Some(test_check_middleware),
+			true,
+		),
 	};
 	api_foreign.doctest_mode = true;
 	let foreign_api = &api_foreign as &dyn ForeignRpc;

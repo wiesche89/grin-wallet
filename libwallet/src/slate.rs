@@ -16,7 +16,7 @@
 //! around during an interactive wallet exchange
 
 use crate::blake2::blake2b::Blake2b;
-use crate::error::{Error, ErrorKind};
+use crate::error::Error;
 use crate::grin_core::core::amount_to_hr_string;
 use crate::grin_core::core::transaction::{
 	FeeFields, Input, Inputs, KernelFeatures, NRDRelativeHeight, Output, OutputFeatures,
@@ -32,8 +32,8 @@ use crate::grin_util::secp::key::{PublicKey, SecretKey};
 use crate::grin_util::secp::pedersen::Commitment;
 use crate::grin_util::secp::Signature;
 use crate::grin_util::{secp, static_secp_instance, ToHex};
-use ed25519_dalek::PublicKey as DalekPublicKey;
 use ed25519_dalek::Signature as DalekSignature;
+use ed25519_dalek::VerifyingKey as DalekPublicKey;
 use serde::ser::{Serialize, Serializer};
 use serde_json;
 use std::fmt;
@@ -101,7 +101,7 @@ impl ParticipantData {
 	}
 }
 
-/// A 'Slate' is passed around to all parties to build up all of the public
+/// A 'Slate' is passed around to all parties to build up all the public
 /// transaction data needed to create a finalized transaction. Callers can pass
 /// the slate around by whatever means they choose, (but we can provide some
 /// binary or JSON serialization helpers here).
@@ -135,7 +135,7 @@ pub struct Slate {
 	/// 	2: height_locked
 	/// 	3: NRD
 	pub kernel_features: u8,
-	/// Offset, needed when posting of transasction is deferred
+	/// Offset, needed when posting of transaction is deferred
 	pub offset: BlindingFactor,
 	/// Participant data, each participant in the transaction will
 	/// insert their public data here. For now, 0 is sender and 1
@@ -156,7 +156,7 @@ impl fmt::Display for Slate {
 }
 
 /// Slate state definition
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum SlateState {
 	/// Unknown, coming from earlier slate versions
 	Unknown,
@@ -170,7 +170,7 @@ pub enum SlateState {
 	Invoice1,
 	///Invoice flow, return journey
 	Invoice2,
-	/// Invoice flow, ready for tranasction posting
+	/// Invoice flow, ready for transaction posting
 	Invoice3,
 	/// Multisig flow, freshly init
 	Multisig1,
@@ -255,7 +255,7 @@ impl Slate {
 	pub fn tx_or_err(&self) -> Result<&Transaction, Error> {
 		match &self.tx {
 			Some(t) => Ok(t),
-			None => Err(ErrorKind::SlateTransactionRequired.into()),
+			None => Err(Error::SlateTransactionRequired),
 		}
 	}
 
@@ -263,7 +263,7 @@ impl Slate {
 	pub fn tx_or_err_mut(&mut self) -> Result<&mut Transaction, Error> {
 		match &mut self.tx {
 			Some(t) => Ok(t),
-			None => Err(ErrorKind::SlateTransactionRequired.into()),
+			None => Err(Error::SlateTransactionRequired),
 		}
 	}
 
@@ -279,7 +279,7 @@ impl Slate {
 	/// Throw error if this can't be done
 	pub fn deserialize_upgrade(slate_json: &str) -> Result<Slate, Error> {
 		let v_slate: VersionedSlate =
-			serde_json::from_str(slate_json).map_err(|_| ErrorKind::SlateVersionParse)?;
+			serde_json::from_str(slate_json).map_err(|_| Error::SlateVersionParse)?;
 		Slate::upgrade(v_slate)
 	}
 
@@ -418,7 +418,7 @@ impl Slate {
 			}) {
 			Ok(i)
 		} else {
-			Err(ErrorKind::StoredTx("Missing participant data".into()).into())
+			Err(Error::StoredTx("Missing participant data".into()).into())
 		}
 	}
 
@@ -429,7 +429,7 @@ impl Slate {
 				return Ok(i);
 			}
 		}
-		Err(ErrorKind::StoredTx("Missing participant data".into()).into())
+		Err(Error::StoredTx("Missing participant data".into()).into())
 	}
 
 	/// Create an atomic secret identifier with the prefix b'\x04mwatomic'
@@ -447,7 +447,7 @@ impl Slate {
 		if &id_bytes[..9] == ATOMIC_ID_PREFIX {
 			Ok(())
 		} else {
-			Err(ErrorKind::GenericError("Invalid atomic ID".into()).into())
+			Err(Error::GenericError("Invalid atomic ID".into()).into())
 		}
 	}
 
@@ -479,26 +479,22 @@ impl Slate {
 			0 => Ok(KernelFeatures::Plain {
 				fee: self.fee_fields,
 			}),
-			1 => Err(ErrorKind::InvalidKernelFeatures(1).into()),
+			1 => Err(Error::InvalidKernelFeatures(1)),
 			2 => Ok(KernelFeatures::HeightLocked {
 				fee: self.fee_fields,
 				lock_height: match &self.kernel_features_args {
 					Some(a) => a.lock_height,
-					None => {
-						return Err(ErrorKind::KernelFeaturesMissing(format!("lock_height")).into())
-					}
+					None => return Err(Error::KernelFeaturesMissing(format!("lock_height"))),
 				},
 			}),
 			3 => Ok(KernelFeatures::NoRecentDuplicate {
 				fee: self.fee_fields,
 				relative_height: match &self.kernel_features_args {
 					Some(a) => NRDRelativeHeight::new(a.lock_height)?,
-					None => {
-						return Err(ErrorKind::KernelFeaturesMissing(format!("lock_height")).into())
-					}
+					None => return Err(Error::KernelFeaturesMissing(format!("lock_height"))),
 				},
 			}),
-			n => Err(ErrorKind::UnknownKernelFeatures(n).into()),
+			n => Err(Error::UnknownKernelFeatures(n)),
 		}
 	}
 
@@ -581,7 +577,7 @@ impl Slate {
 		let pdata_idx = self.find_participant_data_index(secp, context)?;
 		let opdata_idx = self.find_other_participant_data_index(pdata_idx)?;
 		let part_sig = &self.participant_data[opdata_idx].part_sig.ok_or::<Error>(
-			ErrorKind::Signature("Missing round 2 atomic swap adaptor signature".into()).into(),
+			Error::Signature("Missing round 2 atomic swap adaptor signature".into()).into(),
 		)?;
 		let msg = self.msg_to_sign()?;
 		let nonce_sum = self.pub_nonce_sum(secp)?;
@@ -589,7 +585,7 @@ impl Slate {
 		let pub_atomic = self.participant_data[opdata_idx]
 			.public_atomic
 			.as_ref()
-			.ok_or(Error::from(ErrorKind::GenericError(
+			.ok_or(Error::from(Error::GenericError(
 				"Missing atomic public key".into(),
 			)))?;
 
@@ -673,11 +669,11 @@ impl Slate {
 			.map(|p| &p.public_nonce)
 			.collect();
 		if pub_nonces.len() == 0 {
-			return Err(ErrorKind::Commit(format!("Participant nonces cannot be empty")).into());
+			return Err(Error::Commit(format!("Participant nonces cannot be empty")));
 		}
 		match PublicKey::from_combination(secp, pub_nonces) {
 			Ok(k) => Ok(k),
-			Err(e) => Err(ErrorKind::Secp(e).into()),
+			Err(e) => Err(Error::Secp(e)),
 		}
 	}
 
@@ -689,13 +685,13 @@ impl Slate {
 			.map(|p| &p.public_blind_excess)
 			.collect();
 		if pub_blinds.len() == 0 {
-			return Err(
-				ErrorKind::Commit(format!("Participant Blind sums cannot be empty")).into(),
-			);
+			return Err(Error::Commit(format!(
+				"Participant Blind sums cannot be empty"
+			)));
 		}
 		match PublicKey::from_combination(secp, pub_blinds) {
 			Ok(k) => Ok(k),
-			Err(e) => Err(ErrorKind::Secp(e).into()),
+			Err(e) => Err(Error::Secp(e)),
 		}
 	}
 
@@ -800,9 +796,11 @@ impl Slate {
 
 		if fee > tx.fee() {
 			// apply fee mask past HF4
-			return Err(
-				ErrorKind::Fee(format!("Fee Dispute Error: {}, {}", tx.fee(), fee,)).into(),
-			);
+			return Err(Error::Fee(format!(
+				"Fee Dispute Error: {}, {}",
+				tx.fee(),
+				fee,
+			)));
 		}
 
 		if fee > self.amount + self.fee_fields.fee() {
@@ -812,7 +810,7 @@ impl Slate {
 				amount_to_hr_string(self.amount + self.fee_fields.fee(), false)
 			);
 			info!("{}", reason);
-			return Err(ErrorKind::Fee(reason).into());
+			return Err(Error::Fee(reason));
 		}
 
 		Ok(())

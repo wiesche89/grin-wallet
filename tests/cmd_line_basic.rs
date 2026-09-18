@@ -21,13 +21,14 @@ extern crate log;
 extern crate grin_wallet;
 
 use grin_wallet_impls::test_framework::{self, LocalWalletClient, WalletProxy};
+use std::path::PathBuf;
 
 use clap::App;
 use std::thread;
 use std::time::Duration;
 
+use grin_keychain::ExtKeychain;
 use grin_wallet_impls::DefaultLCProvider;
-use grin_wallet_util::grin_keychain::ExtKeychain;
 
 mod common;
 use common::{clean_output_dir, execute_command, initial_setup_wallet, instantiate_wallet, setup};
@@ -60,7 +61,7 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	// add wallet to proxy
 	//let wallet1 = test_framework::create_wallet(&format!("{}/wallet1", test_dir), client1.clone());
 	let config1 = initial_setup_wallet(test_dir, "wallet1");
-	let wallet_config1 = config1.clone().members.unwrap().wallet;
+	let wallet_config1 = config1.clone().members.wallet;
 	let (wallet1, mask1_i) = instantiate_wallet(
 		wallet_config1.clone(),
 		client1.clone(),
@@ -80,7 +81,7 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	execute_command(&app, test_dir, "wallet2", &client2, arg_vec.clone())?;
 
 	let config2 = initial_setup_wallet(test_dir, "wallet2");
-	let wallet_config2 = config2.clone().members.unwrap().wallet;
+	let wallet_config2 = config2.clone().members.wallet;
 	let (wallet2, mask2_i) = instantiate_wallet(
 		wallet_config2.clone(),
 		client2.clone(),
@@ -148,14 +149,14 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 
 	// Mine a bit into wallet 1 so we have something to send
 	// (TODO: Be able to stop listeners so we can test this better)
-	let wallet_config1 = config1.clone().members.unwrap().wallet;
+	let wallet_config1 = config1.clone().members.wallet;
 	let (wallet1, mask1_i) =
 		instantiate_wallet(wallet_config1, client1.clone(), "password1", "default")?;
 	let mask1 = (&mask1_i).as_ref();
 	grin_wallet_controller::controller::owner_single_use(
-		Some(wallet1.clone()),
+		wallet1.clone(),
 		mask1,
-		None,
+		PathBuf::from(test_dir),
 		|api, m| {
 			api.set_active_account(m, "mining")?;
 			Ok(())
@@ -222,7 +223,7 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	execute_command(&app, test_dir, "wallet1", &client1, arg_vec)?;
 	bh += 1;
 
-	let wallet_config1 = config1.clone().members.unwrap().wallet;
+	let wallet_config1 = config1.clone().members.wallet;
 	let (wallet1, mask1_i) = instantiate_wallet(
 		wallet_config1.clone(),
 		client1.clone(),
@@ -233,12 +234,12 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 
 	// Check our transaction log, should have 10 entries
 	grin_wallet_controller::controller::owner_single_use(
-		Some(wallet1.clone()),
+		wallet1.clone(),
 		mask1,
-		None,
+		PathBuf::from(test_dir),
 		|api, m| {
 			api.set_active_account(m, "mining")?;
-			let (refreshed, txs) = api.retrieve_txs(m, true, None, None)?;
+			let (refreshed, txs) = api.retrieve_txs(m, true, None, None, None)?;
 			assert!(refreshed);
 			assert_eq!(txs.len(), bh as usize);
 			for t in txs {
@@ -259,7 +260,7 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	execute_command(&app, test_dir, "wallet2", &client1, arg_vec)?;
 
 	// check results in wallet 2
-	let wallet_config2 = config2.clone().members.unwrap().wallet;
+	let wallet_config2 = config2.clone().members.wallet;
 	let (wallet2, mask2_i) = instantiate_wallet(
 		wallet_config2.clone(),
 		client2.clone(),
@@ -269,14 +270,93 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	let mask2 = (&mask2_i).as_ref();
 
 	grin_wallet_controller::controller::owner_single_use(
-		Some(wallet2.clone()),
+		wallet2.clone(),
 		mask2,
-		None,
+		PathBuf::from(test_dir),
 		|api, m| {
 			api.set_active_account(m, "account_1")?;
 			let (_, wallet1_info) = api.retrieve_summary_info(m, true, 1)?;
 			assert_eq!(wallet1_info.last_confirmed_height, bh);
 			assert_eq!(wallet1_info.amount_currently_spendable, 10_000_000_000);
+			Ok(())
+		},
+	)?;
+
+	// Send to wallet 2 with --amount_includes_fee
+	let mut old_balance = 0;
+	grin_wallet_controller::controller::owner_single_use(
+		wallet1.clone(),
+		mask1,
+		PathBuf::from(test_dir),
+		|api, m| {
+			api.set_active_account(m, "mining")?;
+			let (_, wallet1_info) = api.retrieve_summary_info(m, true, 1)?;
+			old_balance = wallet1_info.amount_currently_spendable;
+			Ok(())
+		},
+	)?;
+	let arg_vec = vec![
+		"grin-wallet",
+		"-p",
+		"password1",
+		"-a",
+		"mining",
+		"send",
+		"--amount_includes_fee",
+		"10",
+	];
+	execute_command(&app, test_dir, "wallet1", &client1, arg_vec)?;
+	let file_name = format!(
+		"{}/wallet1/slatepack/0436430c-2b02-624c-2032-570501212b01.S1.slatepack",
+		test_dir
+	);
+	let arg_vec = vec![
+		"grin-wallet",
+		"-p",
+		"password2",
+		"-a",
+		"account_1",
+		"receive",
+		"-i",
+		&file_name,
+	];
+	execute_command(&app, test_dir, "wallet2", &client2, arg_vec.clone())?;
+	let file_name = format!(
+		"{}/wallet2/slatepack/0436430c-2b02-624c-2032-570501212b01.S2.slatepack",
+		test_dir
+	);
+	let arg_vec = vec![
+		"grin-wallet",
+		"-a",
+		"mining",
+		"-p",
+		"password1",
+		"finalize",
+		"-i",
+		&file_name,
+	];
+	execute_command(&app, test_dir, "wallet1", &client1, arg_vec)?;
+	bh += 1;
+
+	// Mine some blocks to confirm the transaction
+	let _ = test_framework::award_blocks_to_wallet(&chain, wallet1.clone(), mask1, 10, false);
+	bh += 10;
+
+	// Check the new balance of wallet 1 reduced by EXACTLY the tx amount (instead of amount + fee)
+	// This confirms that the TX amount was correctly computed to allow for the fee
+	grin_wallet_controller::controller::owner_single_use(
+		wallet1.clone(),
+		mask1,
+		PathBuf::from(test_dir),
+		|api, m| {
+			api.set_active_account(m, "mining")?;
+			let (_, wallet1_info) = api.retrieve_summary_info(m, true, 1)?;
+			// make sure the new balance is exactly equal to the old balance - the tx amount + the amount mined since then
+			let amt_mined = 10 * 60_000_000_000;
+			assert_eq!(
+				wallet1_info.amount_currently_spendable + 10_000_000_000,
+				old_balance + amt_mined
+			);
 			Ok(())
 		},
 	)?;
@@ -308,7 +388,7 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	execute_command(&app, test_dir, "wallet1", &client1, arg_vec)?;
 
 	let file_name = format!(
-		"{}/wallet1/slatepack/0436430c-2b02-624c-2032-570501212b01.S1.slatepack",
+		"{}/wallet1/slatepack/0436430c-2b02-624c-2032-570501212b02.S1.slatepack",
 		test_dir
 	);
 	let arg_vec = vec![
@@ -324,7 +404,7 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	execute_command(&app, test_dir, "wallet2", &client2, arg_vec.clone())?;
 
 	let file_name = format!(
-		"{}/wallet2/slatepack/0436430c-2b02-624c-2032-570501212b01.S2.slatepack",
+		"{}/wallet2/slatepack/0436430c-2b02-624c-2032-570501212b02.S2.slatepack",
 		test_dir
 	);
 
@@ -342,7 +422,7 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	bh += 1;
 
 	// Check our transaction log, should have bh entries
-	let wallet_config1 = config1.clone().members.unwrap().wallet;
+	let wallet_config1 = config1.clone().members.wallet;
 	let (wallet1, mask1_i) = instantiate_wallet(
 		wallet_config1.clone(),
 		client1.clone(),
@@ -352,12 +432,12 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	let mask1 = (&mask1_i).as_ref();
 
 	grin_wallet_controller::controller::owner_single_use(
-		Some(wallet1.clone()),
+		wallet1.clone(),
 		mask1,
-		None,
+		PathBuf::from(test_dir),
 		|api, m| {
 			api.set_active_account(m, "mining")?;
-			let (refreshed, txs) = api.retrieve_txs(m, true, None, None)?;
+			let (refreshed, txs) = api.retrieve_txs(m, true, None, None, None)?;
 			assert!(refreshed);
 			assert_eq!(txs.len(), bh as usize);
 			Ok(())
@@ -381,7 +461,7 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	execute_command(&app, test_dir, "wallet1", &client1, arg_vec)?;
 
 	let file_name = format!(
-		"{}/wallet1/slatepack/0436430c-2b02-624c-2032-570501212b02.S1.slatepack",
+		"{}/wallet1/slatepack/0436430c-2b02-624c-2032-570501212b03.S1.slatepack",
 		test_dir
 	);
 	let arg_vec = vec![
@@ -397,7 +477,7 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	execute_command(&app, test_dir, "wallet1", &client1, arg_vec.clone())?;
 
 	let file_name = format!(
-		"{}/wallet1/slatepack/0436430c-2b02-624c-2032-570501212b02.S2.slatepack",
+		"{}/wallet1/slatepack/0436430c-2b02-624c-2032-570501212b03.S2.slatepack",
 		test_dir
 	);
 
@@ -415,7 +495,7 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	bh += 1;
 
 	// Check our transaction log, should have bh entries + 1 for self-seld
-	let wallet_config1 = config1.clone().members.unwrap().wallet;
+	let wallet_config1 = config1.clone().members.wallet;
 	let (wallet1, mask1_i) = instantiate_wallet(
 		wallet_config1.clone(),
 		client1.clone(),
@@ -425,12 +505,12 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	let mask1 = (&mask1_i).as_ref();
 
 	grin_wallet_controller::controller::owner_single_use(
-		Some(wallet1.clone()),
+		wallet1.clone(),
 		mask1,
-		None,
+		PathBuf::from(test_dir),
 		|api, m| {
 			api.set_active_account(m, "mining")?;
-			let (refreshed, txs) = api.retrieve_txs(m, true, None, None)?;
+			let (refreshed, txs) = api.retrieve_txs(m, true, None, None, None)?;
 			assert!(refreshed);
 			assert_eq!(txs.len(), bh as usize + 1);
 			Ok(())
@@ -475,7 +555,7 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 		"mining",
 		"cancel",
 		"-i",
-		"25",
+		"36",
 	];
 	execute_command(&app, test_dir, "wallet1", &client1, arg_vec)?;
 
@@ -483,9 +563,25 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	let arg_vec = vec!["grin-wallet", "-p", "password2", "invoice", "65"];
 	execute_command(&app, test_dir, "wallet2", &client2, arg_vec)?;
 	let file_name = format!(
-		"{}/wallet2/slatepack/0436430c-2b02-624c-2032-570501212b05.I1.slatepack",
+		"{}/wallet2/slatepack/0436430c-2b02-624c-2032-570501212b06.I1.slatepack",
 		test_dir
 	);
+
+	// receive and finalize should point to pay
+	for cmd in ["receive", "finalize"] {
+		let arg_vec = vec![
+			"grin-wallet",
+			"-a",
+			"mining",
+			"-p",
+			"password1",
+			cmd,
+			"-i",
+			&file_name,
+		];
+		let e = execute_command(&app, test_dir, "wallet1", &client1, arg_vec).unwrap_err();
+		assert!(e.to_string().contains("'pay'"), "{}", e);
+	}
 
 	// now pay the invoice tx, wallet 1
 	let arg_vec = vec![
@@ -501,7 +597,7 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	execute_command(&app, test_dir, "wallet1", &client1, arg_vec)?;
 
 	let file_name = format!(
-		"{}/wallet1/slatepack/0436430c-2b02-624c-2032-570501212b05.I2.slatepack",
+		"{}/wallet1/slatepack/0436430c-2b02-624c-2032-570501212b06.I2.slatepack",
 		test_dir
 	);
 
@@ -550,20 +646,87 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	// get tx output via -tx parameter
 	let mut tx_id = "".to_string();
 	grin_wallet_controller::controller::owner_single_use(
-		Some(wallet2.clone()),
+		wallet2.clone(),
 		mask2,
-		None,
+		PathBuf::from(test_dir),
 		|api, m| {
 			api.set_active_account(m, "default")?;
-			let (_, txs) = api.retrieve_txs(m, true, None, None)?;
+			let (_, txs) = api.retrieve_txs(m, true, None, None, None)?;
 			let some_tx_id = txs[0].tx_slate_id.clone();
 			assert!(some_tx_id.is_some());
-			tx_id = some_tx_id.unwrap().to_hyphenated().to_string().clone();
+			tx_id = some_tx_id.unwrap().to_string().clone();
 			Ok(())
 		},
 	)?;
 	let arg_vec = vec!["grin-wallet", "-p", "password2", "txs", "-t", &tx_id[..]];
 	execute_command(&app, test_dir, "wallet2", &client2, arg_vec)?;
+
+	// bit of mining
+	let _ = test_framework::award_blocks_to_wallet(&chain, wallet1.clone(), mask1, 10, false);
+
+	// Test wallet sweep
+	let arg_vec = vec![
+		"grin-wallet",
+		"-p",
+		"password1",
+		"-a",
+		"mining",
+		"send",
+		"max",
+	];
+	execute_command(&app, test_dir, "wallet1", &client1, arg_vec)?;
+	let file_name = format!(
+		"{}/wallet1/slatepack/0436430c-2b02-624c-2032-570501212b07.S1.slatepack",
+		test_dir
+	);
+	let arg_vec = vec![
+		"grin-wallet",
+		"-p",
+		"password2",
+		"-a",
+		"account_1",
+		"receive",
+		"-i",
+		&file_name,
+	];
+	execute_command(&app, test_dir, "wallet2", &client2, arg_vec.clone())?;
+	let file_name = format!(
+		"{}/wallet2/slatepack/0436430c-2b02-624c-2032-570501212b07.S2.slatepack",
+		test_dir
+	);
+	let arg_vec = vec![
+		"grin-wallet",
+		"-a",
+		"mining",
+		"-p",
+		"password1",
+		"finalize",
+		"-i",
+		&file_name,
+	];
+	execute_command(&app, test_dir, "wallet1", &client1, arg_vec)?;
+
+	// Mine some blocks to confirm the transaction
+	let _ = test_framework::award_blocks_to_wallet(&chain, wallet1.clone(), mask1, 10, false);
+
+	// Check wallet 1 is now empty, except for immature coinbase outputs from recent mining),
+	// and recently matured coinbase outputs, which were not mature at time of spending.
+	// This confirms that the TX amount was correctly computed to allow for the fee
+	grin_wallet_controller::controller::owner_single_use(
+		wallet1.clone(),
+		mask1,
+		PathBuf::from(test_dir),
+		|api, m| {
+			api.set_active_account(m, "mining")?;
+			let (_, wallet1_info) = api.retrieve_summary_info(m, true, 10)?;
+			// Entire 'spendable' wallet balance should have been swept, except the coinbase outputs
+			// which matured in the last batch of mining. Check that the new spendable balance is
+			// exactly equal to those matured coins.
+			let amt_mined = 10 * 60_000_000_000;
+			assert_eq!(wallet1_info.amount_currently_spendable, amt_mined);
+			Ok(())
+		},
+	)?;
 
 	// let logging finish
 	thread::sleep(Duration::from_millis(200));
@@ -575,6 +738,6 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 fn wallet_command_line() {
 	let test_dir = "target/test_output/command_line";
 	if let Err(e) = command_line_test_impl(test_dir) {
-		panic!("Libwallet Error: {} - {}", e, e.backtrace().unwrap());
+		panic!("Libwallet Error: {}", e);
 	}
 }

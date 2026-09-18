@@ -1,4 +1,4 @@
-// Copyright 2021 The Grin Developers
+// Copyright 2024 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod lmdb;
+//! Onion and comsig modules for mxmixnet
 
-pub use self::lmdb::{wallet_db_exists, LMDBBackend};
+pub mod comsig;
+pub mod dalek;
+pub mod secp;
+
+pub use comsig::{comsig_serde, ComSigError, ComSignature};

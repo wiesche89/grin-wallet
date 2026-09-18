@@ -14,15 +14,26 @@
 
 //! Types specific to the wallet api, mostly argument serialization
 
+use crate::grin_core::core::Output;
 use crate::grin_core::libtx::secp_ser;
-use crate::grin_keychain::Identifier;
+use crate::grin_keychain::{BlindingFactor, Identifier};
 use crate::grin_util::secp::pedersen;
 use crate::slate_versions::ser as dalek_ser;
 use crate::slate_versions::SlateVersion;
 use crate::types::OutputData;
-use crate::SlatepackAddress;
+use crate::{Error, NodeClient, Slate, SlatepackAddress, WalletBackend};
 
+use chrono::prelude::*;
 use ed25519_dalek::Signature as DalekSignature;
+use grin_keychain::Keychain;
+use grin_util::secp::SecretKey;
+
+pub use crate::mwixnet::{Hop, MixnetReqCreationParams, SwapReq};
+
+/// Type for storing amounts (in nanogrins).
+/// Serializes as a string but can deserialize from a string or u64.
+#[derive(Serialize, Deserialize)]
+pub struct Amount(#[serde(with = "secp_ser::string_or_u64")] pub u64);
 
 /// V2 Init / Send TX API Args
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -34,6 +45,8 @@ pub struct InitTxArgs {
 	#[serde(with = "secp_ser::string_or_u64")]
 	/// The amount to send, in nanogrins. (`1 G = 1_000_000_000nG`)
 	pub amount: u64,
+	/// Does the amount include the fee, or will fees be spent in addition to the amount?
+	pub amount_includes_fee: Option<bool>,
 	#[serde(with = "secp_ser::string_or_u64")]
 	/// The minimum number of confirmations an output
 	/// should have in order to be included in the transaction.
@@ -55,6 +68,9 @@ pub struct InitTxArgs {
 	/// as many outputs as are needed to meet the amount, (and no more) starting with the smallest
 	/// value outputs.
 	pub selection_strategy_is_use_all: bool,
+	/// Flag to refresh outputs from node.
+	#[serde(default = "default_refresh_outputs_from_node")]
+	pub refresh_outputs_from_node: bool,
 	/// Optionally set the output target slate version (acceptable
 	/// down to the minimum slate version compatible with the current. If `None` the slate
 	/// is generated with the latest version.
@@ -96,7 +112,7 @@ pub struct InitTxSendArgs {
 	/// Whether to use dandelion when posting. If false, skip the dandelion relay
 	pub fluff: bool,
 	/// If set, skip the Slatepack TOR send attempt
-	pub skip_tor: bool,
+	pub skip_tor: Option<bool>,
 }
 
 impl Default for InitTxArgs {
@@ -104,10 +120,12 @@ impl Default for InitTxArgs {
 		InitTxArgs {
 			src_acct_name: None,
 			amount: 0,
+			amount_includes_fee: None,
 			minimum_confirmations: 10,
 			max_outputs: 500,
 			num_change_outputs: 1,
 			selection_strategy_is_use_all: true,
+			refresh_outputs_from_node: true,
 			target_slate_version: None,
 			ttl_blocks: None,
 			estimate_only: Some(false),
@@ -142,6 +160,107 @@ impl Default for IssueInvoiceTxArgs {
 			dest_acct_name: None,
 			amount: 0,
 			target_slate_version: None,
+		}
+	}
+}
+
+/// Sort tx retrieval order
+#[derive(Clone, Serialize, Deserialize)]
+pub enum RetrieveTxQuerySortOrder {
+	/// Ascending
+	Asc,
+	/// Descending
+	Desc,
+}
+
+/// Valid sort fields for a transaction list retrieval query
+#[derive(Clone, Serialize, Deserialize)]
+pub enum RetrieveTxQuerySortField {
+	/// Transaction Id
+	Id,
+	/// Creation Timestamp
+	CreationTimestamp,
+	/// Confirmation Timestamp
+	ConfirmationTimestamp,
+	/// TotalAmount (AmountCredited-AmountDebited)
+	TotalAmount,
+	/// Amount Credited
+	AmountCredited,
+	/// Amount Debited
+	AmountDebited,
+}
+
+/// Retrieve Transaction List Pagination Arguments
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RetrieveTxQueryArgs {
+	/// Retrieve transactions with an id higher than or equal to the given
+	/// If None, consider items from the first transaction and later
+	pub min_id: Option<u32>,
+	/// Retrieve tranactions with an id less than or equal to the given
+	/// If None, consider items from the last transaction and earlier
+	pub max_id: Option<u32>,
+	/// The maximum number of transactions to return
+	/// if both `before_id_inc` and `after_id_inc` are supplied, this will apply
+	/// to the before and earlier set
+	pub limit: Option<u32>,
+	/// whether to exclude cancelled transactions in the returned set
+	pub exclude_cancelled: Option<bool>,
+	/// whether to only consider outstanding transactions
+	pub include_outstanding_only: Option<bool>,
+	/// whether to only consider confirmed-only transactions
+	pub include_confirmed_only: Option<bool>,
+	/// whether to only consider sent transactions
+	pub include_sent_only: Option<bool>,
+	/// whether to only consider received transactions
+	pub include_received_only: Option<bool>,
+	/// whether to only consider coinbase transactions
+	pub include_coinbase_only: Option<bool>,
+	/// whether to only consider reverted transactions
+	pub include_reverted_only: Option<bool>,
+	/// lower bound on the total amount (amount_credited - amount_debited), inclusive
+	#[serde(with = "secp_ser::opt_string_or_u64")]
+	#[serde(default)]
+	pub min_amount: Option<u64>,
+	/// higher bound on the total amount (amount_credited - amount_debited), inclusive
+	#[serde(with = "secp_ser::opt_string_or_u64")]
+	#[serde(default)]
+	pub max_amount: Option<u64>,
+	/// lower bound on the creation timestamp, inclusive
+	pub min_creation_timestamp: Option<DateTime<Utc>>,
+	/// higher bound on on the creation timestamp, inclusive
+	pub max_creation_timestamp: Option<DateTime<Utc>>,
+	/// lower bound on the confirmation timestamp, inclusive
+	pub min_confirmed_timestamp: Option<DateTime<Utc>>,
+	/// higher bound on the confirmation timestamp, inclusive
+	pub max_confirmed_timestamp: Option<DateTime<Utc>>,
+	/// Field within the tranasction list on which to sort
+	/// defaults to ID if not present
+	pub sort_field: Option<RetrieveTxQuerySortField>,
+	/// Sort order, defaults to ASC if not present (earliest is first)
+	pub sort_order: Option<RetrieveTxQuerySortOrder>,
+}
+
+impl Default for RetrieveTxQueryArgs {
+	fn default() -> Self {
+		Self {
+			min_id: None,
+			max_id: None,
+			limit: None,
+			exclude_cancelled: Some(false),
+			include_outstanding_only: Some(false),
+			include_confirmed_only: Some(false),
+			include_sent_only: Some(false),
+			include_received_only: Some(false),
+			include_coinbase_only: Some(false),
+			include_reverted_only: Some(false),
+			min_amount: None,
+			max_amount: None,
+			min_creation_timestamp: None,
+			max_creation_timestamp: None,
+			min_confirmed_timestamp: None,
+			max_confirmed_timestamp: None,
+			sort_field: Some(RetrieveTxQuerySortField::Id),
+			sort_order: Some(RetrieveTxQuerySortOrder::Asc),
 		}
 	}
 }
@@ -222,4 +341,76 @@ pub struct PaymentProof {
 	/// Sender Signature
 	#[serde(with = "dalek_ser::dalek_sig_serde")]
 	pub sender_sig: DalekSignature,
+}
+
+/// Build output result
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BuiltOutput {
+	/// Blinding Factor
+	#[serde(
+		serialize_with = "secp_ser::as_hex",
+		deserialize_with = "secp_ser::blind_from_hex"
+	)]
+	pub blind: BlindingFactor,
+	/// Key Identifier
+	pub key_id: Identifier,
+	/// Output
+	pub output: Output,
+}
+
+fn default_refresh_outputs_from_node() -> bool {
+	true
+}
+
+/// Update transaction slate state.
+pub fn update_tx_slate_state<C, K>(
+	wallet: &mut WalletBackend<C, K>,
+	keychain_mask: Option<&SecretKey>,
+	parent_key_id: &Identifier,
+	slate: &Slate,
+) -> Result<(), Error>
+where
+	C: NodeClient,
+	K: Keychain,
+{
+	let mut bad_records = 0;
+	let tx = wallet
+		.tx_log_iter()?
+		.filter(|tx| {
+			if tx.is_err() {
+				bad_records += 1;
+			}
+			tx.is_ok()
+		})
+		.map(|tx| tx.unwrap())
+		.find(|tx| tx.tx_slate_id == Some(slate.id));
+	if let Some(mut tx) = tx {
+		let mut batch = wallet.batch(keychain_mask)?;
+		tx.tx_slate_state = Some(slate.state.clone());
+		batch.save_tx_log_entry(tx.clone(), parent_key_id)?;
+		batch.commit()?;
+	} else {
+		return Err(Error::Backend(format!(
+			"Tx log entry with slate id {} not found, there are {} bad tx log records",
+			slate.id, bad_records
+		)));
+	}
+	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::InitTxArgs;
+
+	#[test]
+	fn legacy_refresh_default() {
+		let mut value = serde_json::to_value(InitTxArgs::default()).unwrap();
+		value
+			.as_object_mut()
+			.unwrap()
+			.remove("refresh_outputs_from_node");
+
+		let args: InitTxArgs = serde_json::from_value(value).unwrap();
+		assert!(args.refresh_outputs_from_node);
+	}
 }
