@@ -1,4 +1,4 @@
 [submodule "grin"]
 	path = grin
-	branch = master
-	url = https://github.com/mimblewimble/grin
+	branch = atomic_swaps
+	url = https://github.com/wiesche89/grin.git
