@@ -64,7 +64,7 @@ pub struct PaymentInfo {
 }
 
 /// Public data for each participant in the slate
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ParticipantData {
 	/// Public key corresponding to private blinding factor
 	pub public_blind_excess: PublicKey,
@@ -613,6 +613,122 @@ impl Slate {
 		)?;
 		self.participant_data[ours].part_sig = Some(signature);
 		Ok(adaptor)
+	}
+
+	/// Check immutable terms and our participant data before countersigning
+	pub fn check_offer(&self, previous: &Slate) -> Result<(), Error> {
+		if previous.state != SlateState::Atomic1
+			|| self.state != SlateState::Atomic2
+			|| previous.participant_data.len() != 1
+			|| self.participant_data.len() != 2
+			|| self.num_participants != 2
+			|| self
+				.participant_data
+				.iter()
+				.filter(|p| *p == &previous.participant_data[0])
+				.count() != 1
+		{
+			return Err(Error::Signature("atomic offer changed".into()));
+		}
+		let mut expected = previous.clone();
+		expected.participant_data = self.participant_data.clone();
+		expected.state = self.state.clone();
+		expected.tx = self.tx.clone();
+		expected.offset = self.offset.clone();
+		if serde_json::to_value(&expected).map_err(|e| Error::GenericError(e.to_string()))?
+			!= serde_json::to_value(self).map_err(|e| Error::GenericError(e.to_string()))?
+		{
+			return Err(Error::Signature("atomic offer changed".into()));
+		}
+		Ok(())
+	}
+
+	/// Bind the sender's response to the saved receiver round
+	pub fn check_atomic<K: Keychain>(
+		&self,
+		previous: &Slate,
+		shared: Commitment,
+		keychain: &K,
+		context: &Context,
+	) -> Result<(), Error> {
+		let changed = || Error::Signature("atomic slate changed".into());
+		if previous.state != SlateState::Atomic2
+			|| self.state != SlateState::Atomic3
+			|| previous.num_participants != 2
+			|| previous.participant_data.len() != 2
+			|| self.participant_data.len() != 2
+		{
+			return Err(Error::Signature("atomic participants changed".into()));
+		}
+		let ours = previous.find_participant_data_index(keychain.secp(), context)?;
+		let sender = 1 - ours;
+		let mut expected = previous.clone();
+		expected.participant_data.clear();
+		let mut seen = [false; 2];
+		for data in &self.participant_data {
+			let index = previous
+				.participant_data
+				.iter()
+				.position(|p| {
+					p.public_nonce == data.public_nonce
+						&& p.public_blind_excess == data.public_blind_excess
+				})
+				.ok_or_else(changed)?;
+			if seen[index] {
+				return Err(Error::Signature("duplicate atomic participant".into()));
+			}
+			seen[index] = true;
+			let mut saved = previous.participant_data[index].clone();
+			if index == sender {
+				if saved.part_sig.is_some() || saved.public_atomic.is_some() {
+					return Err(Error::Signature("unexpected sender signature".into()));
+				}
+				saved.part_sig = data.part_sig;
+				aggsig::verify_partial_sig(
+					keychain.secp(),
+					data.part_sig.as_ref().ok_or_else(changed)?,
+					&previous.pub_nonce_sum(keychain.secp())?,
+					&saved.public_blind_excess,
+					Some(&previous.pub_blind_sum(keychain.secp())?),
+					&previous.msg_to_sign()?,
+				)?;
+			}
+			expected.participant_data.push(saved);
+		}
+		self.find_participant_data_index(keychain.secp(), context)?;
+		if self.kernel_features == 0 {
+			let tx = self.tx_or_err()?;
+			let original = previous.tx_or_err()?;
+			let inputs: Vec<crate::grin_core::core::CommitWrapper> = tx.inputs().into();
+			if inputs.len() != 1
+				|| inputs[0].commitment() != shared
+				|| !original
+					.outputs()
+					.iter()
+					.all(|output| tx.outputs().contains(output))
+				|| tx.kernels().len() != 1
+				|| tx.kernels()[0].features != self.kernel_features()?
+			{
+				return Err(Error::Signature("atomic transaction changed".into()));
+			}
+		} else if self.kernel_features != 2 || self.tx.is_some() || previous.tx.is_some() {
+			return Err(Error::Signature("unexpected refund transaction".into()));
+		}
+		expected.state = self.state.clone();
+		expected.offset = self.offset.clone();
+		expected.tx = self.tx.clone();
+		if serde_json::to_value(&expected).map_err(|_| changed())?
+			!= serde_json::to_value(self).map_err(|_| changed())?
+		{
+			return Err(Error::Signature("atomic terms changed".into()));
+		}
+		if self.kernel_features == 0 {
+			let mut completed = self.clone();
+			completed.adjust_offset(keychain, context)?;
+			completed.tx_or_err_mut()?.offset = completed.offset.clone();
+			completed.finalize_atomic(keychain, context)?;
+		}
+		Ok(())
 	}
 
 	/// Finalize the atomic swap transaction, return the receiver's partial signature

@@ -252,7 +252,7 @@ where
 /// Creates a new output in the wallet for the recipient,
 /// returning the key of the fresh output
 /// Also creates a new transaction containing the output
-pub fn build_recipient_output<C, K>(
+pub fn build_recipient_output<C, K, F>(
 	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	slate: &mut Slate,
@@ -260,10 +260,17 @@ pub fn build_recipient_output<C, K>(
 	parent_key_id: Identifier,
 	use_test_rng: bool,
 	is_initiator: bool,
+	finish: F,
 ) -> Result<(Identifier, Context, TxLogEntry), Error>
 where
 	C: NodeClient,
 	K: Keychain,
+	F: FnOnce(
+		&mut Slate,
+		&mut Context,
+		&mut crate::backend::WalletBatch<'_, K>,
+		&mut TxLogEntry,
+	) -> Result<(), Error>,
 {
 	let is_multisig = slate
 		.participant_data
@@ -273,7 +280,7 @@ where
 	// Create a potential output for this transaction
 	let key_id = match is_multisig {
 		true => slate.create_multisig_id(),
-		false => keys::next_available_key(wallet, keychain_mask).unwrap(),
+		false => keys::next_available_key(wallet, keychain_mask)?,
 	};
 	let keychain = wallet.keychain(keychain_mask)?;
 	let key_id_inner = key_id.clone();
@@ -378,6 +385,7 @@ where
 		is_multisig: slate.is_multisig(),
 		tx_log_entry: Some(log_id),
 	})?;
+	finish(slate, &mut context, &mut batch, &mut t)?;
 	batch.save_tx_log_entry(t.clone(), &parent_key_id)?;
 	batch.commit()?;
 

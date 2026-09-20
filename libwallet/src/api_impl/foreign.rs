@@ -223,63 +223,36 @@ where
 		(atomic_id, Some(atomic))
 	};
 
-	let (input_ids, output_ids) = if is_height_lock {
-		// add input(s) and change output to slate
-		let ctx = tx::add_inputs_to_atomic_slate(
+	let inputs = if is_height_lock {
+		Some(tx::add_inputs_to_atomic_slate(
 			w,
 			keychain_mask,
 			&mut ret_slate,
 			height,
-			0,    // Refunds must be signed before funding is published
-			500,  // max_outputs
-			1,    // num_change_outputs
-			true, // selection_strategy_is_use_all
+			0, // Refunds must be signed before funding is published
+			500,
+			1,
+			true,
 			&parent_key_id,
 			atomic_secret.clone(),
 			use_test_rng,
-		)?;
-
-		(ctx.input_ids, ctx.output_ids)
+		)?)
 	} else {
-		(vec![], vec![])
+		None
 	};
 
-	let mut context = tx::add_output_to_atomic_slate(
+	tx::add_output_to_atomic_slate(
 		w,
 		keychain_mask,
 		&mut ret_slate,
+		slate,
 		height,
 		&parent_key_id,
-		atomic_secret,
+		&atomic_id,
+		atomic_secret.ok_or(Error::SlateState)?,
+		inputs,
 		use_test_rng,
 	)?;
-
-	{
-		let atomic_idx = Slate::atomic_id_to_int(&atomic_id)?;
-		let mut batch = w.batch(keychain_mask)?;
-		batch.save_atomic_secret(
-			&atomic_id,
-			context.get_secret_atomic().ok_or(Error::SlateState)?,
-		)?;
-		batch.save_used_atomic_index(&ret_slate.id, atomic_idx)?;
-		batch.commit()?;
-	}
-
-	context.fee = Some(ret_slate.fee_fields.clone());
-
-	if is_height_lock {
-		ret_slate.compact()?;
-		context.input_ids = input_ids;
-		context.output_ids.extend_from_slice(&output_ids);
-		let mut batch = w.batch(keychain_mask)?;
-		batch.save_private_context(ret_slate.id.as_bytes(), &context)?;
-		batch.commit()?;
-	}
-
-	ret_slate.state = SlateState::Atomic2;
-	let mut batch = w.batch(keychain_mask)?;
-	batch.save_round(slate, 2, Some(&ret_slate))?;
-	batch.commit()?;
 
 	Ok(ret_slate)
 }

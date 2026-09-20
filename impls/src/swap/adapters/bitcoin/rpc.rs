@@ -250,6 +250,15 @@ impl Core {
 		}
 	}
 
+	/// Check relay and replacement rules before persisting a fee increase
+	pub fn accept(&self, tx: &Transaction) -> Result<(), Error> {
+		let result = self.call("testmempoolaccept", json!([[serialize_hex(tx)]]))?;
+		if result[0]["allowed"] != true {
+			return Err(invalid("replacement rejected by mempool policy"));
+		}
+		Ok(())
+	}
+
 	/// Broadcast an already saved transaction; rebroadcasting an included transaction is harmless
 	pub fn publish(&self, tx: &Transaction) -> Result<(), Error> {
 		match self.request("sendrawtransaction", json!([serialize_hex(tx)])) {

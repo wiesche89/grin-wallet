@@ -293,6 +293,7 @@ where
 		parent_key_id.clone(),
 		use_test_rng,
 		is_initiator,
+		|_, _, _, _| Ok(()),
 	)?;
 
 	// fill public keys
@@ -326,44 +327,48 @@ pub fn add_output_to_atomic_slate<C, K>(
 	wallet: &mut WalletBackend<C, K>,
 	keychain_mask: Option<&SecretKey>,
 	slate: &mut Slate,
+	request: &Slate,
 	current_height: u64,
 	parent_key_id: &Identifier,
-	atomic_secret: Option<SecretKey>,
+	atomic_id: &Identifier,
+	atomic_secret: SecretKey,
+	inputs: Option<Context>,
 	use_test_rng: bool,
-) -> Result<Context, Error>
+) -> Result<(), Error>
 where
 	C: NodeClient,
 	K: Keychain,
 {
 	let keychain = wallet.keychain(keychain_mask)?;
-	let is_initiator = atomic_secret.is_none();
-
-	// create an output using the amount in the slate
-	let (_, mut context, mut tx) = selection::build_recipient_output(
+	selection::build_recipient_output(
 		wallet,
 		keychain_mask,
 		slate,
 		current_height,
 		parent_key_id.clone(),
 		use_test_rng,
-		is_initiator,
+		false,
+		|slate, context, batch, tx| {
+			context.sec_atomic = Some(atomic_secret.clone());
+			slate.fill_round_1(&keychain, context)?;
+			slate.fill_round_2_atomic(&keychain, context)?;
+			tx.kernel_excess = Some(slate.calc_excess(keychain.secp())?);
+			context.fee = Some(slate.fee_fields);
+			if let Some(inputs) = inputs {
+				slate.compact()?;
+				context.input_ids = inputs.input_ids;
+				context.output_ids.extend(inputs.output_ids);
+			}
+			slate.state = crate::SlateState::Atomic2;
+			tx.tx_slate_state = Some(slate.state.clone());
+			batch.save_private_context(slate.id.as_bytes(), context)?;
+			batch.save_atomic_secret(atomic_id, &atomic_secret)?;
+			batch.save_used_atomic_index(&slate.id, Slate::atomic_id_to_int(atomic_id)?)?;
+			batch.save_round(request, 2, Some(slate))?;
+			Ok(())
+		},
 	)?;
-
-	context.sec_atomic = atomic_secret;
-	// fill public keys
-	slate.fill_round_1(&keychain, &mut context)?;
-	// Create partial signature using the atomic secret,
-	// allows sender to recover the atomic secret when the
-	// full kernel signature is published
-	slate.fill_round_2_atomic(&keychain, &context)?;
-	// update excess in stored transaction
-	let mut batch = wallet.batch(keychain_mask)?;
-	tx.kernel_excess = Some(slate.calc_excess(keychain.secp())?);
-	batch.save_private_context(slate.id.as_bytes(), &context)?;
-	batch.save_tx_log_entry(tx.clone(), &parent_key_id)?;
-	batch.commit()?;
-
-	Ok(context)
+	Ok(())
 }
 
 /// Create context, without adding inputs to slate
@@ -618,6 +623,42 @@ where
 	C: NodeClient,
 	K: Keychain,
 {
+	let tx = stored_tx(wallet, keychain_mask, context, slate, is_invoiced)?;
+	let parent = tx.parent_key_id.clone();
+	let mut batch = wallet.batch(keychain_mask)?;
+	batch.save_tx_log_entry(tx, &parent)?;
+	batch.commit()
+}
+
+/// Save the final transaction log and replay response together
+pub fn save_atomic_tx<C: NodeClient, K: Keychain>(
+	wallet: &mut WalletBackend<C, K>,
+	mask: Option<&SecretKey>,
+	context: &Context,
+	request: &Slate,
+	slate: &mut Slate,
+) -> Result<(), Error> {
+	let tx = stored_tx(wallet, mask, context, slate, true)?;
+	let parent = tx.parent_key_id.clone();
+	slate.state = crate::SlateState::Atomic4;
+	slate.amount = 0;
+	let mut batch = wallet.batch(mask)?;
+	batch.save_tx_log_entry(tx, &parent)?;
+	batch.save_round(request, 4, Some(slate))?;
+	batch.commit()
+}
+
+fn stored_tx<C, K>(
+	wallet: &mut WalletBackend<C, K>,
+	keychain_mask: Option<&SecretKey>,
+	context: &Context,
+	slate: &Slate,
+	is_invoiced: bool,
+) -> Result<crate::TxLogEntry, Error>
+where
+	C: NodeClient,
+	K: Keychain,
+{
 	// finalize command
 	let tx_vec = updater::retrieve_txs(wallet, None, Some(slate.id), None, None, false)?;
 	let mut tx = None;
@@ -636,7 +677,6 @@ where
 		Some(t) => t,
 		None => return Err(Error::TransactionDoesntExist(slate.id.to_string())),
 	};
-	let parent_key = tx.parent_key_id.clone();
 	{
 		let keychain = wallet.keychain(keychain_mask)?;
 		tx.kernel_excess = Some(slate.calc_excess(keychain.secp())?);
@@ -663,10 +703,7 @@ where
 
 	wallet.store_tx(&format!("{}", tx.tx_slate_id.unwrap()), slate.tx_or_err()?)?;
 
-	let mut batch = wallet.batch(keychain_mask)?;
-	batch.save_tx_log_entry(tx, &parent_key)?;
-	batch.commit()?;
-	Ok(())
+	Ok(tx)
 }
 
 pub fn payment_proof_message(

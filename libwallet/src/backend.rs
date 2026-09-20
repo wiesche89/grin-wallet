@@ -465,7 +465,26 @@ where
 		batch.commit()
 	}
 
-	/// Reserve an atomic round or return its saved response
+	/// Read a completed atomic round without reserving another request
+	pub fn atomic_round(&self, id: &Uuid, round: u8) -> Result<Option<crate::Slate>, Error> {
+		let saved: Option<Vec<u8>> = self.db.get_ser(
+			Some(ROUND_PREFIX),
+			&to_key_u64(id.as_bytes(), round as u64),
+			None,
+		)?;
+		match saved {
+			Some(bytes) => {
+				let (_, response): (String, Option<String>) = serde_json::from_slice(&bytes)
+					.map_err(|e| Error::GenericError(e.to_string()))?;
+				response
+					.map(|s| crate::Slate::deserialize_upgrade(&s))
+					.transpose()
+			}
+			None => Ok(None),
+		}
+	}
+
+	/// Check an atomic request against its saved response
 	pub fn begin_round(
 		&mut self,
 		mask: Option<&SecretKey>,
@@ -495,9 +514,6 @@ where
 				.map(|s| crate::Slate::deserialize_upgrade(&s))
 				.transpose();
 		}
-		let mut batch = self.batch(mask)?;
-		batch.save_round(slate, round, None)?;
-		batch.commit()?;
 		Ok(None)
 	}
 
@@ -711,11 +727,10 @@ where
 		let path = Path::new(&self.data_file_dir)
 			.join(TX_SAVE_DIR)
 			.join(filename);
-		let path_buf = Path::new(&path).to_path_buf();
-		let mut stored_tx = File::create(path_buf)?;
-		let tx_hex = ser::ser_vec(tx, ser::ProtocolVersion(1)).unwrap().to_hex();
-		stored_tx.write_all(&tx_hex.as_bytes())?;
-		stored_tx.sync_all()?;
+		let tx_hex = ser::ser_vec(tx, ser::ProtocolVersion(1))
+			.map_err(|e| Error::GenericError(e.to_string()))?
+			.to_hex();
+		grin_store::save_via_temp_file(&path, ".tmp", |file| file.write_all(tx_hex.as_bytes()))?;
 		Ok(())
 	}
 
@@ -730,14 +745,15 @@ where
 		let mut tx_f = File::open(tx_file)?;
 		let mut content = String::new();
 		tx_f.read_to_string(&mut content)?;
-		let tx_bin = grin_util::from_hex(&content).unwrap();
+		let tx_bin =
+			grin_util::from_hex(&content).map_err(|e| Error::GenericError(e.to_string()))?;
 		Ok(Some(
 			ser::deserialize(
 				&mut &tx_bin[..],
 				ser::ProtocolVersion(1),
 				ser::DeserializationMode::default(),
 			)
-			.unwrap(),
+			.map_err(|e| Error::GenericError(e.to_string()))?,
 		))
 	}
 

@@ -1117,15 +1117,17 @@ where
 		context
 	};
 
+	slate.fee_fields = context.fee.ok_or(Error::SlateState)?;
+	slate.compact()?;
+
 	// Save the aggsig context in our DB for when we
 	// receive the transaction back
 	{
 		let mut batch = w.batch(keychain_mask)?;
 		batch.save_private_context(slate.id.as_bytes(), &context)?;
+		batch.save_round(&slate, 1, Some(&slate))?;
 		batch.commit()?;
 	}
-
-	slate.compact()?;
 
 	Ok(slate)
 }
@@ -1151,6 +1153,8 @@ where
 	if let Some(saved) = w.begin_round(keychain_mask, slate, 3)? {
 		return Ok(saved);
 	}
+	let previous = w.atomic_round(&slate.id, 1)?.ok_or(Error::SlateState)?;
+	slate.check_offer(&previous)?;
 	let mut ret_slate = slate.clone();
 	check_ttl(w, &ret_slate)?;
 
@@ -1324,23 +1328,30 @@ where
 	let parent_key_id = w.parent_key_id();
 	let is_height_lock = ret_slate.kernel_features == 2;
 
+	let output = w
+		.iter()?
+		.find(|o| o.is_multisig && Some(&o.key_id) == slate.multisig_key_id.as_ref())
+		.ok_or_else(|| Error::GenericError("missing shared output".into()))?;
 	if !is_height_lock {
-		// check that the multisig ID matches a locally stored multisig output
-		let multisig_id =
-			slate
-				.multisig_key_id
-				.as_ref()
-				.ok_or(Error::from(Error::GenericError(
-					"missing multisig ouptut ID".into(),
-				)))?;
-		let output = w
-			.iter()?
-			.find(|o| &o.key_id == multisig_id)
-			.ok_or(Error::from(Error::GenericError(
-				"missing multisig output".into(),
-			)))?;
 		context.input_ids = vec![(output.key_id, output.mmr_index, output.value)];
 	}
+	let previous = w.atomic_round(&slate.id, 2)?.ok_or(Error::SlateState)?;
+	let commit = crate::grin_util::from_hex(
+		output
+			.commit
+			.as_deref()
+			.ok_or_else(|| Error::GenericError("missing shared commitment".into()))?,
+	)
+	.map_err(|e| Error::GenericError(e.to_string()))?;
+	if commit.len() != 33 {
+		return Err(Error::GenericError("invalid shared commitment".into()));
+	}
+	slate.check_atomic(
+		&previous,
+		crate::grin_util::secp::pedersen::Commitment::from_vec(commit),
+		&w.keychain(keychain_mask)?,
+		&context,
+	)?;
 
 	ret_slate.adjust_offset(&w.keychain(keychain_mask)?, &context)?;
 
@@ -1353,13 +1364,7 @@ where
 
 	tx::complete_atomic_tx(&mut *w, keychain_mask, &mut ret_slate, &context)?;
 	tx::verify_slate_payment_proof(&mut *w, keychain_mask, &parent_key_id, &context, &ret_slate)?;
-	tx::update_stored_tx(&mut *w, keychain_mask, &context, &ret_slate, true)?;
-
-	ret_slate.state = SlateState::Atomic4;
-	ret_slate.amount = 0;
-	let mut batch = w.batch(keychain_mask)?;
-	batch.save_round(slate, 4, Some(&ret_slate))?;
-	batch.commit()?;
+	tx::save_atomic_tx(w, keychain_mask, &context, slate, &mut ret_slate)?;
 
 	Ok(ret_slate)
 }

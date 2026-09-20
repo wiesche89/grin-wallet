@@ -548,6 +548,29 @@ fn atomic_refund_tx_impl(test_dir: &'static str) -> Result<(), libwallet::Error>
 	Ok(())
 }
 
+fn bump(
+	api: &(dyn grin_wallet_api::OwnerRpc + 'static),
+	mask: Option<&grin_util::secp::SecretKey>,
+	id: uuid::Uuid,
+	action: libwallet::swap::Action,
+) -> Result<(), libwallet::Error> {
+	use grin_wallet_api::{swap::Request, Token};
+	for fee in [6000, 1001] {
+		assert!(api
+			.swap(
+				Token {
+					keychain_mask: mask.cloned()
+				},
+				Request::Bump { id, fee }
+			)
+			.is_err());
+	}
+	for fee in [2000, 2000] {
+		assert_eq!(swap(api, mask, Request::Bump { id, fee })?.action, action);
+	}
+	Ok(())
+}
+
 /// atomic swap end-to-end impl
 fn atomic_end_to_end_tx_impl(
 	test_dir: &'static str,
@@ -812,7 +835,7 @@ fn atomic_end_to_end_tx_impl(
 			cookie.clone(),
 			impls::swap::adapters::bitcoin::types::Network::Regtest,
 		)?;
-		let mine = |blocks: u64| {
+		let btc_cli = |args: &[&str]| {
 			let output = std::process::Command::new(std::env::var("GRIN_SWAP_CLI").unwrap())
 				.arg(format!(
 					"-datadir={}",
@@ -823,7 +846,8 @@ fn atomic_end_to_end_tx_impl(
 					"-rpcport={}",
 					std::env::var("GRIN_SWAP_PORT").unwrap()
 				))
-				.args(["-rpcwallet=swap", "-generate", &blocks.to_string()])
+				.arg("-rpcwallet=swap")
+				.args(args)
 				.output()
 				.unwrap();
 			assert!(
@@ -832,6 +856,7 @@ fn atomic_end_to_end_tx_impl(
 				String::from_utf8_lossy(&output.stderr)
 			);
 		};
+		let mine = |blocks: u64| btc_cli(&["-generate", &blocks.to_string()]);
 		let path = PathBuf::from(test_dir).join("swap.toml");
 		let mut config = GlobalWalletConfig {
 			config_file_path: path.clone(),
@@ -913,6 +938,16 @@ fn atomic_end_to_end_tx_impl(
 				Ok(())
 			},
 		)?;
+		for change in 0..3 {
+			let mut altered = main.clone();
+			match change {
+				0 => altered.amount += 1,
+				1 => altered.ttl_cutoff_height = 1,
+				2 => altered.participant_data[0] = altered.participant_data[1].clone(),
+				_ => unreachable!(),
+			}
+			assert!(a.countersign_atomic_swap(&altered, mask1, None).is_err());
+		}
 		let prepare = |id, peer_key| Request::Prepare {
 			id,
 			peer_key,
@@ -983,7 +1018,29 @@ fn atomic_end_to_end_tx_impl(
 				swap(&b, mask2, Request::Step { id: b_info.id })?.action,
 				Action::RefundOther
 			);
-			mine(2);
+			bump(&b, mask2, b_info.id, Action::RefundOther)?;
+			let old = {
+				wallet_inst!(wallet2, w);
+				let state: serde_json::Value = w.load_swap(&b_info.id)?.unwrap();
+				let tx: impls::swap::adapters::bitcoin::types::Transaction =
+					serde_json::from_value(state["replacements"][0].clone()).unwrap();
+				impls::swap::adapters::bitcoin::types::consensus::encode::serialize_hex(&tx)
+			};
+			btc_cli(&[
+				"generateblock",
+				&bitcoin.address()?.to_string(),
+				&serde_json::json!([old]).to_string(),
+			]);
+			mine(1);
+			assert!(b
+				.swap(
+					mask2,
+					Request::Bump {
+						id: b_info.id,
+						fee: 3000
+					}
+				)
+				.is_err());
 			assert_eq!(
 				swap(&b, mask2, Request::Step { id: b_info.id })?.action,
 				Action::Refunded
@@ -991,6 +1048,36 @@ fn atomic_end_to_end_tx_impl(
 		} else {
 			let released = swap(&a, mask1, Request::Step { id: a_info.id })?;
 			assert_eq!(released.action, Action::Release);
+			let signed = Slate::deserialize_upgrade(released.main.as_deref().unwrap())?;
+			for change in 0..6 {
+				let mut altered = signed.clone();
+				match change {
+					0 => altered.amount += 1,
+					1 => altered.participant_data[0] = altered.participant_data[1].clone(),
+					2 => altered.ttl_cutoff_height = 1,
+					3 => {
+						let tx = altered.tx_or_err_mut()?;
+						let outputs = vec![tx.outputs()[0], tx.outputs()[0]];
+						tx.body = tx.body.clone().replace_outputs(&outputs);
+					}
+					4 => altered.offset = grin_keychain::BlindingFactor::zero(),
+					5 => altered.num_participants = 3,
+					_ => unreachable!(),
+				}
+				assert!(b.finalize_atomic_swap(mask2, &altered).is_err());
+				assert!(
+					b.swap(
+						mask2,
+						Request::Receive {
+							id: b_info.id,
+							funding: None,
+							main: Some(serde_json::to_string(&altered).unwrap()),
+						}
+					)
+					.is_err(),
+					"change {change}"
+				);
+			}
 			let resumed = Owner::new(wallet1.clone(), None, path.clone());
 			assert_eq!(
 				swap(&resumed, mask1, Request::Status { id: a_info.id })?.main,
@@ -1017,7 +1104,17 @@ fn atomic_end_to_end_tx_impl(
 				swap(&resumed, mask1, Request::Step { id: a_info.id })?.action,
 				Action::ClaimOther
 			);
+			bump(&resumed, mask1, a_info.id, Action::ClaimOther)?;
 			mine(2);
+			assert!(resumed
+				.swap(
+					mask1,
+					Request::Bump {
+						id: a_info.id,
+						fee: 3000
+					}
+				)
+				.is_err());
 			assert_eq!(
 				swap(&resumed, mask1, Request::Step { id: a_info.id })?.action,
 				Action::Complete
@@ -1239,4 +1336,94 @@ fn swap_refund() -> Result<(), libwallet::Error> {
 	atomic_end_to_end_tx_impl(dir, Some(true))?;
 	clean_output_dir(dir);
 	Ok(())
+}
+
+#[test]
+fn round_restart() {
+	use grin_keychain::ExtKeychain;
+	use libwallet::{Context, WalletBackend};
+	let path = std::env::temp_dir().join("grin-round-restart");
+	let phase = std::env::var("GRIN_ROUND_PHASE").ok();
+	if phase.is_none() {
+		let _ = std::fs::remove_dir_all(&path);
+		for (phase, code) in [("abort", 17), ("commit", 18), ("resume", 0)] {
+			let status = std::process::Command::new(std::env::current_exe().unwrap())
+				.args(["--exact", "round_restart", "--nocapture"])
+				.env("GRIN_ROUND_PHASE", phase)
+				.status()
+				.unwrap();
+			assert_eq!(status.code(), Some(code), "{phase}");
+		}
+		std::fs::remove_dir_all(path).unwrap();
+		return;
+	}
+	core::global::set_local_chain_type(core::global::ChainTypes::AutomatedTesting);
+	let client =
+		impls::HTTPNodeClient::new("http://127.0.0.1:1", None, Duration::from_secs(1)).unwrap();
+	let mut w = WalletBackend::new(path.to_str().unwrap(), client).unwrap();
+	let keychain = ExtKeychain::from_seed(&[42; 32], false).unwrap();
+	w.set_keychain(keychain.clone(), false, false).unwrap();
+	let mut request = Slate::blank(2, TxFlow::Atomic);
+	request.id = uuid::Uuid::from_bytes([23; 16]);
+	request.amount = 1_000_000_000;
+	request.fee_fields = (core::libtx::tx_fee(1, 1, 1) as u32).into();
+	let parent = w.parent_key_id();
+	let mut context = Context::new(keychain.secp(), &parent, true, true);
+	request.fill_round_1(&keychain, &mut context).unwrap();
+	request.compact().unwrap();
+	match phase.as_deref().unwrap() {
+		"abort" => {
+			let mut batch = w.batch(None).unwrap();
+			let id = batch.next_tx_log_id(&parent).unwrap();
+			batch
+				.save(libwallet::OutputData {
+					root_key_id: parent.clone(),
+					key_id: parent.clone(),
+					mmr_index: None,
+					n_child: 0,
+					commit: None,
+					value: request.amount,
+					status: libwallet::OutputStatus::Unconfirmed,
+					height: 0,
+					lock_height: 0,
+					is_coinbase: false,
+					is_multisig: false,
+					tx_log_entry: Some(id),
+				})
+				.unwrap();
+			batch
+				.save_private_context(request.id.as_bytes(), &context)
+				.unwrap();
+			batch.save_round(&request, 2, None).unwrap();
+			std::process::exit(17);
+		}
+		"commit" => {
+			assert_eq!(w.iter().unwrap().count(), 0);
+			assert_eq!(w.tx_log_iter().unwrap().count(), 0);
+			assert!(w.atomic_round(&request.id, 2).unwrap().is_none());
+			libwallet::api_impl::foreign::receive_atomic_tx(&mut w, None, &request, None, false)
+				.unwrap();
+			std::process::exit(18);
+		}
+		"resume" => {
+			let saved = w.atomic_round(&request.id, 2).unwrap().unwrap();
+			let reply = libwallet::api_impl::foreign::receive_atomic_tx(
+				&mut w, None, &request, None, false,
+			)
+			.unwrap();
+			assert_eq!(
+				serde_json::to_value(saved).unwrap(),
+				serde_json::to_value(reply).unwrap()
+			);
+			assert_eq!(w.iter().unwrap().count(), 1);
+			assert_eq!(w.tx_log_iter().unwrap().count(), 1);
+			let id = w.get_used_atomic_id(&request.id).unwrap();
+			let context = w.get_private_context(None, request.id.as_bytes()).unwrap();
+			assert_eq!(
+				w.get_atomic_secret(None, &id).unwrap(),
+				context.sec_atomic.unwrap()
+			);
+		}
+		_ => unreachable!(),
+	}
 }

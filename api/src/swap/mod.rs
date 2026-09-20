@@ -65,6 +65,13 @@ pub enum Request {
 		/// Local swap ID
 		id: Uuid,
 	},
+	/// Raise the fee of a local Bitcoin claim or refund within the agreed limit
+	Bump {
+		/// Local swap ID
+		id: Uuid,
+		/// New absolute fee in satoshis
+		fee: u64,
+	},
 	/// Read the saved state without broadcasting
 	Status {
 		/// Local swap ID

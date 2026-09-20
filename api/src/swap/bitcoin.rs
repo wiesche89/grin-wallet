@@ -51,6 +51,8 @@ struct Swap {
 	btc_funding: Option<btc::Transaction>,
 	btc_refund: Option<btc::Transaction>,
 	btc_claim: Option<btc::Transaction>,
+	#[serde(default)]
+	replacements: Vec<btc::Transaction>,
 	last_action: Action,
 }
 
@@ -183,6 +185,7 @@ where
 				btc_funding: None,
 				btc_refund: None,
 				btc_claim: None,
+				replacements: Vec::new(),
 				last_action: Action::Wait,
 			};
 			w.save_swap(mask, &id, &state)?;
@@ -191,6 +194,7 @@ where
 		let id = match &request {
 			Request::Prepare { id, .. }
 			| Request::Receive { id, .. }
+			| Request::Bump { id, .. }
 			| Request::Step { id }
 			| Request::Status { id } => *id,
 			Request::Start { .. } => unreachable!(),
@@ -263,17 +267,25 @@ where
 					}
 					let signed = Slate::deserialize_upgrade(&json)?;
 					let original = slate(&state.main)?;
-					if signed.state != SlateState::Atomic3
-						|| signed.id != original.id
-						|| signed.amount != original.amount
-						|| signed.fee_fields != original.fee_fields
-						|| signed.multisig_key_id != original.multisig_key_id
-						|| point(&signed)? != point(&original)?
-						|| signed.kernel_features != 0
-						|| signed.ttl_cutoff_height != 0
-					{
-						return Err(invalid("main slate changed"));
+					if signed.tx_or_err()?.outputs() != original.tx_or_err()?.outputs() {
+						return Err(invalid("main outputs changed"));
 					}
+					let mut context = w.get_private_context(mask, signed.id.as_bytes())?;
+					let output = w
+						.iter()?
+						.find(|o| {
+							o.is_multisig && Some(&o.key_id) == original.multisig_key_id.as_ref()
+						})
+						.ok_or_else(|| invalid("missing shared output"))?;
+					context.input_ids = vec![(output.key_id, output.mmr_index, output.value)];
+					signed.check_atomic(
+						&original,
+						state
+							.shared
+							.ok_or_else(|| invalid("missing shared output"))?,
+						&w.keychain(mask)?,
+						&context,
+					)?;
 					if let Some(saved) = &state.released {
 						if saved != &encode(&signed)? {
 							return Err(invalid("signature changed"));
@@ -284,6 +296,7 @@ where
 				}
 			}
 			Request::Step { .. } => publish = step(w, mask, &core, &mut state)?,
+			Request::Bump { fee, .. } => publish = Some(bump(w, mask, &core, &mut state, fee)?),
 			Request::Status { .. } => return reply(w, mask, id, &state),
 			Request::Start { .. } => unreachable!(),
 		}
@@ -415,6 +428,10 @@ fn prepare<C: NodeClient, K: Keychain>(
 	let keychain = w.keychain(mask)?;
 	main.find_participant_data_index(keychain.secp(), &context)?;
 	if state.flow.role == Role::SellGrin {
+		let offer = w
+			.atomic_round(&main.id, 1)?
+			.ok_or_else(|| invalid("missing sender round"))?;
+		main.check_offer(&offer)?;
 		main.verify_adaptor(&keychain, &context)?;
 		if w.get_stored_tx(&refund.id.to_string())?.as_ref() != Some(refund_tx)
 			|| w.get_stored_tx(&funding.id.to_string())?.as_ref() != Some(funding.tx_or_err()?)
@@ -422,6 +439,12 @@ fn prepare<C: NodeClient, K: Keychain>(
 			return Err(invalid("funding and refund must be finalized locally"));
 		}
 	} else {
+		let saved = w
+			.atomic_round(&main.id, 2)?
+			.ok_or_else(|| invalid("missing receiver round"))?;
+		if encode(main)? != encode(&saved)? {
+			return Err(invalid("receiver round changed"));
+		}
 		let atomic = context
 			.sec_atomic
 			.as_ref()
@@ -519,21 +542,42 @@ fn step<C: NodeClient, K: Keychain>(
 		height: other_height,
 		funding: other_funding,
 		unspent,
-		claim: match &state.btc_claim {
-			Some(tx) => core.status(tx.compute_txid())?,
-			None => TxState::Absent,
-		},
-		refund: match &state.btc_refund {
-			Some(tx) => core.status(tx.compute_txid())?,
-			None => TxState::Absent,
-		},
+		claim: status(
+			core,
+			state.btc_claim.as_ref(),
+			if state.flow.role == Role::SellGrin {
+				&state.replacements
+			} else {
+				&[]
+			},
+		)?,
+		refund: status(
+			core,
+			state.btc_refund.as_ref(),
+			if state.flow.role == Role::BuyGrin {
+				&state.replacements
+			} else {
+				&[]
+			},
+		)?,
 	};
 	if w.w2n_client().get_chain_tip()? != (height, hash)
 		|| core.tip()? != (other_height, other_hash)
 	{
 		return Err(invalid("chain tip changed; retry"));
 	}
-	let action = state.flow.next(grin, other)?;
+	let mut action = state.flow.next(grin, other)?;
+	// A saved replacement can be retried while its predecessor still spends the funding
+	if action == Action::Wait && !state.replacements.is_empty() {
+		if state.flow.role == Role::SellGrin && other.claim == TxState::Pending {
+			action = Action::ClaimOther;
+		} else if state.flow.role == Role::BuyGrin
+			&& other.refund == TxState::Pending
+			&& other.height >= state.flow.policy.other.refund
+		{
+			action = Action::RefundOther;
+		}
+	}
 	state.last_action = action;
 	let publish = match action {
 		Action::FundGrin => Some(Publish::Grin(funding.tx_or_err()?.clone())),
@@ -575,26 +619,7 @@ fn step<C: NodeClient, K: Keychain>(
 		}
 		Action::ClaimOther => {
 			if state.btc_claim.is_none() {
-				let excess = main.calc_excess(w.keychain(mask)?.secp())?;
-				let (kernel, _, _) = w
-					.w2n_client()
-					.get_kernel(&excess, None, None)?
-					.ok_or_else(|| invalid("main kernel disappeared"))?;
-				let recovered = crate::libwallet::recover_atomic_secret(w, mask, &main, &kernel)?;
-				let recovered = btc::secp256k1::SecretKey::from_slice(&recovered.0)
-					.map_err(|_| invalid("recovered key"))?;
-				let destination = state.destination()?;
-				let funding = state
-					.btc_funding
-					.as_ref()
-					.ok_or_else(|| invalid("missing Bitcoin funding"))?;
-				state.btc_claim = Some(contract.claim(
-					funding,
-					&destination,
-					btc::Amount::from_sat(state.fee),
-					&secret(w, mask, &state.key)?,
-					&recovered,
-				)?);
+				state.btc_claim = Some(claim(w, mask, state)?);
 			}
 			state.flow.claimed = true;
 			Some(Publish::Bitcoin(
@@ -614,4 +639,117 @@ fn step<C: NodeClient, K: Keychain>(
 		_ => None,
 	};
 	Ok(publish)
+}
+
+fn status(
+	core: &Core,
+	tx: Option<&btc::Transaction>,
+	previous: &[btc::Transaction],
+) -> Result<TxState, Error> {
+	let mut result = TxState::Absent;
+	for tx in tx.into_iter().chain(previous.iter()) {
+		match core.status(tx.compute_txid())? {
+			confirmed @ TxState::Confirmed(_) => return Ok(confirmed),
+			TxState::Pending => result = TxState::Pending,
+			TxState::Conflicted if result == TxState::Absent => result = TxState::Conflicted,
+			_ => (),
+		}
+	}
+	Ok(result)
+}
+
+fn claim<C: NodeClient, K: Keychain>(
+	w: &mut WalletBackend<C, K>,
+	mask: Option<&SecretKey>,
+	state: &Swap,
+) -> Result<btc::Transaction, Error> {
+	let main = slate(&state.released)?;
+	let atomic_id = w.get_used_atomic_id(&main.id)?;
+	let recovered = match w.find_recovered_atomic_secret(mask, &atomic_id)? {
+		Some(key) => key,
+		None => {
+			let excess = main.calc_excess(w.keychain(mask)?.secp())?;
+			let (kernel, _, _) = w
+				.w2n_client()
+				.get_kernel(&excess, None, None)?
+				.ok_or_else(|| invalid("main kernel disappeared"))?;
+			crate::libwallet::recover_atomic_secret(w, mask, &main, &kernel)?
+		}
+	};
+	let recovered = btc::secp256k1::SecretKey::from_slice(&recovered.0)
+		.map_err(|_| invalid("recovered key"))?;
+	state
+		.contract
+		.as_ref()
+		.ok_or_else(|| invalid("missing contract"))?
+		.claim(
+			state
+				.btc_funding
+				.as_ref()
+				.ok_or_else(|| invalid("missing Bitcoin funding"))?,
+			&state.destination()?,
+			btc::Amount::from_sat(state.fee),
+			&secret(w, mask, &state.key)?,
+			&recovered,
+		)
+}
+
+fn bump<C: NodeClient, K: Keychain>(
+	w: &mut WalletBackend<C, K>,
+	mask: Option<&SecretKey>,
+	core: &Core,
+	state: &mut Swap,
+	fee: u64,
+) -> Result<Publish, Error> {
+	if fee < state.fee || fee > state.max_fee {
+		return Err(invalid("fee increase exceeds policy"));
+	}
+	let old = match state.flow.role {
+		Role::SellGrin => state.btc_claim.as_ref(),
+		Role::BuyGrin => state.btc_refund.as_ref(),
+	}
+	.ok_or_else(|| invalid("no Bitcoin spend to replace"))?
+	.clone();
+	if matches!(
+		status(core, Some(&old), &state.replacements)?,
+		TxState::Confirmed(_) | TxState::Conflicted
+	) {
+		return Err(invalid("Bitcoin spend is confirmed or conflicted"));
+	}
+	if state.flow.role == Role::BuyGrin && core.height()? < state.flow.policy.other.refund {
+		return Err(invalid("refund is not mature"));
+	}
+	if fee == state.fee {
+		return Ok(Publish::Bitcoin(old));
+	}
+	state.fee = fee;
+	let replacement = match state.flow.role {
+		Role::SellGrin => claim(w, mask, state)?,
+		Role::BuyGrin => state
+			.contract
+			.as_ref()
+			.ok_or_else(|| invalid("missing contract"))?
+			.refund(
+				state
+					.btc_funding
+					.as_ref()
+					.ok_or_else(|| invalid("missing Bitcoin funding"))?,
+				&state.destination()?,
+				btc::Amount::from_sat(fee),
+				&secret(w, mask, &state.key)?,
+			)?,
+	};
+	core.accept(&replacement)?;
+	state.replacements.push(old);
+	match state.flow.role {
+		Role::SellGrin => {
+			state.btc_claim = Some(replacement.clone());
+			state.last_action = Action::ClaimOther;
+		}
+		Role::BuyGrin => {
+			state.btc_refund = Some(replacement.clone());
+			state.last_action = Action::RefundOther;
+		}
+	}
+	Ok(Publish::Bitcoin(replacement))
 }
