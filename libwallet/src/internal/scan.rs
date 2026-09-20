@@ -53,20 +53,11 @@ struct OutputResult {
 	pub lock_height: u64,
 	///
 	pub is_coinbase: bool,
-	///
-	pub is_multisig: bool,
 }
 
 fn identify_utxo_outputs<K>(
 	keychain: &K,
-	outputs: Vec<(
-		pedersen::Commitment,
-		pedersen::RangeProof,
-		bool,
-		bool,
-		u64,
-		u64,
-	)>,
+	outputs: Vec<(pedersen::Commitment, pedersen::RangeProof, bool, u64, u64)>,
 	status_send_channel: &Option<Sender<StatusMessage>>,
 	percentage_complete: u8,
 ) -> Result<Vec<OutputResult>, Error>
@@ -86,7 +77,7 @@ where
 				// set chain type for thread
 				global::set_local_chain_type(chain_type);
 
-				let (commit, proof, is_coinbase, is_multisig, height, mmr_index) = output;
+				let (commit, proof, is_coinbase, height, mmr_index) = output;
 				// attempt to unwind message from the RP and get a value
 				// will fail if it's not ours
 				let info = {
@@ -128,7 +119,6 @@ where
 						height: *height,
 						lock_height,
 						is_coinbase: *is_coinbase,
-						is_multisig: *is_multisig,
 						mmr_index: *mmr_index,
 					},
 					switch,
@@ -201,7 +191,7 @@ where
 
 		// Scanning outputs
 		for output in outputs.iter() {
-			let (commit, proof, is_coinbase, _is_multisig, height, mmr_index) = output;
+			let (commit, proof, is_coinbase, height, mmr_index) = output;
 			let rewind_hash = from_hex(vw.rewind_hash.as_str())
 				.map_err(|e| Error::RewindHash(format!("Unable to decode rewind hash: {}", e)))?;
 			let rewind_nonce = blake2b(32, &commit.0, &rewind_hash);
@@ -356,7 +346,7 @@ where
 				height: output.height,
 				lock_height: output.lock_height,
 				is_coinbase: output.is_coinbase,
-				is_multisig: output.is_multisig,
+				is_multisig: false,
 				tx_log_entry: Some(log_id),
 			})?;
 

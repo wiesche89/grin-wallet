@@ -196,7 +196,7 @@ pub trait ForeignRpc {
 	) -> Result<VersionedSlate, Error>;
 
 	/**
-	;Networked version of [Foreign::receive_atomic_tx](struct.Foreign.html#method.receive_atomic_tx).
+	;Networked version of [Foreign::receive_atomic_tx](struct.Foreign.html#method.receive_atomic_tx)
 
 	# Json rpc example
 
@@ -367,6 +367,9 @@ pub trait ForeignRpc {
 	```
 	*/
 	fn finalize_tx(&self, slate: VersionedSlate) -> Result<VersionedSlate, Error>;
+
+	/// Finalize without publishing, for swap funding and refunds
+	fn presign_tx(&self, slate: VersionedSlate) -> Result<VersionedSlate, Error>;
 }
 
 impl<'a, L, C, K> ForeignRpc for Foreign<'a, L, C, K>
@@ -429,10 +432,27 @@ where
 	}
 
 	fn finalize_tx(&self, in_slate: VersionedSlate) -> Result<VersionedSlate, Error> {
-		let v = in_slate.version();
-		let out_slate = Foreign::finalize_tx(self, &Slate::from(in_slate), true)?;
-		Ok(VersionedSlate::into_version(out_slate, v)?)
+		finalize(self, in_slate, true)
 	}
+
+	fn presign_tx(&self, in_slate: VersionedSlate) -> Result<VersionedSlate, Error> {
+		finalize(self, in_slate, false)
+	}
+}
+
+fn finalize<'a, L, C, K>(
+	api: &Foreign<'a, L, C, K>,
+	slate: VersionedSlate,
+	post: bool,
+) -> Result<VersionedSlate, Error>
+where
+	L: WalletLCProvider<'a, C, K>,
+	C: NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let version = slate.version();
+	let slate = Foreign::finalize_tx(api, &Slate::from(slate), post)?;
+	VersionedSlate::into_version(slate, version)
 }
 
 fn test_check_middleware(

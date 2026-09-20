@@ -38,6 +38,7 @@ mod client_utils;
 mod error;
 mod lifecycle;
 mod node_clients;
+pub mod swap;
 pub mod test_framework;
 pub mod tor;
 

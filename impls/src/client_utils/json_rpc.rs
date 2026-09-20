@@ -62,7 +62,17 @@ impl Response {
 		}
 
 		let result = match self.result.clone() {
-			Some(r) => serde_json::from_value(r["Ok"].clone()).map_err(Error::Json),
+			Some(r) => {
+				let result: Result<T, serde_json::Value> =
+					serde_json::from_value(r).map_err(Error::Json)?;
+				result.map_err(|error| {
+					Error::Rpc(RpcError {
+						code: -32603,
+						message: error.to_string(),
+						data: Some(error),
+					})
+				})
+			}
 			None => serde_json::from_value(serde_json::Value::Null).map_err(Error::Json),
 		}?;
 		Ok(result)
@@ -260,5 +270,31 @@ pub fn _result_to_response(
 			id: id,
 			jsonrpc: Some(String::from("2.0")),
 		},
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn rpc_error() {
+		let response: Response = serde_json::from_value(serde_json::json!({
+			"jsonrpc": "2.0", "id": 1,
+			"result": {"Err": {"Internal": "Failed to update pool"}}
+		}))
+		.unwrap();
+		assert!(response.result::<serde_json::Value>().is_err());
+		assert!(response.result::<()>().is_err());
+
+		let success: Response = serde_json::from_value(serde_json::json!({
+			"jsonrpc": "2.0", "id": 1, "result": {"Ok": null}
+		}))
+		.unwrap();
+		assert_eq!(
+			success.result::<serde_json::Value>().unwrap(),
+			serde_json::Value::Null
+		);
+		assert!(success.result::<()>().is_ok());
 	}
 }

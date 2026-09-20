@@ -572,6 +572,10 @@ pub fn parse_send_args(args: &ArgMatches) -> Result<command::SendArgs, ParseErro
 		is_multisig,
 		derive_path,
 		multisig_path,
+		refund_height: args
+			.value_of("refund_height")
+			.map(|v| parse_u64(v, "refund_height"))
+			.transpose()?,
 		skip_tor,
 		bridge,
 		slatepack_qr,
@@ -1430,6 +1434,12 @@ where
 		("finalize_atomic", Some(args)) => {
 			let a = arg_parse!(parse_finalize_args(&args));
 			command::finalize(owner_api, km, a, TxFlow::Atomic)
+		}
+		("swap", Some(args)) => {
+			let path = args
+				.value_of("input")
+				.ok_or_else(|| Error::ArgumentError("missing request".into()))?;
+			command::swap(owner_api, km, path)
 		}
 		("recover_atomic_secret", Some(args)) => {
 			let a = arg_parse!(parse_recover_atomic_args(&args));

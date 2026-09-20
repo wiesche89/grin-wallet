@@ -424,7 +424,7 @@ where
 			self.doctest_mode,
 		)?;
 		// Countersigning requires the sender's owner API. Return the response to
-		// the caller, which can deliver it through the Slatepack workflow.
+		// the caller, which can deliver it through the Slatepack workflow
 		let _ = r_addr;
 		Ok(ret_slate)
 	}

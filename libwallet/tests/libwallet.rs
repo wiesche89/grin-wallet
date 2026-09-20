@@ -118,7 +118,6 @@ fn aggsig_sender_receiver_interaction() {
 			&keychain.secp(),
 			&rx_cx.sec_key,
 			&rx_cx.sec_nonce,
-			None,
 			&pub_nonce_sum,
 			Some(&pub_key_sum),
 			&msg,
@@ -136,7 +135,6 @@ fn aggsig_sender_receiver_interaction() {
 			&keychain.secp(),
 			&rx_sig_part,
 			&pub_nonce_sum,
-			None,
 			&receiver_pub_excess,
 			Some(&pub_key_sum),
 			&msg,
@@ -152,7 +150,6 @@ fn aggsig_sender_receiver_interaction() {
 			&keychain.secp(),
 			&s_cx.sec_key,
 			&s_cx.sec_nonce,
-			None,
 			&pub_nonce_sum,
 			Some(&pub_key_sum),
 			&msg,
@@ -170,7 +167,6 @@ fn aggsig_sender_receiver_interaction() {
 			&keychain.secp(),
 			&sender_sig_part,
 			&pub_nonce_sum,
-			None,
 			&sender_pub_excess,
 			Some(&pub_key_sum),
 			&msg,
@@ -187,7 +183,6 @@ fn aggsig_sender_receiver_interaction() {
 			&keychain.secp(),
 			&rx_cx.sec_key,
 			&rx_cx.sec_nonce,
-			None,
 			&pub_nonce_sum,
 			Some(&pub_key_sum),
 			&msg,
@@ -341,7 +336,6 @@ fn aggsig_sender_receiver_interaction_offset() {
 			&keychain.secp(),
 			&rx_cx.sec_key,
 			&rx_cx.sec_nonce,
-			None,
 			&pub_nonce_sum,
 			Some(&pub_key_sum),
 			&msg,
@@ -359,7 +353,6 @@ fn aggsig_sender_receiver_interaction_offset() {
 			&keychain.secp(),
 			&sig_part,
 			&pub_nonce_sum,
-			None,
 			&receiver_pub_excess,
 			Some(&pub_key_sum),
 			&msg,
@@ -375,7 +368,6 @@ fn aggsig_sender_receiver_interaction_offset() {
 			&keychain.secp(),
 			&s_cx.sec_key,
 			&s_cx.sec_nonce,
-			None,
 			&pub_nonce_sum,
 			Some(&pub_key_sum),
 			&msg,
@@ -393,7 +385,6 @@ fn aggsig_sender_receiver_interaction_offset() {
 			&keychain.secp(),
 			&sender_sig_part,
 			&pub_nonce_sum,
-			None,
 			&sender_pub_excess,
 			Some(&pub_key_sum),
 			&msg,
@@ -409,7 +400,6 @@ fn aggsig_sender_receiver_interaction_offset() {
 			&keychain.secp(),
 			&rx_cx.sec_key,
 			&rx_cx.sec_nonce,
-			None,
 			&pub_nonce_sum,
 			Some(&pub_key_sum),
 			&msg,
@@ -645,9 +635,21 @@ fn test_atomic_swap_multisig_tx() {
 		.adjust_offset(&receiver_keychain, &receiver_ctx)
 		.unwrap();
 
+	let mut missing_secret = receiver_ctx.clone();
+	missing_secret.sec_atomic = None;
+	assert!(slate
+		.fill_round_2_atomic(&receiver_keychain, &missing_secret)
+		.is_err());
+
 	slate
 		.fill_round_2_atomic(&receiver_keychain, &mut receiver_ctx)
 		.unwrap();
+	let mut wrong_adaptor = slate.clone();
+	wrong_adaptor.participant_data[1].public_atomic =
+		Some(PublicKey::from_secret_key(receiver_keychain.secp(), &receiver_ctx.sec_key).unwrap());
+	assert!(wrong_adaptor
+		.fill_round_3_atomic(&sender_keychain, &sender_ctx)
+		.is_err());
 
 	let adaptor_sig = slate
 		.fill_round_3_atomic(&sender_keychain, &mut sender_ctx)

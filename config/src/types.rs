@@ -21,6 +21,17 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Local Bitcoin Core connection for swaps
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BitcoinConfig {
+	/// Loopback RPC URL, including the Core wallet path
+	pub url: String,
+	/// Core's authentication cookie
+	pub cookie: PathBuf,
+	/// bitcoin, testnet, testnet4, signet or regtest
+	pub network: String,
+}
+
 /// Command-line wallet configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WalletConfig {
@@ -56,11 +67,14 @@ pub struct WalletConfig {
 	/// Scaling factor from transaction weight to transaction fee
 	/// should match accept_fee_base parameter in grin-server
 	pub accept_fee_base: Option<u64>,
+	/// Optional Bitcoin swap backend
+	pub bitcoin: Option<BitcoinConfig>,
 }
 
 impl Default for WalletConfig {
 	fn default() -> WalletConfig {
 		WalletConfig {
+			bitcoin: None,
 			chain_type: Some(ChainTypes::Mainnet),
 			api_listen_port: 3415,
 			owner_api_listen_port: Some(WalletConfig::default_owner_api_listen_port()),

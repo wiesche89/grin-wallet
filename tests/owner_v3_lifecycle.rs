@@ -29,7 +29,7 @@ use std::time::Duration;
 use grin_keychain::ExtKeychain;
 use grin_wallet_config::GlobalWalletConfig;
 use grin_wallet_impls::DefaultLCProvider;
-use grin_wallet_libwallet::{InitTxArgs, Slate, SlateVersion, VersionedSlate};
+use grin_wallet_libwallet::{InitTxArgs, Slate, VersionedSlate};
 use serde_json;
 
 use grin_util::Mutex;
@@ -262,6 +262,26 @@ fn owner_v3_lifecycle() -> Result<(), grin_wallet_controller::Error> {
 	println!("RES 8: {:?}", res);
 	assert!(res.is_ok());
 	let token = res.unwrap();
+
+	// Swap requests use the encrypted owner endpoint and its wallet token
+	for auth in [Some(token.clone()), None] {
+		let req = serde_json::json!({
+			"jsonrpc": "2.0", "id": 1, "method": "swap",
+			"params": {
+				"token": auth,
+				"request": {"action": "status", "id": "00000000-0000-0000-0000-000000000000"}
+			}
+		});
+		let result = send_request_enc::<serde_json::Value>(
+			&JsonId::StrId(String::from("1")),
+			1,
+			"http://127.0.0.1:43420/v3/owner",
+			&req.to_string(),
+			&shared_key,
+		)?;
+		let error = result.unwrap_err();
+		assert_eq!(error.message.contains("unknown swap"), auth.is_some());
+	}
 
 	// 9) Send a request with our new token
 	let req = serde_json::json!({

@@ -53,8 +53,14 @@ const WALLET_INIT_STATUS_KEY: &str = "WALLET_INIT_STATUS";
 const ATOMIC_ID_PREFIX: u8 = b'm';
 const ATOMIC_SECRET_PREFIX: u8 = b's';
 const RECOVERED_ATOMIC_SECRET_PREFIX: u8 = b'r';
+const ADAPTOR_PREFIX: u8 = b'A';
+const ROUND_PREFIX: u8 = b'R';
+const SWAP_PREFIX: u8 = b'W';
 
-const DB_PREFIXES: [u8; 12] = [
+const DB_PREFIXES: [u8; 15] = [
+	SWAP_PREFIX,
+	ROUND_PREFIX,
+	ADAPTOR_PREFIX,
 	ATOMIC_ID_PREFIX,
 	ATOMIC_SECRET_PREFIX,
 	RECOVERED_ATOMIC_SECRET_PREFIX,
@@ -119,43 +125,19 @@ where
 	Ok(ret_tau_x)
 }
 
-fn atomic_xor_key<K>(keychain: &K, atomic_id: &Identifier) -> Result<[u8; SECRET_KEY_SIZE], Error>
-where
-	K: Keychain,
-{
-	let root_key = keychain.derive_key(0, &K::root_key_id(), SwitchCommitmentType::Regular)?;
-
-	//derive XOE value for storing atomic public key
-	// h(root_key|atomic_id|"atomic_secret")
-	let mut hasher = Blake2b::new(SECRET_KEY_SIZE);
-	hasher.update(&root_key.0);
-	hasher.update(&atomic_id.to_bytes());
-	hasher.update(&b"atomic_secret"[..]);
-	let atomic_xor_key = hasher.finalize();
-	let mut ret_atomic = [0; SECRET_KEY_SIZE];
-	ret_atomic.copy_from_slice(&atomic_xor_key.as_bytes()[0..SECRET_KEY_SIZE]);
-
-	Ok(ret_atomic)
-}
-
-fn recovered_atomic_xor_key<K>(
+fn atomic_xor_key<K: Keychain>(
 	keychain: &K,
-	atomic_id: &Identifier,
-) -> Result<[u8; SECRET_KEY_SIZE], Error>
-where
-	K: Keychain,
-{
-	let root_key = keychain.derive_key(0, &K::root_key_id(), SwitchCommitmentType::Regular)?;
-	//derive XOE value for storing public atomic secret
-	// h(root_key|atomic_id|"recovered_atomic_secret")
+	id: &Identifier,
+	domain: &[u8],
+) -> Result<[u8; SECRET_KEY_SIZE], Error> {
+	let root = keychain.derive_key(0, &K::root_key_id(), SwitchCommitmentType::Regular)?;
 	let mut hasher = Blake2b::new(SECRET_KEY_SIZE);
-	hasher.update(&root_key.0);
-	hasher.update(&atomic_id.to_bytes());
-	hasher.update(&b"recovered_atomic_secret"[..]);
-	let atomic_xor_key = hasher.finalize();
-	let mut ret_atomic = [0; SECRET_KEY_SIZE];
-	ret_atomic.copy_from_slice(&atomic_xor_key.as_bytes()[0..SECRET_KEY_SIZE]);
-	Ok(ret_atomic)
+	hasher.update(&root.0);
+	hasher.update(&id.to_bytes());
+	hasher.update(domain);
+	let mut key = [0; SECRET_KEY_SIZE];
+	key.copy_from_slice(hasher.finalize().as_bytes());
+	Ok(key)
 }
 
 fn default_parent_atomic_id() -> Identifier {
@@ -346,8 +328,7 @@ where
 		/*}*/
 	}
 
-	/// Set parent key id by stored account name.
-	/// Calculate the local and combined commitments for a shared output.
+	/// Calculate the local and combined commitments for a shared output
 	pub fn calc_multisig_commit_for_cache(
 		&mut self,
 		keychain_mask: Option<&SecretKey>,
@@ -357,7 +338,7 @@ where
 	) -> Result<(Option<Commitment>, Option<Commitment>), Error> {
 		let keychain = self.keychain(keychain_mask)?;
 		let secp = keychain.secp();
-		// TODO: proper support for different switch commitment schemes
+		// Match the regular switch used when building and spending shared outputs
 		let commit_key = keychain.derive_key(amount, id, SwitchCommitmentType::Regular)?;
 		let commit = secp.commit(0, commit_key)?;
 		let commit_sum = secp.commit_sum(vec![commit.clone(), partial_commit.clone()], vec![])?;
@@ -365,7 +346,7 @@ where
 		Ok((Some(commit), Some(commit_sum)))
 	}
 
-	/// Return the next unused atomic secret derivation path.
+	/// Return the next unused atomic secret derivation path
 	pub fn current_atomic_id(&mut self) -> Result<Identifier, Error> {
 		let index = {
 			let batch = self.db.batch()?;
@@ -382,7 +363,7 @@ where
 		Ok(Identifier::from_path(&return_path))
 	}
 
-	/// Reserve an atomic secret derivation path and persist the next index.
+	/// Reserve an atomic secret derivation path and persist the next index
 	pub fn next_atomic_id(
 		&mut self,
 		keychain_mask: Option<&SecretKey>,
@@ -399,74 +380,204 @@ where
 		let mut return_path = default_parent_atomic_id().to_path();
 		return_path.depth += 1;
 		return_path.path[return_path.depth as usize - 1] = ChildNumber::from(atomic_idx);
-		atomic_idx += 1;
+		atomic_idx = atomic_idx
+			.checked_add(1)
+			.ok_or_else(|| Error::GenericError("atomic index exhausted".into()))?;
 		let mut batch = self.batch(keychain_mask)?;
 		batch.save_atomic_index(atomic_idx)?;
 		batch.commit()?;
 		Ok(Identifier::from_path(&return_path))
 	}
 
-	/// Return the atomic secret path associated with a swap.
-	pub fn get_used_atomic_id(&mut self, id: &Uuid) -> Result<Identifier, Error> {
-		let parent_atomic_id = default_parent_atomic_id().clone();
-		let atomic_idx = {
-			let batch = self.db.batch()?;
-			let atomic_key = id.as_bytes().to_vec();
-			let prefix = ATOMIC_ID_PREFIX;
-			match batch.get_ser(Some(prefix), &atomic_key, None)? {
-				Some(idx) => idx,
-				None => 0,
-			}
-		};
-		let mut return_path = parent_atomic_id.to_path();
-		return_path.depth += 1;
-		return_path.path[return_path.depth as usize - 1] = ChildNumber::from(atomic_idx);
-		Ok(Identifier::from_path(&return_path))
+	/// Find the atomic key reserved for a slate
+	pub fn find_used_atomic_id(&self, id: &Uuid) -> Result<Option<Identifier>, Error> {
+		let batch = self.db.batch()?;
+		let index: Option<u32> = batch.get_ser(Some(ATOMIC_ID_PREFIX), id.as_bytes(), None)?;
+		Ok(index.map(|index| {
+			let mut path = default_parent_atomic_id().to_path();
+			path.depth += 1;
+			path.path[path.depth as usize - 1] = ChildNumber::from(index);
+			Identifier::from_path(&path)
+		}))
 	}
 
-	/// Decrypt the locally stored atomic secret.
+	/// Read the atomic key reserved for a slate
+	pub fn get_used_atomic_id(&self, id: &Uuid) -> Result<Identifier, Error> {
+		self.find_used_atomic_id(id)?
+			.ok_or_else(|| Error::GenericError("unknown atomic slate".into()))
+	}
+
+	/// Bind a shared funding transaction to one swap
+	pub fn bind_swap(
+		&mut self,
+		mask: Option<&SecretKey>,
+		funding: &Uuid,
+		swap: &Uuid,
+	) -> Result<(), Error> {
+		let key = to_key_u64(funding.as_bytes(), 0);
+		let saved: Option<Vec<u8>> = self.db.get_ser(Some(SWAP_PREFIX), &key, None)?;
+		if saved.as_deref().map_or(false, |id| id != swap.as_bytes()) {
+			return Err(Error::GenericError(
+				"funding already belongs to a swap".into(),
+			));
+		}
+		let mut batch = self.batch(mask)?;
+		batch
+			.db
+			.put_ser(Some(SWAP_PREFIX), &key, &swap.as_bytes().to_vec())?;
+		batch.commit()
+	}
+
+	/// Load swap state for the selected account
+	pub fn load_swap<T: serde::de::DeserializeOwned>(
+		&mut self,
+		id: &Uuid,
+	) -> Result<Option<T>, Error> {
+		let bytes: Option<Vec<u8>> = self.db.get_ser(Some(SWAP_PREFIX), id.as_bytes(), None)?;
+		bytes
+			.map(|bytes| {
+				let (account, value): (Identifier, T) = serde_json::from_slice(&bytes)
+					.map_err(|e| Error::GenericError(e.to_string()))?;
+				if account != self.parent_key_id() {
+					return Err(Error::GenericError(
+						"swap belongs to another account".into(),
+					));
+				}
+				Ok(value)
+			})
+			.transpose()
+	}
+
+	/// Commit swap state before performing an external action
+	pub fn save_swap<T: serde::Serialize>(
+		&mut self,
+		mask: Option<&SecretKey>,
+		id: &Uuid,
+		value: &T,
+	) -> Result<(), Error> {
+		let bytes = serde_json::to_vec(&(self.parent_key_id(), value))
+			.map_err(|e| Error::GenericError(e.to_string()))?;
+		if bytes.len() > 4 * 1024 * 1024 {
+			return Err(Error::GenericError("swap record too large".into()));
+		}
+		let mut batch = self.batch(mask)?;
+		batch.db.put_ser(Some(SWAP_PREFIX), id.as_bytes(), &bytes)?;
+		batch.commit()
+	}
+
+	/// Reserve an atomic round or return its saved response
+	pub fn begin_round(
+		&mut self,
+		mask: Option<&SecretKey>,
+		slate: &crate::Slate,
+		round: u8,
+	) -> Result<Option<crate::Slate>, Error> {
+		self.keychain(mask)?;
+		let expected = match round {
+			2 => crate::SlateState::Atomic1,
+			3 => crate::SlateState::Atomic2,
+			4 => crate::SlateState::Atomic3,
+			_ => return Err(Error::SlateState),
+		};
+		if slate.state != expected || slate.num_participants != 2 {
+			return Err(Error::SlateState);
+		}
+		let input = serde_json::to_string(slate).map_err(|e| Error::GenericError(e.to_string()))?;
+		let key = to_key_u64(slate.id.as_bytes(), round as u64);
+		let saved: Option<Vec<u8>> = self.db.get_ser(Some(ROUND_PREFIX), &key, None)?;
+		if let Some(saved) = saved {
+			let (request, response): (String, Option<String>) =
+				serde_json::from_slice(&saved).map_err(|e| Error::GenericError(e.to_string()))?;
+			if request != input {
+				return Err(Error::Signature("atomic round changed".into()));
+			}
+			return response
+				.map(|s| crate::Slate::deserialize_upgrade(&s))
+				.transpose();
+		}
+		let mut batch = self.batch(mask)?;
+		batch.save_round(slate, round, None)?;
+		batch.commit()?;
+		Ok(None)
+	}
+
+	fn read_secret(
+		&mut self,
+		mask: Option<&SecretKey>,
+		id: &Identifier,
+		prefix: u8,
+		domain: &[u8],
+	) -> Result<Option<SecretKey>, Error> {
+		let keychain = self.keychain(mask)?;
+		let batch = self.db.batch()?;
+		let bytes: Option<Vec<u8>> = batch.get_ser(Some(prefix), &id.to_bytes(), None)?;
+		let bytes = match bytes {
+			Some(bytes) => bytes,
+			None => return Ok(None),
+		};
+		if bytes.len() != SECRET_KEY_SIZE {
+			return Err(Error::GenericError("invalid atomic secret length".into()));
+		}
+		let mut key = atomic_xor_key(&keychain, id, domain)?;
+		for (dst, src) in key.iter_mut().zip(bytes) {
+			*dst ^= src;
+		}
+		Ok(Some(SecretKey::from_slice(keychain.secp(), &key)?))
+	}
+
+	/// Read the local atomic secret
 	pub fn get_atomic_secret(
 		&mut self,
-		keychain_mask: Option<&SecretKey>,
-		atomic_id: &Identifier,
+		mask: Option<&SecretKey>,
+		id: &Identifier,
 	) -> Result<SecretKey, Error> {
-		let keychain = self.keychain(keychain_mask)?;
-		let mut xor_key = atomic_xor_key(&keychain, atomic_id)?;
-		let secret_key = atomic_id.to_bytes().to_vec();
-		let prefix = ATOMIC_SECRET_PREFIX;
-		let batch = self.db.batch()?;
-		let secret: Vec<u8> = match batch.get_ser(Some(prefix), &secret_key, None)? {
-			Some(s) => s,
-			None => return Err(Error::GenericError("missing atomic secret".into()).into()),
-		};
-		for (x, s) in xor_key.iter_mut().zip(secret.iter()) {
-			*x ^= s;
-		}
-		Ok(SecretKey::from_slice(keychain.secp(), xor_key.as_ref())?)
+		self.find_atomic_secret(mask, id)?
+			.ok_or_else(|| Error::GenericError("missing atomic secret".into()))
 	}
 
-	/// Decrypt the recovered counterparty secret.
+	/// Read a stored secret, allowing legacy derivation when absent
+	pub fn find_atomic_secret(
+		&mut self,
+		mask: Option<&SecretKey>,
+		id: &Identifier,
+	) -> Result<Option<SecretKey>, Error> {
+		self.read_secret(mask, id, ATOMIC_SECRET_PREFIX, b"atomic_secret")
+	}
+
+	/// Read the saved adaptor scalar
+	pub fn get_adaptor(
+		&mut self,
+		mask: Option<&SecretKey>,
+		id: &Identifier,
+	) -> Result<Option<SecretKey>, Error> {
+		self.read_secret(mask, id, ADAPTOR_PREFIX, b"atomic_adaptor")
+	}
+
+	/// Read the recovered secret, if present
+	pub fn find_recovered_atomic_secret(
+		&mut self,
+		mask: Option<&SecretKey>,
+		id: &Identifier,
+	) -> Result<Option<SecretKey>, Error> {
+		self.read_secret(
+			mask,
+			id,
+			RECOVERED_ATOMIC_SECRET_PREFIX,
+			b"recovered_atomic_secret",
+		)
+	}
+
+	/// Read the recovered counterparty secret
 	pub fn get_recovered_atomic_secret(
 		&mut self,
-		keychain_mask: Option<&SecretKey>,
-		atomic_id: &Identifier,
+		mask: Option<&SecretKey>,
+		id: &Identifier,
 	) -> Result<SecretKey, Error> {
-		let keychain = self.keychain(keychain_mask)?;
-		let mut xor_key = recovered_atomic_xor_key(&keychain, atomic_id)?;
-		let nonce_key = atomic_id.to_bytes().to_vec();
-		let prefix = RECOVERED_ATOMIC_SECRET_PREFIX;
-		let batch = self.db.batch()?;
-		let secret: Vec<u8> = match batch.get_ser(Some(prefix), &nonce_key, None)? {
-			Some(s) => s,
-			None => return Err(Error::GenericError("missing atomic secret".into()).into()),
-		};
-		for (x, s) in xor_key.iter_mut().zip(secret.iter()) {
-			*x ^= s;
-		}
-		Ok(SecretKey::from_slice(keychain.secp(), xor_key.as_ref())?)
+		self.find_recovered_atomic_secret(mask, id)?
+			.ok_or_else(|| Error::GenericError("missing atomic secret".into()))
 	}
 
-	/// Set the active account by its label.
+	/// Set the active account by its label
 	pub fn set_parent_key_id_by_name(&mut self, label: &str) -> Result<(), Error> {
 		let label = label.to_owned();
 		let res = self.acct_path_iter()?.find(|l| l.label == label);
@@ -959,36 +1070,67 @@ where
 		Ok(())
 	}
 
-	pub fn save_atomic_secret(
+	/// Persist an atomic round with its request
+	pub fn save_round(
 		&mut self,
-		atomic_id: &Identifier,
-		secret: &SecretKey,
+		input: &crate::Slate,
+		round: u8,
+		output: Option<&crate::Slate>,
 	) -> Result<(), Error> {
-		let mut xor_key = atomic_xor_key(self.keychain(), atomic_id)?;
-		let secret_key = atomic_id.to_bytes().to_vec();
-		let prefix = ATOMIC_SECRET_PREFIX;
-		for (x, s) in xor_key.iter_mut().zip(secret.0[..].iter()) {
-			*x ^= s;
-		}
-		self.db
-			.put_ser(Some(prefix), &secret_key, &xor_key.to_vec())?;
+		let request =
+			serde_json::to_string(input).map_err(|e| Error::GenericError(e.to_string()))?;
+		let response = output
+			.map(serde_json::to_string)
+			.transpose()
+			.map_err(|e| Error::GenericError(e.to_string()))?;
+		let bytes = serde_json::to_vec(&(request, response))
+			.map_err(|e| Error::GenericError(e.to_string()))?;
+		self.db.put_ser(
+			Some(ROUND_PREFIX),
+			&to_key_u64(input.id.as_bytes(), round as u64),
+			&bytes,
+		)?;
 		Ok(())
 	}
 
-	pub fn save_recovered_atomic_secret(
+	fn write_secret(
 		&mut self,
-		atomic_id: &Identifier,
+		id: &Identifier,
 		secret: &SecretKey,
+		prefix: u8,
+		domain: &[u8],
 	) -> Result<(), Error> {
-		let mut xor_key = recovered_atomic_xor_key(self.keychain(), atomic_id)?;
-		let secret_key = atomic_id.to_bytes().to_vec();
-		let prefix = RECOVERED_ATOMIC_SECRET_PREFIX;
-		for (x, s) in xor_key.iter_mut().zip(secret.0[..].iter()) {
-			*x ^= s;
+		let mut key = atomic_xor_key(self.keychain(), id, domain)?;
+		for (dst, src) in key.iter_mut().zip(secret.0.iter()) {
+			*dst ^= src;
 		}
 		self.db
-			.put_ser(Some(prefix), &secret_key, &xor_key.to_vec())?;
+			.put_ser(Some(prefix), &id.to_bytes(), &key.to_vec())?;
 		Ok(())
+	}
+
+	/// Save the local atomic secret
+	pub fn save_atomic_secret(&mut self, id: &Identifier, secret: &SecretKey) -> Result<(), Error> {
+		self.write_secret(id, secret, ATOMIC_SECRET_PREFIX, b"atomic_secret")
+	}
+
+	/// Save the adaptor scalar separately from the recovered key
+	pub fn save_adaptor(&mut self, id: &Identifier, secret: &SecretKey) -> Result<(), Error> {
+		self.write_secret(id, secret, ADAPTOR_PREFIX, b"atomic_adaptor")
+	}
+
+	/// Save the recovered counterparty secret
+	pub fn save_recovered_atomic_secret(
+		&mut self,
+		id: &Identifier,
+		secret: &SecretKey,
+	) -> Result<(), Error> {
+		self.write_secret(
+			id,
+			secret,
+			RECOVERED_ATOMIC_SECRET_PREFIX,
+			b"recovered_atomic_secret",
+		)
 	}
 
 	/// Delete the private context associated with the slate id.

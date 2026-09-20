@@ -234,7 +234,7 @@ where
 				height,
 				lock_height: 0,
 				is_coinbase: false,
-				is_multisig: slate.is_multisig(),
+				is_multisig: false,
 				tx_log_entry: Some(log_id),
 			})?;
 		}
@@ -637,12 +637,14 @@ where
 	C: NodeClient,
 	K: Keychain,
 {
-	let key_id = multisig_key_id.unwrap_or(parent_key_id);
 	Ok(wallet
 		.iter()?
 		.filter(|output| {
-			(output.root_key_id == *key_id || output.key_id == *key_id)
-				&& output.eligible_to_spend(current_height, minimum_confirmations)
+			let owned = match multisig_key_id {
+				Some(key_id) => output.is_multisig && output.key_id == *key_id,
+				None => !output.is_multisig && output.root_key_id == *parent_key_id,
+			};
+			owned && output.eligible_to_spend(current_height, minimum_confirmations)
 		})
 		.collect())
 }
@@ -991,7 +993,7 @@ where
 			"error creating final multisig proof".into(),
 		)))?;
 
-		let output = Output::new(OutputFeatures::Multisig, commit.clone(), proof);
+		let output = Output::new(OutputFeatures::Plain, commit.clone(), proof);
 		output.verify_proof()?;
 
 		// replace the multisig output's rangeproof with the finalized multisig proof
@@ -1116,7 +1118,7 @@ mod tests {
 	}
 
 	#[test]
-	fn covers_fee_with_multiple_outputs() {
+	fn combined_fees() {
 		global::set_local_accept_fee_base(1);
 		let coins = vec![output(20), output(20)];
 		let output_len = 1;

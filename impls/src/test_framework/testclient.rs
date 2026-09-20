@@ -336,18 +336,10 @@ where
 	) -> Result<WalletProxyMessage, libwallet::Error> {
 		let split = m.body.split(',').collect::<Vec<&str>>();
 		let excess = split[0].parse::<String>().unwrap();
-		let min = split[1].parse::<u64>().unwrap();
-		let max = split[2].parse::<u64>().unwrap();
+		let min = split[1].parse::<u64>().ok();
+		let max = split[2].parse::<u64>().ok();
 		let commit_bytes = util::from_hex(&excess).unwrap();
 		let commit = pedersen::Commitment::from_vec(commit_bytes);
-		let min = match min {
-			0 => None,
-			m => Some(m),
-		};
-		let max = match max {
-			0 => None,
-			m => Some(m),
-		};
 		let k = super::get_kernel_local(self.chain.clone(), &commit, min, max);
 		Ok(WalletProxyMessage {
 			sender_id: "node".to_owned(),
@@ -511,16 +503,14 @@ impl NodeClient for LocalWalletClient {
 		min_height: Option<u64>,
 		max_height: Option<u64>,
 	) -> Result<Option<(TxKernel, u64, u64)>, libwallet::Error> {
-		let mut query = format!("{},", excess.0.as_ref().to_hex());
+		let mut query = format!("{},", (&excess.0[..]).to_hex());
 		if let Some(h) = min_height {
 			query += &format!("{},", h);
 		} else {
-			query += "0,"
+			query += ","
 		}
 		if let Some(h) = max_height {
 			query += &format!("{}", h);
-		} else {
-			query += "0"
 		}
 
 		let m = WalletProxyMessage {
@@ -557,14 +547,7 @@ impl NodeClient for LocalWalletClient {
 		(
 			u64,
 			u64,
-			Vec<(
-				pedersen::Commitment,
-				pedersen::RangeProof,
-				bool,
-				bool,
-				u64,
-				u64,
-			)>,
+			Vec<(pedersen::Commitment, pedersen::RangeProof, bool, u64, u64)>,
 		),
 		libwallet::Error,
 	> {
@@ -593,26 +576,18 @@ impl NodeClient for LocalWalletClient {
 		let m = r.recv().unwrap();
 		let o: api::OutputListing = serde_json::from_str(&m.body).unwrap();
 
-		let mut api_outputs: Vec<(
-			pedersen::Commitment,
-			pedersen::RangeProof,
-			bool,
-			bool,
-			u64,
-			u64,
-		)> = Vec::new();
+		let mut api_outputs: Vec<(pedersen::Commitment, pedersen::RangeProof, bool, u64, u64)> =
+			Vec::new();
 
 		for out in o.outputs {
-			let (is_coinbase, is_multisig) = match out.output_type {
-				api::OutputType::Coinbase => (true, false),
-				api::OutputType::Transaction => (false, false),
-				api::OutputType::Multisig => (false, true),
+			let is_coinbase = match out.output_type {
+				api::OutputType::Coinbase => true,
+				api::OutputType::Transaction => false,
 			};
 			api_outputs.push((
 				out.commit,
 				out.range_proof().unwrap(),
 				is_coinbase,
-				is_multisig,
 				out.block_height.unwrap(),
 				out.mmr_index,
 			));

@@ -190,14 +190,7 @@ pub trait NodeClient: Send + Sync + Clone {
 		(
 			u64,
 			u64,
-			Vec<(
-				pedersen::Commitment,
-				pedersen::RangeProof,
-				bool,
-				bool,
-				u64,
-				u64,
-			)>,
+			Vec<(pedersen::Commitment, pedersen::RangeProof, bool, u64, u64)>,
 		),
 		Error,
 	>;
@@ -254,7 +247,7 @@ pub struct OutputData {
 	pub lock_height: u64,
 	/// Is this a coinbase output? Is it subject to coinbase locktime?
 	pub is_coinbase: bool,
-	/// Is this a multisig output?
+	/// Locally tracked shared ownership; the on-chain output is Plain
 	#[serde(default)]
 	pub is_multisig: bool,
 	/// Optional corresponding internal entry in tx entry log
@@ -1037,7 +1030,7 @@ mod tests {
 	}
 
 	#[test]
-	fn legacy_output_without_multisig_flag() {
+	fn legacy_output() {
 		let output = OutputData {
 			root_key_id: Identifier::zero(),
 			key_id: Identifier::zero(),

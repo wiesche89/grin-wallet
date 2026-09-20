@@ -55,13 +55,13 @@ pub struct SlateV5 {
 	pub off: BlindingFactor,
 	// Optional fields depending on state
 	/// The number of participants intended to take part in this transaction
-	#[serde(default = "default_num_participants_2")]
+	#[serde(default = "default_parts")]
 	#[serde(skip_serializing_if = "num_parts_is_2")]
 	pub num_parts: u8,
 	/// base amount (excluding fee)
 	#[serde(with = "secp_ser::string_or_u64")]
 	#[serde(skip_serializing_if = "u64_is_blank")]
-	#[serde(default = "default_u64_0")]
+	#[serde(default)]
 	pub amt: u64,
 	/// fee
 	#[serde(skip_serializing_if = "fee_is_zero")]
@@ -69,13 +69,13 @@ pub struct SlateV5 {
 	pub fee: FeeFields,
 	/// kernel features, if any
 	#[serde(skip_serializing_if = "u8_is_blank")]
-	#[serde(default = "default_u8_0")]
+	#[serde(default)]
 	pub feat: u8,
 	/// TTL, the block height at which wallets
 	/// should refuse to process the transaction and unlock all
 	#[serde(with = "secp_ser::string_or_u64")]
 	#[serde(skip_serializing_if = "u64_is_blank")]
-	#[serde(default = "default_u64_0")]
+	#[serde(default)]
 	pub ttl: u64,
 	// Structs always required
 	/// Participant data, each participant in the transaction will
@@ -84,26 +84,22 @@ pub struct SlateV5 {
 	pub sigs: Vec<ParticipantDataV5>,
 	// Situational, but required at some point in the tx
 	/// Inputs/Output commits added to slate
-	#[serde(default = "default_coms_none")]
+	#[serde(default)]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub coms: Option<Vec<CommitsV5>>,
 	// Optional Structs
 	/// Payment Proof
-	#[serde(default = "default_payment_none")]
+	#[serde(default)]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub proof: Option<PaymentInfoV5>,
 	/// Kernel features arguments
-	#[serde(default = "default_kernel_features_none")]
+	#[serde(default)]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub feat_args: Option<KernelFeaturesArgsV5>,
 	/// Multisig output identifier
-	#[serde(default = "default_multisig_id_none")]
+	#[serde(default)]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub multisig_key_id: Option<Identifier>,
-}
-
-fn default_payment_none() -> Option<PaymentInfoV5> {
-	None
 }
 
 fn default_offset_zero() -> BlindingFactor {
@@ -114,28 +110,12 @@ fn offset_is_zero(o: &BlindingFactor) -> bool {
 	*o == BlindingFactor::zero()
 }
 
-fn default_coms_none() -> Option<Vec<CommitsV5>> {
-	None
-}
-
-fn default_u64_0() -> u64 {
-	0
-}
-
 fn num_parts_is_2(n: &u8) -> bool {
 	*n == 2
 }
 
-fn default_num_participants_2() -> u8 {
+fn default_parts() -> u8 {
 	2
-}
-
-fn default_kernel_features_none() -> Option<KernelFeaturesArgsV5> {
-	None
-}
-
-fn default_multisig_id_none() -> Option<Identifier> {
-	None
 }
 
 /// Slate state definition
@@ -197,55 +177,35 @@ pub struct ParticipantDataV5 {
 	#[serde(with = "secp_ser::pubkey_serde")]
 	pub nonce: PublicKey,
 	/// Public key corresponding to atomic secret
-	#[serde(default = "default_atomic_none")]
+	#[serde(default)]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[serde(with = "secp_ser::option_pubkey_serde")]
 	pub atomic: Option<PublicKey>,
 	/// Public partial signature
-	#[serde(default = "default_part_sig_none")]
+	#[serde(default)]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[serde(with = "secp_ser::option_sig_serde")]
 	pub part: Option<Signature>,
 	/// Public partial commitment to multisig output value
-	#[serde(default = "default_part_com_none")]
+	#[serde(default)]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[serde(with = "secp_ser::option_commitment_serde")]
 	pub part_commit: Option<Commitment>,
 	/// Tau X key for shared outputs
-	#[serde(default = "default_tau_x_none")]
+	#[serde(default)]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[serde(with = "secp_ser::option_seckey_serde")]
 	pub tau_x: Option<SecretKey>,
 	/// Tau part one key for shared outputs
-	#[serde(default = "default_tau_part_none")]
+	#[serde(default)]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[serde(with = "secp_ser::option_pubkey_serde")]
 	pub tau_one: Option<PublicKey>,
 	/// Tau part two key for shared outputs
-	#[serde(default = "default_tau_part_none")]
+	#[serde(default)]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[serde(with = "secp_ser::option_pubkey_serde")]
 	pub tau_two: Option<PublicKey>,
-}
-
-fn default_atomic_none() -> Option<PublicKey> {
-	None
-}
-
-fn default_part_sig_none() -> Option<Signature> {
-	None
-}
-
-fn default_part_com_none() -> Option<Commitment> {
-	None
-}
-
-fn default_tau_x_none() -> Option<SecretKey> {
-	None
-}
-
-fn default_tau_part_none() -> Option<PublicKey> {
-	None
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
@@ -254,14 +214,10 @@ pub struct PaymentInfoV5 {
 	pub saddr: DalekPublicKey,
 	#[serde(with = "ser::dalek_pubkey_serde")]
 	pub raddr: DalekPublicKey,
-	#[serde(default = "default_receiver_signature_none")]
+	#[serde(default)]
 	#[serde(with = "ser::option_dalek_sig_serde")]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub rsig: Option<DalekSignature>,
-}
-
-fn default_receiver_signature_none() -> Option<DalekSignature> {
-	None
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -279,7 +235,7 @@ pub struct CommitsV5 {
 	/// A proof that the commitment is in the right range
 	/// Only applies for transaction outputs
 	#[serde(with = "ser::option_rangeproof_hex")]
-	#[serde(default = "default_range_proof")]
+	#[serde(default)]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub p: Option<RangeProof>,
 }
@@ -294,7 +250,7 @@ impl From<&Output> for CommitsV5 {
 	}
 }
 
-// This will need to be reworked once we no longer support input features with "commit only" inputs.
+// This will need to be reworked once we no longer support input features with "commit only" inputs
 impl From<&Input> for CommitsV5 {
 	fn from(input: &Input) -> CommitsV5 {
 		CommitsV5 {
@@ -314,7 +270,18 @@ fn output_feature_is_plain(o: &OutputFeaturesV5) -> bool {
 }
 
 #[derive(Serialize, Deserialize, Copy, Debug, Clone, PartialEq, Eq)]
+#[serde(try_from = "u8")]
 pub struct OutputFeaturesV5(pub u8);
+
+impl std::convert::TryFrom<u8> for OutputFeaturesV5 {
+	type Error = &'static str;
+	fn try_from(value: u8) -> Result<Self, Self::Error> {
+		match value {
+			0 | 1 => Ok(Self(value)),
+			_ => Err("Unsupported output feature"),
+		}
+	}
+}
 
 pub fn sig_is_blank(s: &secp::Signature) -> bool {
 	for b in s.to_raw_data().iter() {
@@ -325,16 +292,8 @@ pub fn sig_is_blank(s: &secp::Signature) -> bool {
 	true
 }
 
-fn default_range_proof() -> Option<RangeProof> {
-	None
-}
-
 fn u64_is_blank(u: &u64) -> bool {
 	*u == 0
-}
-
-fn default_u8_0() -> u8 {
-	0
 }
 
 fn u8_is_blank(u: &u8) -> bool {
@@ -349,7 +308,7 @@ fn default_fee() -> FeeFields {
 	FeeFields::zero()
 }
 
-/// A mining node requests new coinbase via the foreign api every time a new candidate block is built.
+/// A mining node requests new coinbase via the foreign api every time a new candidate block is built
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CoinbaseV5 {
 	/// Output
@@ -416,4 +375,20 @@ struct CbKernelV5 {
 	excess: Commitment,
 	#[serde(with = "secp_ser::sig_serde")]
 	excess_sig: secp::Signature,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::OutputFeaturesV5;
+
+	#[test]
+	fn output_features_reject_non_consensus_values() {
+		for feature in [0, 1] {
+			let json = serde_json::to_string(&OutputFeaturesV5(feature)).unwrap();
+			let decoded: OutputFeaturesV5 = serde_json::from_str(&json).unwrap();
+			assert_eq!(decoded.0, feature);
+		}
+		assert!(serde_json::from_str::<OutputFeaturesV5>("2").is_err());
+		assert!(serde_json::from_str::<OutputFeaturesV5>("255").is_err());
+	}
 }

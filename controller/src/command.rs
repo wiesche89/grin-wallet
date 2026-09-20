@@ -30,6 +30,7 @@ use crate::libwallet::{
 use crate::util::secp::key::SecretKey;
 use crate::util::{Mutex, ZeroingString};
 use crate::{controller, display};
+use grin_util::ToHex;
 
 use qr_code::QrCode;
 use serde_json as json;
@@ -326,6 +327,7 @@ pub struct SendArgs {
 	pub is_multisig: Option<bool>,
 	pub derive_path: Option<u32>,
 	pub multisig_path: Option<String>,
+	pub refund_height: Option<u64>,
 	pub bridge: Option<String>,
 	pub slatepack_qr: bool,
 }
@@ -403,6 +405,7 @@ where
 					estimate_only: Some(true),
 					is_multisig: args.is_multisig,
 					multisig_path: args.multisig_path.clone(),
+					refund_height: args.refund_height,
 					..Default::default()
 				};
 				let result = init(init_args.clone());
@@ -450,6 +453,7 @@ where
 			late_lock: Some(args.late_lock),
 			is_multisig: args.is_multisig,
 			multisig_path: args.multisig_path.clone(),
+			refund_height: args.refund_height,
 			..Default::default()
 		};
 		let init_send_tx = |init_args: InitTxArgs| -> Result<Slate, libwallet::Error> {
@@ -1089,6 +1093,31 @@ pub struct RecoverAtomicArgs {
 	pub outfile: Option<String>,
 }
 
+/// Execute a swap request from a local JSON file
+pub fn swap<L, C, K>(
+	owner_api: &mut Owner<L, C, K>,
+	mask: Option<&SecretKey>,
+	path: &str,
+) -> Result<(), Error>
+where
+	L: WalletLCProvider<'static, C, K>,
+	C: NodeClient + 'static,
+	K: keychain::Keychain + 'static,
+{
+	let bytes = std::fs::read(path).map_err(|e| Error::ArgumentError(e.to_string()))?;
+	if bytes.len() > 4 * 1024 * 1024 {
+		return Err(Error::ArgumentError("swap request too large".into()));
+	}
+	let request =
+		serde_json::from_slice(&bytes).map_err(|e| Error::ArgumentError(e.to_string()))?;
+	let reply = owner_api.swap(mask, request)?;
+	println!(
+		"{}",
+		serde_json::to_string_pretty(&reply).map_err(|e| Error::ArgumentError(e.to_string()))?
+	);
+	Ok(())
+}
+
 /// Recover the atomic secret from an adaptor signature and kernel excess signature
 pub fn recover_atomic_secret<L, C, K>(
 	owner_api: &mut Owner<L, C, K>,
@@ -1155,8 +1184,9 @@ where
 			let result =
 				api.get_atomic_secrets(m, args.id, (args.amount * (10_u64.pow(9) as f64)) as u64);
 			match result {
-				Ok(_) => {
-					info!("Atomic nonces recovered successfully.");
+				Ok((local, recovered)) => {
+					println!("Local atomic secret: {}", local.to_hex());
+					println!("Recovered atomic secret: {}", recovered.to_hex());
 					Ok(())
 				}
 				Err(e) => {

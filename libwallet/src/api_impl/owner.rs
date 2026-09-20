@@ -966,7 +966,7 @@ where
 		let mut batch = w.batch(keychain_mask)?;
 		let commit = Some(commit_sum.0.to_vec().to_hex());
 		batch.save(OutputData {
-			root_key_id: key_id.clone(),
+			root_key_id: context.parent_key_id.clone(),
 			key_id: key_id.clone(),
 			mmr_index: None,
 			n_child: key_id.to_path().last_path_index(),
@@ -1084,14 +1084,19 @@ where
 
 		slate.fill_round_1(&keychain, &mut context)?;
 
-		// Create a height_lock kernel, with a lock_height set to an
-		// arbitrary amount of blocks in the future
-		//
-		// FIXME: add option to specify the lock_height?
+		let lock_height = match args.refund_height {
+			Some(height) => height,
+			None => height
+				.checked_add(60)
+				.ok_or_else(|| Error::GenericError("refund height overflow".into()))?,
+		};
+		if lock_height <= height {
+			return Err(Error::GenericError(
+				"refund height must be in the future".into(),
+			));
+		}
 		slate.kernel_features = 2;
-		slate.kernel_features_args = Some(KernelFeaturesArgs {
-			lock_height: height + 60,
-		});
+		slate.kernel_features_args = Some(KernelFeaturesArgs { lock_height });
 
 		context
 	} else {
@@ -1129,11 +1134,11 @@ where
 ///
 /// In this round, the adaptor signature from round
 /// two is saved, and the counterparty completes their
-/// half of the kernel signature.
+/// half of the kernel signature
 ///
-/// For the refund transaction, the receiver is the counterparty.
+/// For the refund transaction, the receiver is the counterparty
 ///
-/// For the main transaction, the sender is the counterparty.
+/// For the main transaction, the sender is the counterparty
 pub fn countersign_atomic_swap<C, K>(
 	w: &mut WalletBackend<C, K>,
 	slate: &Slate,
@@ -1143,40 +1148,21 @@ where
 	C: NodeClient,
 	K: Keychain,
 {
+	if let Some(saved) = w.begin_round(keychain_mask, slate, 3)? {
+		return Ok(saved);
+	}
 	let mut ret_slate = slate.clone();
 	check_ttl(w, &ret_slate)?;
 
-	let mut context = w.get_private_context(keychain_mask, ret_slate.id.as_bytes())?;
+	let context = w.get_private_context(keychain_mask, ret_slate.id.as_bytes())?;
 
 	let keychain = w.keychain(keychain_mask)?;
-	// Save `s` from the adaptor signature to be able to extract the
-	// atomic secret using the full signature
-	//
-	// This is the atomic secret used to recover funds on the other chain
-	let adaptor_sig = ret_slate.fill_round_3_atomic(&keychain, &mut context)?;
-	let atomic_secret = SecretKey::from_slice(keychain.secp(), &adaptor_sig.as_ref()[32..])?;
-
-	{
-		let atomic_id = w.next_atomic_id(keychain_mask)?;
-		let atomic =
-			keychain.derive_key(slate.amount, &atomic_id, SwitchCommitmentType::Regular)?;
-		let pub_atomic = PublicKey::from_secret_key(keychain.secp(), &atomic)?;
-
-		debug!(
-			"Your public atomic key: {}",
-			pub_atomic
-				.serialize_vec(keychain.secp(), true)
-				.as_ref()
-				.to_hex()
-		);
-		debug!("Use this key to lock funds on the other chain.\n");
-
-		let mut batch = w.batch(keychain_mask)?;
-		batch.save_recovered_atomic_secret(&atomic_id, &atomic_secret)?;
-		let atomic_idx = Slate::atomic_id_to_int(&atomic_id)?;
-		batch.save_used_atomic_index(&slate.id, atomic_idx)?;
-		batch.commit()?;
-	}
+	let adaptor = ret_slate.fill_round_3_atomic(&keychain, &context)?;
+	let scalar = SecretKey::from_slice(keychain.secp(), &adaptor.as_ref()[32..])?;
+	let atomic_id = match w.find_used_atomic_id(&slate.id)? {
+		Some(id) => id,
+		None => w.next_atomic_id(keychain_mask)?,
+	};
 
 	ret_slate.adjust_offset(&keychain, &context)?;
 
@@ -1185,6 +1171,11 @@ where
 	}
 
 	ret_slate.state = SlateState::Atomic3;
+	let mut batch = w.batch(keychain_mask)?;
+	batch.save_adaptor(&atomic_id, &scalar)?;
+	batch.save_used_atomic_index(&slate.id, Slate::atomic_id_to_int(&atomic_id)?)?;
+	batch.save_round(slate, 3, Some(&ret_slate))?;
+	batch.commit()?;
 
 	Ok(ret_slate)
 }
@@ -1324,6 +1315,9 @@ where
 	C: NodeClient,
 	K: Keychain,
 {
+	if let Some(saved) = w.begin_round(keychain_mask, slate, 4)? {
+		return Ok(saved);
+	}
 	let mut ret_slate = slate.clone();
 	check_ttl(w, &ret_slate)?;
 	let mut context = w.get_private_context(keychain_mask, ret_slate.id.as_bytes())?;
@@ -1363,6 +1357,9 @@ where
 
 	ret_slate.state = SlateState::Atomic4;
 	ret_slate.amount = 0;
+	let mut batch = w.batch(keychain_mask)?;
+	batch.save_round(slate, 4, Some(&ret_slate))?;
+	batch.commit()?;
 
 	Ok(ret_slate)
 }
@@ -2058,17 +2055,12 @@ where
 	let w = w_lock.lc_provider()?.wallet_inst()?;
 	let mut client = w.w2n_client().clone();
 	let keychain = w.keychain(keychain_mask)?;
-	if let Some((kernel, _, _)) = client.get_kernel(
-		&slate.calc_excess(keychain.secp())?,
-		Some(slate.ttl_cutoff_height.saturating_sub(60)),
-		Some(slate.ttl_cutoff_height),
-	)? {
-		let atomic = tx::recover_atomic_secret(w, keychain_mask, slate, &kernel)?;
+	if let Some((kernel, _, _)) =
+		client.get_kernel(&slate.calc_excess(keychain.secp())?, None, None)?
+	{
+		tx::recover_atomic_secret(w, keychain_mask, slate, &kernel)?;
 		let atomic_id = w.get_used_atomic_id(&slate.id)?;
 		info!("Saving atomic secret with atomic ID: {}, use with `get_atomic_secrets` to retrieve from storage", Slate::atomic_id_to_int(&atomic_id)?);
-		let mut batch = w.batch(keychain_mask)?;
-		batch.save_recovered_atomic_secret(&atomic_id, &atomic)?;
-		batch.commit()?;
 		Ok(atomic_id)
 	} else {
 		Err(

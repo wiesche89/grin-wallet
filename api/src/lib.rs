@@ -41,6 +41,7 @@ mod foreign_rpc;
 
 mod owner;
 mod owner_rpc;
+pub mod swap;
 
 mod tor_config;
 mod types;

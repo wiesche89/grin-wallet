@@ -296,8 +296,8 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	];
 	execute_command(&app, test_dir, "wallet2", &client2, arg_vec.clone())?;
 
-	// shouldn't be allowed to receive twice
-	assert!(execute_command(&app, test_dir, "wallet2", &client2, arg_vec).is_err());
+	// A repeated message returns the saved response
+	execute_command(&app, test_dir, "wallet2", &client2, arg_vec)?;
 
 	let file_name = format!(
 		"{}/wallet2/slatepack/0436430c-2b02-624c-2032-570501212b01.A2.slatepack",
@@ -369,8 +369,8 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 	];
 	execute_command(&app, test_dir, "wallet1", &client1, arg_vec.clone())?;
 
-	// shouldn't be allowed to receive twice
-	assert!(execute_command(&app, test_dir, "wallet1", &client1, arg_vec).is_err());
+	// A repeated message returns the saved response
+	execute_command(&app, test_dir, "wallet1", &client1, arg_vec)?;
 
 	let file_name = format!(
 		"{}/wallet1/slatepack/0436430c-2b02-624c-2032-570501212b02.A2.slatepack",

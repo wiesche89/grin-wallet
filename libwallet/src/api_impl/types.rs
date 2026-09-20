@@ -99,6 +99,9 @@ pub struct InitTxArgs {
 	pub is_multisig: Option<bool>,
 	/// BIP32 path for the multisig output spent in an atomic swap transaction
 	pub multisig_path: Option<String>,
+	/// Earliest Grin block for a refund
+	#[serde(default)]
+	pub refund_height: Option<u64>,
 }
 
 /// Send TX API Args, for convenience functionality that inits the transaction and sends
@@ -134,6 +137,7 @@ impl Default for InitTxArgs {
 			send_args: None,
 			is_multisig: None,
 			multisig_path: None,
+			refund_height: None,
 		}
 	}
 }

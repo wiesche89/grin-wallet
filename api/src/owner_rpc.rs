@@ -47,6 +47,13 @@ use std::time::Duration;
 
 #[easy_jsonrpc_mw::rpc]
 pub trait OwnerRpc {
+	/// Execute one persisted cross-chain swap operation
+	fn swap(
+		&self,
+		token: Token,
+		request: crate::swap::Request,
+	) -> Result<crate::swap::Reply, Error>;
+
 	/**
 	Networked version of [Owner::accounts](struct.Owner.html#method.accounts).
 
@@ -619,7 +626,7 @@ pub trait OwnerRpc {
 	) -> Result<VersionedSlate, Error>;
 
 	/**
-	Networked version of [Owner::process_invoice_tx](struct.Owner.html#method.process_invoice_tx).
+	Networked version of [Owner::process_invoice_tx](struct.Owner.html#method.process_invoice_tx)
 
 	```
 		# grin_wallet_api::doctest_helper_json_rpc_owner_assert_response!(
@@ -704,7 +711,7 @@ pub trait OwnerRpc {
 	) -> Result<VersionedSlate, Error>;
 
 	/**
-	Networked version of [Owner::process_multisig_tx](struct.Owner.html#method.process_multisig_tx).
+	Networked version of [Owner::process_multisig_tx](struct.Owner.html#method.process_multisig_tx)
 
 	# Json rpc example
 
@@ -819,7 +826,7 @@ pub trait OwnerRpc {
 	fn tx_lock_outputs(&self, token: Token, slate: VersionedSlate) -> Result<(), Error>;
 
 	/**
-	;Networked version of [Owner::init_atomic_swap](struct.Owner.html#method.init_atomic_swap).
+	;Networked version of [Owner::init_atomic_swap](struct.Owner.html#method.init_atomic_swap)
 
 	```
 		# grin_wallet_api::doctest_helper_json_rpc_owner_assert_response!(
@@ -876,7 +883,7 @@ pub trait OwnerRpc {
 	fn init_atomic_swap(&self, token: Token, args: InitTxArgs) -> Result<VersionedSlate, Error>;
 
 	/**
-		Networked version of [Owner::countersign_atomic_swap](struct.Owner.html#method.countersign_atomic_swap).
+		Networked version of [Owner::countersign_atomic_swap](struct.Owner.html#method.countersign_atomic_swap)
 
 		```
 		# grin_wallet_api::doctest_helper_json_rpc_owner_assert_response!(
@@ -966,6 +973,13 @@ pub trait OwnerRpc {
 		token: Token,
 		slate: VersionedSlate,
 		r_addr: Option<String>,
+	) -> Result<VersionedSlate, Error>;
+
+	/// Finalize an atomic claim or refund without publishing it
+	fn finalize_atomic_swap(
+		&self,
+		token: Token,
+		slate: VersionedSlate,
 	) -> Result<VersionedSlate, Error>;
 
 	/**
@@ -2307,6 +2321,14 @@ where
 	C: NodeClient + 'static,
 	K: Keychain + 'static,
 {
+	fn swap(
+		&self,
+		token: Token,
+		request: crate::swap::Request,
+	) -> Result<crate::swap::Reply, Error> {
+		Owner::swap(self, token.keychain_mask.as_ref(), request)
+	}
+
 	fn accounts(&self, token: Token) -> Result<Vec<AcctPathMapping>, Error> {
 		Owner::accounts(self, (&token.keychain_mask).as_ref())
 	}
@@ -2458,6 +2480,20 @@ where
 			Owner::countersign_atomic_swap(self, &slate, (&token.keychain_mask).as_ref(), r_addr)?;
 		let v = out_slate.version();
 		Ok(VersionedSlate::into_version(out_slate, v)?)
+	}
+
+	fn finalize_atomic_swap(
+		&self,
+		token: Token,
+		in_slate: VersionedSlate,
+	) -> Result<VersionedSlate, Error> {
+		let slate = Owner::finalize_atomic_swap(
+			self,
+			token.keychain_mask.as_ref(),
+			&Slate::from(in_slate),
+		)?;
+		let version = slate.version();
+		VersionedSlate::into_version(slate, version)
 	}
 
 	fn finalize_tx(&self, token: Token, in_slate: VersionedSlate) -> Result<VersionedSlate, Error> {

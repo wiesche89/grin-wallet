@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::grin_core::consensus::header_version;
 use crate::grin_keychain::{Identifier, Keychain, SwitchCommitmentType};
-use crate::grin_util::secp::key::SecretKey;
+use crate::grin_util::secp::key::{PublicKey, SecretKey};
 use crate::grin_util::secp::pedersen;
 use crate::grin_util::Mutex;
 use crate::internal::{selection, updater};
@@ -490,6 +490,27 @@ where
 	let keychain = wallet.keychain(keychain_mask)?;
 	let secp = keychain.secp();
 
+	tx_kernel.verify()?;
+	if tx_kernel.excess != slate.calc_excess(secp)? {
+		return Err(Error::Signature("atomic kernel mismatch".into()));
+	}
+	let mut points = slate
+		.participant_data
+		.iter()
+		.filter_map(|p| p.public_atomic.as_ref());
+	let point = points
+		.next()
+		.ok_or_else(|| Error::Signature("missing atomic key".into()))?;
+	if points.next().is_some() {
+		return Err(Error::Signature("ambiguous atomic key".into()));
+	}
+	let atomic_id = wallet.get_used_atomic_id(&slate.id)?;
+	let saved = wallet.find_recovered_atomic_secret(keychain_mask, &atomic_id)?;
+	if let Some(ref secret) = saved {
+		if PublicKey::from_secret_key(secp, secret)? == *point {
+			return Ok(secret.clone());
+		}
+	}
 	let context = wallet.get_private_context(keychain_mask, slate.id.as_bytes())?;
 
 	let pdata_idx = slate.find_participant_data_index(secp, &context)?;
@@ -508,8 +529,11 @@ where
 	// signature from the full signature
 	let mut sp_s = SecretKey::from_slice(secp, &part_sig.as_ref()[32..])?;
 	// The atomic_secret contains sr' from the responder's adaptor signature
-	let atomic_id = wallet.get_used_atomic_id(&slate.id)?;
-	let mut srp = wallet.get_recovered_atomic_secret(keychain_mask, &atomic_id)?;
+	// Older wallets stored the adaptor scalar in the recovered-key slot
+	let mut srp = wallet
+		.get_adaptor(keychain_mask, &atomic_id)?
+		.or(saved)
+		.ok_or_else(|| Error::Signature("missing adaptor signature".into()))?;
 
 	// Subtract the initiator's partial signature from the full signature
 	sp_s.neg_assign(secp)?;
@@ -521,12 +545,14 @@ where
 	sr.neg_assign(secp)?;
 	srp.add_assign(secp, &sr)?;
 
-	{
-		// No longer need to keep the slate around, clean up
-		let mut batch = wallet.batch(keychain_mask)?;
-		batch.delete_private_context(slate.id.as_bytes())?;
+	if PublicKey::from_secret_key(secp, &srp)? != *point {
+		return Err(Error::Signature("recovered atomic key mismatch".into()));
 	}
 
+	let mut batch = wallet.batch(keychain_mask)?;
+	batch.save_recovered_atomic_secret(&atomic_id, &srp)?;
+	batch.delete_private_context(slate.id.as_bytes())?;
+	batch.commit()?;
 	Ok(srp)
 }
 

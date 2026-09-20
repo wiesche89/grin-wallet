@@ -147,7 +147,7 @@ impl From<VersionedBinSlate> for VersionedSlate {
 /// Versions are ordered newest to oldest so serde attempts to
 /// deserialize newer versions first, then falls back to older versions.
 pub enum VersionedCoinbase {
-	/// Next supported coinbase version.
+	/// Next supported coinbase version
 	V5(CoinbaseV5),
 	/// Current supported coinbase version.
 	V4(CoinbaseV4),

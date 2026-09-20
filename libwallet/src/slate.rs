@@ -31,7 +31,7 @@ use crate::grin_keychain::{
 use crate::grin_util::secp::key::{PublicKey, SecretKey};
 use crate::grin_util::secp::pedersen::Commitment;
 use crate::grin_util::secp::Signature;
-use crate::grin_util::{secp, static_secp_instance, ToHex};
+use crate::grin_util::{secp, static_secp_instance};
 use ed25519_dalek::Signature as DalekSignature;
 use ed25519_dalek::VerifyingKey as DalekPublicKey;
 use serde::ser::{Serialize, Serializer};
@@ -523,7 +523,6 @@ impl Slate {
 			keychain.secp(),
 			sec_key,
 			sec_nonce,
-			None,
 			&self.pub_nonce_sum(keychain.secp())?,
 			Some(&self.pub_blind_sum(keychain.secp())?),
 			&self.msg_to_sign()?,
@@ -549,11 +548,13 @@ impl Slate {
 		K: Keychain,
 	{
 		let secp = keychain.secp();
-		let part_sig = aggsig::calculate_partial_sig(
+		let part_sig = aggsig::calculate_partial_sig_with_adaptor(
 			secp,
 			&context.sec_key,
 			&context.sec_nonce,
-			context.get_secret_atomic(),
+			context
+				.get_secret_atomic()
+				.ok_or_else(|| Error::Signature("Missing atomic secret".into()))?,
 			&self.pub_nonce_sum(secp)?,
 			Some(&self.pub_blind_sum(secp)?),
 			&self.msg_to_sign()?,
@@ -564,61 +565,54 @@ impl Slate {
 		Ok(())
 	}
 
-	/// Verify the receiver's adaptor signature, and create the sender's partial signature
-	pub fn fill_round_3_atomic<K>(
+	/// Verify the receiver's adaptor signature without releasing our signature
+	pub fn verify_adaptor<K: Keychain>(
+		&self,
+		keychain: &K,
+		context: &Context,
+	) -> Result<Signature, Error> {
+		let secp = keychain.secp();
+		let ours = self.find_participant_data_index(secp, context)?;
+		let other = self.find_other_participant_data_index(ours)?;
+		let data = &self.participant_data[other];
+		let signature = data
+			.part_sig
+			.ok_or_else(|| Error::Signature("missing adaptor signature".into()))?;
+		let key = data
+			.public_atomic
+			.as_ref()
+			.ok_or_else(|| Error::Signature("missing atomic key".into()))?;
+		aggsig::verify_partial_sig_with_adaptor(
+			secp,
+			&signature,
+			&self.pub_nonce_sum(secp)?,
+			key,
+			&data.public_blind_excess,
+			Some(&self.pub_blind_sum(secp)?),
+			&self.msg_to_sign()?,
+		)?;
+		Ok(signature)
+	}
+
+	/// Verify the adaptor and create the sender's partial signature
+	pub fn fill_round_3_atomic<K: Keychain>(
 		&mut self,
 		keychain: &K,
 		context: &Context,
-	) -> Result<Signature, Error>
-	where
-		K: Keychain,
-	{
+	) -> Result<Signature, Error> {
+		let adaptor = self.verify_adaptor(keychain, context)?;
 		let secp = keychain.secp();
-		let pdata_idx = self.find_participant_data_index(secp, context)?;
-		let opdata_idx = self.find_other_participant_data_index(pdata_idx)?;
-		let part_sig = &self.participant_data[opdata_idx].part_sig.ok_or::<Error>(
-			Error::Signature("Missing round 2 atomic swap adaptor signature".into()).into(),
-		)?;
-		let msg = self.msg_to_sign()?;
-		let nonce_sum = self.pub_nonce_sum(secp)?;
-		let key_sum = self.pub_blind_sum(secp)?;
-		let pub_atomic = self.participant_data[opdata_idx]
-			.public_atomic
-			.as_ref()
-			.ok_or(Error::from(Error::GenericError(
-				"Missing atomic public key".into(),
-			)))?;
-
-		debug!(
-			"Other party's atomic public key: {}",
-			pub_atomic.serialize_vec(secp, true).as_ref().to_hex()
-		);
-		debug!("Validate against the key used to lock funds on the other chain.\n");
-
-		aggsig::verify_partial_sig(
-			secp,
-			part_sig,
-			&nonce_sum,
-			self.participant_data[opdata_idx].public_atomic.as_ref(),
-			&self.participant_data[opdata_idx].public_blind_excess,
-			Some(&key_sum),
-			&msg,
-		)?;
-
-		let a_part_sig = aggsig::calculate_partial_sig(
+		let ours = self.find_participant_data_index(secp, context)?;
+		let signature = aggsig::calculate_partial_sig(
 			secp,
 			&context.sec_key,
 			&context.sec_nonce,
-			None,
-			&nonce_sum,
-			Some(&key_sum),
-			&msg,
+			&self.pub_nonce_sum(secp)?,
+			Some(&self.pub_blind_sum(secp)?),
+			&self.msg_to_sign()?,
 		)?;
-
-		self.participant_data[pdata_idx].part_sig = Some(a_part_sig);
-
-		// return the receiver's adaptor signature from round 2
-		Ok((*part_sig).clone())
+		self.participant_data[ours].part_sig = Some(signature);
+		Ok(adaptor)
 	}
 
 	/// Finalize the atomic swap transaction, return the receiver's partial signature
@@ -636,7 +630,6 @@ impl Slate {
 			secp,
 			&context.sec_key,
 			&context.sec_nonce,
-			None,
 			&self.pub_nonce_sum(secp)?,
 			Some(&self.pub_blind_sum(secp)?),
 			&self.msg_to_sign()?,
@@ -825,7 +818,6 @@ impl Slate {
 					secp,
 					p.part_sig.as_ref().unwrap(),
 					&self.pub_nonce_sum(secp)?,
-					None,
 					&p.public_blind_excess,
 					Some(&self.pub_blind_sum(secp)?),
 					&self.msg_to_sign()?,
@@ -1415,7 +1407,6 @@ impl From<OutputFeatures> for OutputFeaturesV4 {
 		let index = match of {
 			OutputFeatures::Plain => 0,
 			OutputFeatures::Coinbase => 1,
-			OutputFeatures::Multisig => 2,
 		};
 		OutputFeaturesV4(index)
 	}
@@ -1426,7 +1417,6 @@ impl From<OutputFeatures> for OutputFeaturesV5 {
 		let index = match of {
 			OutputFeatures::Plain => 0,
 			OutputFeatures::Coinbase => 1,
-			OutputFeatures::Multisig => 2,
 		};
 		OutputFeaturesV5(index)
 	}
@@ -1538,6 +1528,8 @@ pub fn tx_from_slate_v4(slate: &SlateV4) -> Option<Transaction> {
 	let secp = secp.lock();
 	let mut calc_slate = Slate::blank(2, TxFlow::Standard);
 	calc_slate.fee_fields = slate.fee;
+	calc_slate.kernel_features = slate.feat;
+	calc_slate.kernel_features_args = slate.feat_args.as_ref().map(KernelFeaturesArgs::from);
 	for d in slate.sigs.iter() {
 		calc_slate.participant_data.push(ParticipantData {
 			public_blind_excess: d.xs,
@@ -1559,17 +1551,7 @@ pub fn tx_from_slate_v4(slate: &SlateV4) -> Option<Transaction> {
 		Err(_) => Signature::from_raw_data(&[0; 64]).unwrap(),
 	};
 	let kernel = TxKernel {
-		features: match slate.feat {
-			0 => KernelFeatures::Plain { fee: slate.fee },
-			1 => KernelFeatures::HeightLocked {
-				fee: slate.fee,
-				lock_height: match slate.feat_args.as_ref() {
-					Some(a) => a.lock_hgt,
-					None => 0,
-				},
-			},
-			_ => KernelFeatures::Plain { fee: slate.fee },
-		},
+		features: calc_slate.kernel_features().ok()?,
 		excess,
 		excess_sig,
 	};
@@ -1609,6 +1591,8 @@ pub fn tx_from_slate_v5(slate: &SlateV5) -> Option<Transaction> {
 	let secp = secp.lock();
 	let mut calc_slate = Slate::blank(2, TxFlow::Standard);
 	calc_slate.fee_fields = slate.fee;
+	calc_slate.kernel_features = slate.feat;
+	calc_slate.kernel_features_args = slate.feat_args.as_ref().map(KernelFeaturesArgs::from);
 	for d in slate.sigs.iter() {
 		calc_slate.participant_data.push(ParticipantData {
 			public_blind_excess: d.xs,
@@ -1630,17 +1614,7 @@ pub fn tx_from_slate_v5(slate: &SlateV5) -> Option<Transaction> {
 		Err(_) => Signature::from_raw_data(&[0; 64]).unwrap(),
 	};
 	let kernel = TxKernel {
-		features: match slate.feat {
-			0 => KernelFeatures::Plain { fee: slate.fee },
-			1 => KernelFeatures::HeightLocked {
-				fee: slate.fee,
-				lock_height: match slate.feat_args.as_ref() {
-					Some(a) => a.lock_hgt,
-					None => 0,
-				},
-			},
-			_ => KernelFeatures::Plain { fee: slate.fee },
-		},
+		features: calc_slate.kernel_features().ok()?,
 		excess,
 		excess_sig,
 	};
@@ -1871,7 +1845,6 @@ impl From<OutputFeaturesV4> for OutputFeatures {
 impl From<OutputFeaturesV5> for OutputFeatures {
 	fn from(of: OutputFeaturesV5) -> OutputFeatures {
 		match of.0 {
-			2 => OutputFeatures::Multisig,
 			1 => OutputFeatures::Coinbase,
 			0 | _ => OutputFeatures::Plain,
 		}

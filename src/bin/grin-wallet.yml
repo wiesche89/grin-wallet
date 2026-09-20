@@ -340,6 +340,11 @@ subcommands:
             help: Create an atomic swap refund transaction
             short: r
             long: refund
+        - refund_height:
+            help: Earliest Grin block for a refund
+            long: refund_height
+            takes_value: true
+            requires: refund
         - amount:
             help: Number of coins to send with optional fraction, e.g. 12.423
             index: 1
@@ -459,6 +464,15 @@ subcommands:
             short: u
             long: outfile
             takes_value: true
+  - swap:
+      about: Advance a persisted cross-chain swap using an owner request
+      args:
+        - input:
+            help: JSON swap request file
+            short: i
+            long: input
+            takes_value: true
+            required: true
   - recover_atomic_secret:
       about: Processes a Slatepack Message to recover an atomic secret for recovering funds on the other chain.
       args:

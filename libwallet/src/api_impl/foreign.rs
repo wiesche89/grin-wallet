@@ -160,6 +160,9 @@ where
 	C: NodeClient,
 	K: Keychain,
 {
+	if let Some(saved) = w.begin_round(keychain_mask, slate, 2)? {
+		return Ok(saved);
+	}
 	let mut ret_slate = slate.clone();
 	check_ttl(w, &ret_slate)?;
 	let parent_key_id = match dest_acct_name {
@@ -189,15 +192,22 @@ where
 
 	ret_slate.tx = Some(Slate::empty_transaction());
 
-	let height = w.last_confirmed_height()?;
 	let keychain = w.keychain(keychain_mask)?;
 
 	let is_height_lock = ret_slate.kernel_features == 2;
-	// derive atomic nonce from the slate's `atomic_id`
+	let height = if is_height_lock {
+		w.w2n_client().get_chain_tip()?.0
+	} else {
+		w.last_confirmed_height()?
+	};
+	// Fresh secrets prevent reuse after restoring a seed without its wallet database
 	let (atomic_id, atomic_secret) = {
 		let atomic_id = w.next_atomic_id(keychain_mask)?;
-		let atomic =
-			keychain.derive_key(ret_slate.amount, &atomic_id, SwitchCommitmentType::Regular)?;
+		let atomic = if use_test_rng {
+			keychain.derive_key(ret_slate.amount, &atomic_id, SwitchCommitmentType::Regular)?
+		} else {
+			SecretKey::new(keychain.secp(), &mut rand::thread_rng())
+		};
 
 		let pub_atomic = PublicKey::from_secret_key(keychain.secp(), &atomic)?;
 
@@ -213,7 +223,6 @@ where
 		(atomic_id, Some(atomic))
 	};
 
-	let min_confirmations = if use_test_rng { 0 } else { 10 };
 	let (input_ids, output_ids) = if is_height_lock {
 		// add input(s) and change output to slate
 		let ctx = tx::add_inputs_to_atomic_slate(
@@ -221,7 +230,7 @@ where
 			keychain_mask,
 			&mut ret_slate,
 			height,
-			min_confirmations,
+			0,    // Refunds must be signed before funding is published
 			500,  // max_outputs
 			1,    // num_change_outputs
 			true, // selection_strategy_is_use_all
@@ -248,6 +257,10 @@ where
 	{
 		let atomic_idx = Slate::atomic_id_to_int(&atomic_id)?;
 		let mut batch = w.batch(keychain_mask)?;
+		batch.save_atomic_secret(
+			&atomic_id,
+			context.get_secret_atomic().ok_or(Error::SlateState)?,
+		)?;
 		batch.save_used_atomic_index(&ret_slate.id, atomic_idx)?;
 		batch.commit()?;
 	}
@@ -264,6 +277,9 @@ where
 	}
 
 	ret_slate.state = SlateState::Atomic2;
+	let mut batch = w.batch(keychain_mask)?;
+	batch.save_round(slate, 2, Some(&ret_slate))?;
+	batch.commit()?;
 
 	Ok(ret_slate)
 }
