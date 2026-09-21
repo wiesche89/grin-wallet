@@ -87,6 +87,7 @@ fn no_change_test_impl(test_dir: &'static str) -> Result<(), libwallet::Error> {
 			let args = InitTxArgs {
 				src_acct_name: None,
 				amount: reward - fee,
+				ttl_blocks: Some(2),
 				minimum_confirmations: 2,
 				max_outputs: 500,
 				num_change_outputs: 1,
@@ -103,8 +104,12 @@ fn no_change_test_impl(test_dir: &'static str) -> Result<(), libwallet::Error> {
 			Ok(())
 		},
 	)?;
-	let confirmed_height = chain.head().unwrap().height;
 
+	let confirmed_height = chain.head().unwrap().height;
+	// Keep mined no-change transactions confirmed after TTL expiry
+	test_framework::award_blocks_to_wallet(&chain, wallet1.clone(), mask1, 2, false)?;
+	assert_ne!(slate.ttl_cutoff_height, 0);
+	assert!(chain.head().unwrap().height >= slate.ttl_cutoff_height);
 	// ensure stored excess is correct in both wallets
 	// Wallet 1 calculated the excess with the full slate // Wallet 2 only had the excess provided by
 	// wallet 1

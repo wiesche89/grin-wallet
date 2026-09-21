@@ -379,9 +379,7 @@ where
 				};
 				let f_outstanding = match outstanding_only {
 					true => {
-						(!tx_entry.confirmed
-							|| (tx_entry.confirmed_height.is_none()
-								&& tx_entry.kernel_excess.is_some()))
+						!tx_entry.confirmed
 							&& (tx_entry.tx_type == TxLogEntryType::TxReceived
 								|| tx_entry.tx_type == TxLogEntryType::TxSent
 								|| tx_entry.tx_type == TxLogEntryType::TxReverted)
@@ -594,6 +592,7 @@ where
 								t.update_confirmation_ts();
 								t.confirmed = true;
 								t.confirmed_height = Some(o.1);
+								t.last_known_kernel_height = None;
 								batch.save_tx_log_entry(t, &parent_key_id)?;
 							} else {
 								if let Some(tx_id) = output.tx_log_entry {
@@ -641,6 +640,7 @@ where
 				});
 				tx.confirmed = false;
 				tx.confirmed_height = None;
+				tx.last_known_kernel_height = None;
 				txs_to_save.push(tx);
 			}
 		}
