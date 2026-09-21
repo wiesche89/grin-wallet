@@ -156,6 +156,21 @@ fn basic_transaction_api(test_dir: &'static str) -> Result<(), libwallet::Error>
 
 			assert_eq!(slate_i.state, SlateState::Standard1);
 
+			wallet::controller::foreign_single_use(
+				wallet2.clone(),
+				PathBuf::from(test_dir),
+				mask2_i.clone(),
+				|api| {
+					let mut zero_amount_slate = slate_i.clone();
+					zero_amount_slate.amount = 0;
+					assert_eq!(
+						api.receive_tx(&zero_amount_slate, None, None).unwrap_err(),
+						libwallet::Error::InvalidAmount
+					);
+					Ok(())
+				},
+			)?;
+
 			// Check we are creating a tx with the expected lock_height of 0.
 			// We will check this produces a Plain kernel later.
 			assert_eq!(0, slate.kernel_features);

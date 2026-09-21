@@ -107,7 +107,7 @@ where
 		context.add_input(&input.key_id, &input.mmr_index, input.value);
 	}
 
-	// Store change output(s) and cached commits
+	// Store change output(s)
 	for (change_amount, id, mmr_index) in &change_amounts_derivations {
 		context.add_output(&id, &mmr_index, *change_amount);
 	}

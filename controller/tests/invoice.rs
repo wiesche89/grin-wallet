@@ -150,6 +150,14 @@ fn invoice_tx_impl(test_dir: &'static str) -> Result<(), libwallet::Error> {
 				selection_strategy_is_use_all: true,
 				..Default::default()
 			};
+			let mut zero_amount_slate = slate.clone();
+			zero_amount_slate.amount = 0;
+			assert_eq!(
+				api.process_invoice_tx(m, &zero_amount_slate, args.clone())
+					.unwrap_err(),
+				libwallet::Error::InvalidAmount
+			);
+
 			slate = api.process_invoice_tx(m, &slate, args)?;
 			api.tx_lock_outputs(m, &slate)?;
 			Ok(())

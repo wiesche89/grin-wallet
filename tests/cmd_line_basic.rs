@@ -149,8 +149,8 @@ fn command_line_test_impl(test_dir: &str) -> Result<(), grin_wallet_controller::
 
 	// Return an explained error when trying to send max amount on empty wallet.
 	let arg_vec = vec!["grin-wallet", "-p", "password2", "send", "max"];
-	let err = execute_command(&app, test_dir, "wallet2", &client2, arg_vec).err();
-	assert!(format!("{}", err.unwrap()).contains("No spendable funds"));
+	let err = execute_command(&app, test_dir, "wallet2", &client2, arg_vec).unwrap_err();
+	assert!(format!("{}", err).contains("No spendable funds"));
 
 	// Mine a bit into wallet 1 so we have something to send
 	// (TODO: Be able to stop listeners so we can test this better)
