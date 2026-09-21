@@ -374,6 +374,9 @@ where
 		)?;
 	if args.use_max_amount {
 		amount = wallet_info.amount_currently_spendable;
+		if amount == 0 {
+			return Err(Error::GenericError("No spendable funds".to_string()));
+		}
 	}
 	if !info_updated && !update_skipped {
 		warn!("Wallet info update failed: node connection error");
