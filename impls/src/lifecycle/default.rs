@@ -208,9 +208,7 @@ where
 			password,
 			test_mode,
 		)
-		.map_err(|_| {
-			Error::Lifecycle("Error creating wallet seed (is mnemonic valid?)".to_owned())
-		})?;
+		.map_err(|e| Error::Lifecycle(format!("Error creating wallet seed: {}", e)))?;
 		info!("Wallet seed file created");
 		let mut wallet: WalletBackend<C, K> =
 			match WalletBackend::new(&data_dir_name, self.node_client.clone()) {
@@ -291,7 +289,7 @@ where
 			.map_err(|_| Error::Lifecycle("Error opening wallet seed file".into()))?;
 		let res = wallet_seed
 			.to_mnemonic()
-			.map_err(|e| Error::Lifecycle(format!("Error recovering wallet seed: {}", e)))?;
+			.map_err(|e| Error::Lifecycle(format!("Error recovering wallet seed: {}, move funds to new wallet or recreate wallet from existing mnemonic backup", e)))?;
 		Ok(ZeroingString::from(res))
 	}
 
