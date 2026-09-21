@@ -182,7 +182,7 @@ where
 		&mut self,
 		_name: Option<&str>,
 		mnemonic: Option<ZeroingString>,
-		mnemonic_length: usize,
+		entropy_size: usize,
 		password: ZeroingString,
 		test_mode: bool,
 	) -> Result<(), Error> {
@@ -196,14 +196,10 @@ where
 				return Err(Error::WalletSeedExists(msg));
 			}
 		}
-		let mnemonic_length = if mnemonic_length == 0 {
-			32
-		} else {
-			mnemonic_length
-		};
+		let entropy_size = if entropy_size == 0 { 32 } else { entropy_size };
 		WalletSeed::init_file(
 			&data_dir_name,
-			mnemonic_length,
+			entropy_size,
 			mnemonic.clone(),
 			password,
 			test_mode,
@@ -390,7 +386,10 @@ where
 mod tests {
 	use super::*;
 	use crate::keychain::ExtKeychain;
+	use crate::lifecycle::seed::{EncryptedWalletSeed, SEED_FILE};
 	use crate::node_clients::HTTPNodeClient;
+	use std::fs::File;
+	use std::io::Write;
 	use std::time::Duration;
 
 	fn provider(test_dir: &str) -> DefaultLCProvider<HTTPNodeClient, ExtKeychain> {
@@ -426,9 +425,24 @@ mod tests {
 		let provider = provider(test_dir);
 		let password = ZeroingString::from("test");
 		let data_dir = PathBuf::from(test_dir).join(GRIN_WALLET_DIR);
+		fs::create_dir_all(data_dir.clone()).unwrap();
 
-		WalletSeed::init_file(data_dir.to_str().unwrap(), 0, None, password.clone(), false)
-			.unwrap();
+		let seed_file_path = &format!(
+			"{}{}{}",
+			fmt_path(data_dir.to_str().unwrap().to_string()),
+			MAIN_SEPARATOR,
+			SEED_FILE,
+		);
+
+		let enc_seed = EncryptedWalletSeed::from_seed(
+			&WalletSeed::from_bytes(vec![].as_slice()),
+			password.clone(),
+		)
+		.unwrap();
+		let enc_seed_json = serde_json::to_string_pretty(&enc_seed).unwrap();
+		let mut file = File::create(seed_file_path).unwrap();
+		file.write_all(&enc_seed_json.as_bytes()).unwrap();
+
 		let error = match provider.get_mnemonic(None, password) {
 			Ok(_) => panic!("expected missing recovery phrase error"),
 			Err(error) => error,
@@ -436,7 +450,7 @@ mod tests {
 
 		assert_eq!(
 			error,
-			Error::Lifecycle("Error recovering wallet seed: BIP39 Mnemonic (word list) Error: invalid mnemonic/entropy length 0".into())
+			Error::Lifecycle("Error recovering wallet seed: BIP39 Mnemonic (word list) Error: invalid mnemonic/entropy length 0, move funds to new wallet or recreate wallet from existing mnemonic backup".into())
 		);
 		fs::remove_dir_all(test_dir).unwrap();
 	}
