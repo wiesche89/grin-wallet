@@ -111,6 +111,7 @@ fn basic_transaction_api(test_dir: &'static str) -> Result<(), libwallet::Error>
 		mask1,
 		PathBuf::from(test_dir),
 		|sender_api, m| {
+			// Do not allow to send 0
 			let error = sender_api
 				.init_send_tx(
 					m,
@@ -122,10 +123,29 @@ fn basic_transaction_api(test_dir: &'static str) -> Result<(), libwallet::Error>
 				.unwrap_err();
 			assert_eq!(error, libwallet::Error::InvalidAmount);
 
+			// Result amount can not be 0 when amount includes fee
+			let mut init_args = InitTxArgs {
+				amount_includes_fee: Some(true),
+				amount: 23_000_000,
+				estimate_only: Some(true),
+				..Default::default()
+			};
+			let est = sender_api.init_send_tx(m, init_args.clone())?;
+			assert_eq!(init_args.amount, est.fee_fields.fee());
+
+			init_args.estimate_only = None;
+			let error = sender_api.init_send_tx(m, init_args).unwrap_err();
+			assert_eq!(
+				error,
+				libwallet::Error::GenericError(
+					"Transaction amount is too small to include fee".to_string()
+				)
+			);
+
 			// note this will increment the block count as part of the transaction "Posting"
 			let args = InitTxArgs {
 				src_acct_name: None,
-				amount: amount,
+				amount,
 				minimum_confirmations: 2,
 				max_outputs: 500,
 				num_change_outputs: 1,
