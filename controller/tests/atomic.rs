@@ -17,7 +17,6 @@ extern crate log;
 extern crate grin_wallet_controller as wallet;
 extern crate grin_wallet_impls as impls;
 
-use easy_jsonrpc_mw::Handler;
 use grin_core as core;
 use grin_keychain::{Keychain, SwitchCommitmentType};
 use grin_wallet_libwallet as libwallet;
@@ -31,53 +30,9 @@ use std::{sync::atomic::Ordering, thread, time::Duration};
 mod common;
 use common::{clean_output_dir, create_wallet_proxy, setup};
 
-fn rpc<T: serde::de::DeserializeOwned>(
-	api: &(dyn grin_wallet_api::OwnerRpc + 'static),
-	mask: Option<&grin_util::secp::SecretKey>,
-	method: &str,
-	mut params: serde_json::Value,
-) -> Result<T, libwallet::Error> {
-	params["token"] = serde_json::to_value(grin_wallet_api::Token {
-		keychain_mask: mask.cloned(),
-	})
-	.unwrap();
-	let response = api
-		.handle_request(serde_json::json!({
-			"jsonrpc": "2.0", "id": 1, "method": method, "params": params
-		}))
-		.as_option()
-		.expect("RPC response");
-	assert!(response.get("error").is_none(), "{response}");
-	assert!(response["result"].get("Err").is_none(), "{response}");
-	serde_json::from_value(response["result"]["Ok"].clone())
-		.map_err(|e| libwallet::Error::GenericError(e.to_string()))
-}
-
-fn foreign(
-	api: &(dyn grin_wallet_api::ForeignRpc + 'static),
-	method: &str,
-	params: serde_json::Value,
-) -> Slate {
-	let response = api
-		.handle_request(serde_json::json!({
-			"jsonrpc": "2.0", "id": 1, "method": method, "params": params
-		}))
-		.as_option()
-		.unwrap();
-	assert!(response.get("error").is_none(), "{response}");
-	assert!(response["result"].get("Err").is_none(), "{response}");
-	let wire: libwallet::VersionedSlate =
-		serde_json::from_value(response["result"]["Ok"].clone()).unwrap();
-	Slate::from(wire)
-}
-
-fn swap(
-	api: &(dyn grin_wallet_api::OwnerRpc + 'static),
-	mask: Option<&grin_util::secp::SecretKey>,
-	request: grin_wallet_api::swap::Request,
-) -> Result<grin_wallet_api::swap::Reply, libwallet::Error> {
-	rpc(api, mask, "swap", serde_json::json!({"request": request}))
-}
+#[path = "common/swap.rs"]
+mod wire;
+use wire::{foreign, rpc, swap};
 
 /// atomic swap impl
 fn atomic_tx_impl(test_dir: &'static str) -> Result<(), libwallet::Error> {
@@ -864,6 +819,7 @@ fn atomic_end_to_end_tx_impl(
 				config_file_version: Some(2),
 				wallet: WalletConfig {
 					bitcoin: Some(BitcoinConfig {
+						proxy: None,
 						url: rpc,
 						cookie,
 						network: "regtest".into(),

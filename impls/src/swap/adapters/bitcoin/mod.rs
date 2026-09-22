@@ -18,6 +18,11 @@ use crate::libwallet::Error;
 
 pub use ::bitcoin as types;
 
+/// Key-only funding and secret recovery for succinct swaps
+pub mod sas;
+
+mod backend;
+mod esplora;
 mod rpc;
 use ::bitcoin::absolute::LockTime;
 use ::bitcoin::opcodes::all::*;
@@ -28,6 +33,7 @@ use ::bitcoin::{
 	transaction, Address, Amount, Network, OutPoint, PublicKey, ScriptBuf, Sequence, Transaction,
 	TxIn, TxOut, Witness,
 };
+pub use backend::Node;
 pub use rpc::{Core, Funding};
 
 fn invalid(message: &str) -> Error {

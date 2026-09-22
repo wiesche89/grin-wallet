@@ -16,6 +16,13 @@
 
 use crate::Error;
 
+/// Swap transaction bookkeeping
+pub mod records;
+/// Succinct swaps with a Grin revoke branch
+pub mod sas;
+/// Preparation timing policy
+pub mod timing;
+
 /// Local side of the trade
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Role {
@@ -148,6 +155,14 @@ pub enum Action {
 	RefundGrin,
 	/// Publish the prepared counter-chain refund
 	RefundOther,
+	/// Publish the Grin revocation transaction
+	RevokeGrin,
+	/// Publish the Grin timeout transaction
+	TimeoutGrin,
+	/// Store the recovered Bitcoin signing key without spending the funding
+	OwnBitcoin,
+	/// The timeout branch won
+	TimedOut,
 	/// The local claim has enough confirmations
 	Complete,
 	/// The local refund has enough confirmations

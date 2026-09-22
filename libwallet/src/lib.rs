@@ -94,3 +94,6 @@ macro_rules! wallet_lock {
 		let $wallet = w_provider.wallet_inst()?;
 	};
 }
+
+/// Scoped cleanup for the swap coordinator
+pub use internal::tx::cancel_swap_tx;

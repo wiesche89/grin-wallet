@@ -21,12 +21,16 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Local Bitcoin Core connection for swaps
+/// Bitcoin connection for swaps
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BitcoinConfig {
-	/// Loopback RPC URL, including the Core wallet path
+	/// Explicit proxy for remote Bitcoin requests
+	#[serde(default)]
+	pub proxy: Option<String>,
+	/// Local Core RPC URL or HTTPS testnet explorer URL
 	pub url: String,
-	/// Core's authentication cookie
+	/// Core's authentication cookie, unused for remote access
+	#[serde(default)]
 	pub cookie: PathBuf,
 	/// bitcoin, testnet, testnet4, signet or regtest
 	pub network: String,

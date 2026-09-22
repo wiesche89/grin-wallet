@@ -75,33 +75,30 @@ impl HTTPNodeClient {
 		self.get_chain_tip()
 	}
 
+	fn send_json_response(
+		&self,
+		method: &str,
+		params: &serde_json::Value,
+	) -> Result<Response, libwallet::Error> {
+		let url = format!("{}{}", self.node_url(), ENDPOINT);
+		let req = build_request(method, params);
+		self.client
+			.post::<Request, Response>(url.as_str(), self.node_api_secret(), &req)
+			.map_err(|e| libwallet::Error::ClientCallback(format!("Error calling {method}: {e}")))
+	}
+
 	fn send_json_request<D: serde::de::DeserializeOwned>(
 		&self,
 		method: &str,
 		params: &serde_json::Value,
 	) -> Result<D, libwallet::Error> {
-		let url = format!("{}{}", self.node_url(), ENDPOINT);
-		let req = build_request(method, params);
-		let res = self
-			.client
-			.post::<Request, Response>(url.as_str(), self.node_api_secret(), &req);
-
-		match res {
-			Err(e) => {
-				let report = format!("Error calling {}: {}", method, e);
-				error!("{}", report);
-				Err(libwallet::Error::ClientCallback(report))
-			}
-			Ok(inner) => match inner.clone().into_result() {
-				Ok(r) => Ok(r),
-				Err(e) => {
-					error!("{:?}", inner);
-					let report = format!("Unable to parse response for {}: {}", method, e);
-					error!("{}", report);
-					Err(libwallet::Error::ClientCallback(report))
-				}
-			},
-		}
+		self.send_json_response(method, params)?
+			.into_result()
+			.map_err(|e| {
+				libwallet::Error::ClientCallback(format!(
+					"Unable to parse response for {method}: {e}"
+				))
+			})
 	}
 }
 
@@ -124,8 +121,9 @@ impl NodeClient for HTTPNodeClient {
 	/// Posts a transaction to a grin node
 	fn post_tx(&self, tx: &Transaction, fluff: bool) -> Result<(), libwallet::Error> {
 		let params = json!([tx, fluff]);
-		self.send_json_request::<serde_json::Value>("push_transaction", &params)?;
-		Ok(())
+		posted(self.send_json_response("push_transaction", &params)?).map_err(|e| {
+			libwallet::Error::ClientCallback(format!("Unable to post transaction: {e}"))
+		})
 	}
 
 	fn get_version_info(&mut self) -> Option<NodeVersionInfo> {
@@ -395,6 +393,20 @@ impl NodeClient for HTTPNodeClient {
 	}
 }
 
+fn posted(response: Response) -> Result<(), Error> {
+	match response.into_result::<serde_json::Value>() {
+		Ok(_) => Ok(()),
+		Err(Error::Rpc(error))
+			if error.code == -32603
+				&& error.data
+					== Some(json!({"Internal":"Failed to update pool: Duplicate tx"})) =>
+		{
+			Ok(())
+		}
+		Err(error) => Err(error),
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -402,6 +414,31 @@ mod tests {
 	use crate::core::libtx::build;
 	use crate::core::libtx::ProofBuilder;
 	use crate::keychain::{ExtKeychain, Keychain};
+
+	#[test]
+	fn post_reply() {
+		let reply = |result| {
+			serde_json::from_value::<Response>(json!({"id":1,"jsonrpc":"2.0","result":result}))
+				.unwrap()
+		};
+		assert!(posted(reply(json!({"Ok":null}))).is_ok());
+		assert!(posted(reply(
+			json!({"Err":{"Internal":"Failed to update pool: Duplicate tx"}})
+		))
+		.is_ok());
+		for error in [
+			"Invalid signature",
+			"Duplicate tx",
+			"Failed to update pool: Double spend",
+		] {
+			assert!(posted(reply(json!({"Err":{"Internal":error}}))).is_err());
+		}
+		assert!(
+			reply(json!({"Err":{"Internal":"Failed to update pool: Duplicate tx"}}))
+				.into_result::<serde_json::Value>()
+				.is_err()
+		);
+	}
 
 	// JSON api for "push_transaction" between wallet->node currently only supports "feature and commit" inputs.
 	// We will need to revisit this if we decide to support "commit only" inputs (no features) at wallet level.

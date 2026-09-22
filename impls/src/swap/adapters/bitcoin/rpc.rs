@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::{invalid, Contract};
-use crate::client_utils::RUNTIME;
+use crate::client_utils::block_on;
 use crate::libwallet::{swap::TxState, Error};
 use ::bitcoin::consensus::{deserialize, encode::serialize_hex};
 use ::bitcoin::hex::FromHex;
@@ -26,6 +26,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 /// Locally configured Bitcoin Core wallet. Credentials are read for each request
+#[derive(Clone)]
 pub struct Core {
 	url: reqwest::Url,
 	cookie: PathBuf,
@@ -96,7 +97,7 @@ impl Core {
 		let body =
 			serde_json::to_vec(&json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params}))
 				.map_err(|_| -1001)?;
-		let result: Value = RUNTIME.block_on(async {
+		let result: Value = block_on(async {
 			let response = self
 				.client
 				.post(self.url.clone())
@@ -149,6 +150,76 @@ impl Core {
 			.map_err(|_| invalid("address network"))
 	}
 
+	/// Register a swap address before exposing payment instructions
+	pub fn watch(&self, address: &Address) -> Result<(), Error> {
+		let watcher = self.watcher(true)?;
+		let info = self.call("getdescriptorinfo", json!([format!("addr({address})")]))?;
+		let descriptor = info["descriptor"]
+			.as_str()
+			.ok_or_else(|| invalid("watch descriptor"))?;
+		let result = watcher.call(
+			"importdescriptors",
+			json!([[{
+				"desc": descriptor, "timestamp": "now", "active": false, "label": "grin-swap"
+			}]]),
+		)?;
+		if result[0]["success"] != true {
+			return Err(invalid("cannot watch swap address"));
+		}
+		Ok(())
+	}
+
+	/// Find an unspent payment without relying on the sending wallet
+	pub fn payment(&self, address: &Address, value: Amount) -> Result<Option<Transaction>, Error> {
+		let watcher = self.watcher(false)?;
+		let outputs = watcher.call(
+			"listunspent",
+			json!([0, 9999999, [address.to_string()], true]),
+		)?;
+		let outputs = outputs
+			.as_array()
+			.ok_or_else(|| invalid("payment outputs"))?;
+		let mut payment = None;
+		for output in outputs {
+			if amount(&output["amount"])? != value {
+				continue;
+			}
+			if payment.is_some() {
+				return Err(invalid("multiple swap payments"));
+			}
+			let txid = output["txid"]
+				.as_str()
+				.ok_or_else(|| invalid("payment txid"))?;
+			let tx = watcher.call("gettransaction", json!([txid, true]))?;
+			payment = Some(decode(&tx["hex"])?);
+		}
+		Ok(payment)
+	}
+
+	fn watcher(&self, create: bool) -> Result<Self, Error> {
+		let mut watcher = self.clone();
+		watcher.url.set_path("/wallet/grin-sas-watch");
+		if watcher.request("getwalletinfo", json!([])) == Err(-18) {
+			match self.request("loadwallet", json!(["grin-sas-watch", true])) {
+				Ok(_) => (),
+				Err(-18) if create => {
+					self.call(
+						"createwallet",
+						json!(["grin-sas-watch", true, true, "", false, true, true]),
+					)?;
+				}
+				Err(_) => return Err(invalid("swap watch wallet unavailable")),
+			}
+		}
+		let info = watcher.call("getwalletinfo", json!([]))?;
+		if info["private_keys_enabled"] != false || info["descriptors"] != true {
+			return Err(invalid(
+				"swap watcher must be a descriptor wallet without private keys",
+			));
+		}
+		Ok(watcher)
+	}
+
 	/// Prepare funding and refund without broadcasting. The Core wallet must be unlocked
 	pub fn prepare(
 		&self,
@@ -165,8 +236,33 @@ impl Core {
 		if self.height()? >= contract.height as u64 {
 			return Err(invalid("refund already mature"));
 		}
-		let outputs =
-			json!([{contract.address(self.network)?.to_string(): contract.amount.to_btc()}]);
+		let tx = self.fund(
+			&contract.address(self.network)?,
+			contract.amount,
+			fee_rate,
+			max_fee,
+		)?;
+		let refund = contract.refund(&tx, destination, refund_fee, refund_key)?;
+		Ok(Funding { tx, refund })
+	}
+
+	/// Sign a stable funding transaction without broadcasting
+	pub fn fund(
+		&self,
+		address: &Address,
+		value: Amount,
+		fee_rate: u64,
+		max_fee: Amount,
+	) -> Result<Transaction, Error> {
+		if fee_rate == 0
+			|| fee_rate > 1000
+			|| max_fee == Amount::ZERO
+			|| value == Amount::ZERO
+			|| value > Amount::MAX_MONEY
+		{
+			return Err(invalid("funding policy"));
+		}
+		let outputs = json!([{address.to_string(): value.to_btc()}]);
 		let psbt = self.call(
 			"walletcreatefundedpsbt",
 			json!([[], outputs, 0,
@@ -198,8 +294,7 @@ impl Core {
 				return Err(invalid("funding requires native SegWit inputs"));
 			}
 		}
-		let refund = contract.refund(&tx, destination, refund_fee, refund_key)?;
-		Ok(Funding { tx, refund })
+		Ok(tx)
 	}
 
 	/// Validate the agreed output against the current UTXO set, including mempool spends
@@ -209,13 +304,21 @@ impl Core {
 		funding: &Transaction,
 	) -> Result<(TxState, bool), Error> {
 		let point = contract.output(funding)?;
+		self.unspent(&point, &funding.output[point.vout as usize])
+	}
+
+	/// Check a specific funding output against the active UTXO set
+	pub fn unspent(
+		&self,
+		point: &::bitcoin::OutPoint,
+		expected: &::bitcoin::TxOut,
+	) -> Result<(TxState, bool), Error> {
 		let utxo = self.call("gettxout", json!([point.txid, point.vout, true]))?;
 		if utxo.is_null() {
 			return Ok((TxState::Absent, false));
 		}
-		if amount(&utxo["value"])? != contract.amount
-			|| utxo["scriptPubKey"]["hex"].as_str()
-				!= Some(&contract.script()?.to_p2wsh().to_hex_string())
+		if amount(&utxo["value"])? != expected.value
+			|| utxo["scriptPubKey"]["hex"].as_str() != Some(&expected.script_pubkey.to_hex_string())
 		{
 			return Err(invalid("funding output mismatch"));
 		}
@@ -287,6 +390,61 @@ mod tests {
 	use super::*;
 	use ::bitcoin::secp256k1::Secp256k1;
 	use ::bitcoin::PublicKey;
+
+	#[test]
+	fn runtime() {
+		use std::io::{Read, Write};
+		use std::net::TcpListener;
+		for mut builder in [
+			tokio::runtime::Builder::new_current_thread(),
+			tokio::runtime::Builder::new_multi_thread(),
+		] {
+			let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+			let address = listener.local_addr().unwrap();
+			let cookie = std::env::temp_dir().join(format!("grin-core-{}.cookie", address.port()));
+			std::fs::write(&cookie, "test:cookie").unwrap();
+			let server = std::thread::spawn(move || {
+				for _ in 0..2 {
+					let (mut stream, _) = listener.accept().unwrap();
+					stream
+						.set_read_timeout(Some(Duration::from_secs(5)))
+						.unwrap();
+					let mut headers = Vec::new();
+					while !headers.ends_with(b"\r\n\r\n") {
+						let mut byte = [0];
+						stream.read_exact(&mut byte).unwrap();
+						headers.push(byte[0]);
+					}
+					let headers = String::from_utf8(headers).unwrap();
+					let length: usize = headers
+						.lines()
+						.find_map(|line| {
+							let (name, value) = line.split_once(':')?;
+							name.eq_ignore_ascii_case("content-length")
+								.then(|| value.trim().parse().unwrap())
+						})
+						.unwrap();
+					let mut body = vec![0; length];
+					stream.read_exact(&mut body).unwrap();
+					let request: Value = serde_json::from_slice(&body).unwrap();
+					assert_eq!(request["method"], "getblockchaininfo");
+					let body = json!({"id":1,"result":{"chain":"regtest","initialblockdownload":false,"blocks":42,"bestblockhash":"tip"},"error":null}).to_string();
+					write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+				}
+			});
+			builder.enable_all().build().unwrap().block_on(async {
+				let core = Core::new(
+					&format!("http://{address}/wallet/test"),
+					cookie.clone(),
+					Network::Regtest,
+				)
+				.unwrap();
+				assert_eq!(core.tip().unwrap(), (42, "tip".into()));
+			});
+			server.join().unwrap();
+			std::fs::remove_file(cookie).unwrap();
+		}
+	}
 
 	#[test]
 	#[ignore = "requires GRIN_SWAP_RPC and GRIN_SWAP_COOKIE for an isolated funded regtest wallet"]

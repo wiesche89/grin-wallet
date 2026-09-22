@@ -15,4 +15,6 @@
 mod client;
 pub mod json_rpc;
 
+pub(crate) use client::block_on;
+
 pub use client::{Client, Error as ClientError, RUNTIME};

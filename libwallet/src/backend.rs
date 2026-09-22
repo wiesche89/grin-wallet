@@ -56,8 +56,10 @@ const RECOVERED_ATOMIC_SECRET_PREFIX: u8 = b'r';
 const ADAPTOR_PREFIX: u8 = b'A';
 const ROUND_PREFIX: u8 = b'R';
 const SWAP_PREFIX: u8 = b'W';
+const DRAFT_PREFIX: u8 = b'D';
 
-const DB_PREFIXES: [u8; 15] = [
+const DB_PREFIXES: [u8; 16] = [
+	DRAFT_PREFIX,
 	SWAP_PREFIX,
 	ROUND_PREFIX,
 	ADAPTOR_PREFIX,
@@ -425,6 +427,155 @@ where
 		batch
 			.db
 			.put_ser(Some(SWAP_PREFIX), &key, &swap.as_bytes().to_vec())?;
+		batch.commit()
+	}
+
+	/// Bind each grouped signing operation to one request before using its nonce
+	pub fn draft_round(
+		&mut self,
+		mask: Option<&SecretKey>,
+		slate: &crate::Slate,
+		op: u64,
+		response: Option<&crate::Slate>,
+	) -> Result<Option<crate::Slate>, Error> {
+		self.keychain(mask)?;
+		let key = to_key_u64(slate.id.as_bytes(), op);
+		let request =
+			serde_json::to_string(slate).map_err(|e| Error::GenericError(e.to_string()))?;
+		let saved: Option<Vec<u8>> = self.db.get_ser(Some(DRAFT_PREFIX), &key, None)?;
+		if let Some(bytes) = saved {
+			let (input, output): (String, Option<String>) =
+				serde_json::from_slice(&bytes).map_err(|e| Error::GenericError(e.to_string()))?;
+			if input != request {
+				return Err(Error::Signature("draft request changed".into()));
+			}
+			if response.is_none() {
+				return output
+					.map(|s| crate::Slate::deserialize_upgrade(&s))
+					.transpose()?
+					.map(Some)
+					.ok_or_else(|| Error::GenericError("interrupted draft operation".into()));
+			}
+		}
+		let output = response
+			.map(serde_json::to_string)
+			.transpose()
+			.map_err(|e| Error::GenericError(e.to_string()))?;
+		let bytes = serde_json::to_vec(&(request, output))
+			.map_err(|e| Error::GenericError(e.to_string()))?;
+		let mut batch = self.batch(mask)?;
+		batch.db.put_ser(Some(DRAFT_PREFIX), &key, &bytes)?;
+		batch.commit()?;
+		Ok(None)
+	}
+
+	/// Read a local shared-output draft without adding it to the wallet balance
+	pub fn shared_draft(&self, id: &Identifier) -> Result<Option<OutputData>, Error> {
+		let bytes: Option<Vec<u8>> = self.db.get_ser(Some(DRAFT_PREFIX), &id.to_bytes(), None)?;
+		bytes
+			.map(|bytes| {
+				let output: OutputData = serde_json::from_slice(&bytes)
+					.map_err(|e| Error::GenericError(e.to_string()))?;
+				if output.root_key_id != self.parent_key_id {
+					return Err(Error::GenericError(
+						"draft belongs to another account".into(),
+					));
+				}
+				Ok(output)
+			})
+			.transpose()
+	}
+
+	/// Reserve only a locally initiated shared output
+	pub fn reserve_shared(
+		&mut self,
+		mask: Option<&SecretKey>,
+		slate: &crate::Slate,
+	) -> Result<(), Error> {
+		let context = self.get_private_context(mask, slate.id.as_bytes())?;
+		let keychain = self.keychain(mask)?;
+		let (_, nonce) = context.get_public_keys(keychain.secp());
+		let id = slate.create_multisig_id();
+		let commit = keychain.commit(slate.amount, &id, SwitchCommitmentType::Regular)?;
+		if slate.state != crate::SlateState::Multisig1
+			|| slate.participant_data.len() != 1
+			|| slate.participant_data[0].public_nonce != nonce
+			|| slate.participant_data[0].part_commit != Some(commit)
+			|| slate.amount != context.amount
+		{
+			return Err(Error::SlateState);
+		}
+		let output = OutputData {
+			root_key_id: context.parent_key_id,
+			key_id: id.clone(),
+			n_child: id.to_path().last_path_index(),
+			mmr_index: None,
+			commit: Some(commit.0.to_hex()),
+			value: slate.amount,
+			status: crate::OutputStatus::Unconfirmed,
+			height: self.last_confirmed_height()?,
+			lock_height: 0,
+			is_coinbase: false,
+			is_multisig: true,
+			tx_log_entry: None,
+		};
+		let bytes = serde_json::to_vec(&output).map_err(|e| Error::GenericError(e.to_string()))?;
+		let mut batch = self.batch(mask)?;
+		batch
+			.db
+			.put_ser(Some(DRAFT_PREFIX), &id.to_bytes(), &bytes)?;
+		batch.commit()
+	}
+
+	/// Bind graph entries before exposing a preparation to the caller
+	pub fn register_swap(
+		&mut self,
+		mask: Option<&SecretKey>,
+		record: &crate::swap::records::Record,
+	) -> Result<Uuid, Error> {
+		let (id, entries) = record.entries()?;
+		let parent = self.parent_key_id();
+		let mut batch = self.batch(mask)?;
+		for (slate, info) in entries {
+			let key = swap_tx_key(&parent, &slate);
+			let bytes: Option<Vec<u8>> = batch.db.get_ser(Some(SWAP_PREFIX), &key, None)?;
+			if let Some(bytes) = bytes {
+				let saved: crate::swap::records::TxInfo = serde_json::from_slice(&bytes)
+					.map_err(|e| Error::GenericError(e.to_string()))?;
+				if saved != info {
+					return Err(Error::GenericError(
+						"swap transaction binding changed".into(),
+					));
+				}
+			}
+			let bytes =
+				serde_json::to_vec(&info).map_err(|e| Error::GenericError(e.to_string()))?;
+			batch.db.put_ser(Some(SWAP_PREFIX), &key, &bytes)?;
+		}
+		let txs = batch.tx_log_iter()?.collect::<Result<Vec<_>, _>>()?;
+		for tx in txs.into_iter().filter(|tx| tx.parent_key_id == parent) {
+			batch.save_tx_log_entry(tx, &parent)?;
+		}
+		batch.commit()?;
+		Ok(id)
+	}
+
+	/// Whether preparation was cancelled for the selected account
+	pub fn swap_aborted(&self, id: &Uuid) -> Result<bool, Error> {
+		let mut key = swap_tx_key(&self.parent_key_id, id);
+		key.extend_from_slice(b"aborted");
+		Ok(self
+			.db
+			.get_ser::<u8>(Some(SWAP_PREFIX), &key, None)?
+			.is_some())
+	}
+
+	/// Keep preparation aborts irreversible across restarts
+	pub fn abort_swap(&mut self, mask: Option<&SecretKey>, id: &Uuid) -> Result<(), Error> {
+		let mut key = swap_tx_key(&self.parent_key_id, id);
+		key.extend_from_slice(b"aborted");
+		let mut batch = self.batch(mask)?;
+		batch.db.put_ser(Some(SWAP_PREFIX), &key, &1u8)?;
 		batch.commit()
 	}
 
@@ -1000,9 +1151,34 @@ where
 	/// Save a transaction log entry.
 	pub fn save_tx_log_entry(
 		&mut self,
-		tx_in: TxLogEntry,
+		mut tx_in: TxLogEntry,
 		parent_id: &Identifier,
 	) -> Result<(), Error> {
+		if let Some(id) = tx_in.tx_slate_id {
+			let bytes: Option<Vec<u8>> =
+				self.db
+					.get_ser(Some(SWAP_PREFIX), &swap_tx_key(parent_id, &id), None)?;
+			if let Some(bytes) = bytes {
+				let info = serde_json::from_slice(&bytes)
+					.map_err(|e| Error::GenericError(e.to_string()))?;
+				if !matches!(
+					tx_in.tx_slate_state,
+					Some(
+						crate::SlateState::Multisig1
+							| crate::SlateState::Multisig2
+							| crate::SlateState::Multisig3
+							| crate::SlateState::Multisig4
+							| crate::SlateState::Atomic1
+							| crate::SlateState::Atomic2
+							| crate::SlateState::Atomic3
+							| crate::SlateState::Atomic4
+					)
+				) {
+					return Err(Error::GenericError("not a swap transaction".into()));
+				}
+				tx_in.swap = Some(info);
+			}
+		}
 		let tx_log_key = to_key_u64(parent_id.to_bytes(), tx_in.id as u64);
 		self.db
 			.put_ser(Some(TX_LOG_ENTRY_PREFIX), &tx_log_key, &tx_in)?;
@@ -1012,6 +1188,12 @@ where
 	/// Delete a transaction log entry.
 	pub fn delete_tx_log_entry(&mut self, tx_id: u32, parent_id: &Identifier) -> Result<(), Error> {
 		let tx_log_key = to_key_u64(parent_id.to_bytes(), tx_id as u64);
+		if let Some(tx) =
+			self.db
+				.get_ser::<TxLogEntry>(Some(TX_LOG_ENTRY_PREFIX), &tx_log_key, None)?
+		{
+			crate::swap::records::check_edit(&tx)?;
+		}
 		self.db.delete(Some(TX_LOG_ENTRY_PREFIX), &tx_log_key)?;
 		Ok(())
 	}
@@ -1169,4 +1351,11 @@ fn to_key_u64<K: AsRef<[u8]>>(k: K, val: u64) -> Vec<u8> {
 	let mut res = k.as_ref().to_vec();
 	res.write_u64::<BigEndian>(val).unwrap();
 	res
+}
+
+fn swap_tx_key(parent: &Identifier, id: &Uuid) -> Vec<u8> {
+	let mut key = b"transaction".to_vec();
+	key.extend_from_slice(&parent.to_bytes());
+	key.extend_from_slice(id.as_bytes());
+	key
 }

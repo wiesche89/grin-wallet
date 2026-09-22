@@ -447,9 +447,13 @@ where
 	let unspents = match update_all {
 		false => unspents
 			.into_iter()
-			.filter(|x| match x.tx_log_entry.as_ref() {
-				Some(t) => tx_entries.iter().any(|te| te.id == *t),
-				None => true,
+			.filter(|x| {
+				// A partner can spend shared outputs after funding is confirmed
+				x.is_multisig
+					|| match x.tx_log_entry.as_ref() {
+						Some(t) => tx_entries.iter().any(|te| te.id == *t),
+						None => true,
+					}
 			})
 			.collect(),
 		true => unspents,
@@ -807,7 +811,19 @@ where
 	let current_height = wallet.last_confirmed_height_for_parent(parent_key_id)?;
 	let outputs = wallet
 		.iter()?
-		.filter(|out| out.root_key_id == *parent_key_id);
+		.filter(|out| out.root_key_id == *parent_key_id && !out.is_multisig);
+
+	let recovery: HashSet<_> = wallet
+		.tx_log_iter()?
+		.collect::<Result<Vec<_>, _>>()?
+		.into_iter()
+		.filter(|tx| {
+			tx.parent_key_id == *parent_key_id
+				&& !tx.confirmed
+				&& tx.swap.as_ref().map(|s| s.kind) == Some(crate::swap::records::TxKind::Recovery)
+		})
+		.map(|tx| tx.id)
+		.collect();
 
 	let mut unspent_total = 0;
 	let mut immature_total = 0;
@@ -817,6 +833,11 @@ where
 	let mut reverted_total = 0;
 
 	for out in outputs {
+		if out.status == OutputStatus::Unconfirmed
+			&& out.tx_log_entry.map_or(false, |id| recovery.contains(&id))
+		{
+			continue;
+		}
 		match out.status {
 			OutputStatus::Unspent => {
 				if out.is_coinbase && out.lock_height > current_height {

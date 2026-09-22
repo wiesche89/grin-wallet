@@ -645,7 +645,7 @@ where
 	C: NodeClient,
 	K: Keychain,
 {
-	Ok(wallet
+	let mut outputs: Vec<_> = wallet
 		.iter()?
 		.filter(|output| {
 			let owned = match multisig_key_id {
@@ -654,7 +654,17 @@ where
 			};
 			owned && output.eligible_to_spend(current_height, minimum_confirmations)
 		})
-		.collect())
+		.collect();
+	if outputs.is_empty() && minimum_confirmations == 0 {
+		if let Some(id) = multisig_key_id {
+			if !wallet.iter()?.any(|output| output.key_id == *id) {
+				if let Some(draft) = wallet.shared_draft(id)? {
+					outputs.push(draft);
+				}
+			}
+		}
+	}
+	Ok(outputs)
 }
 
 /// Selects inputs and change for a transaction
@@ -859,7 +869,10 @@ where
 	for (id, mmr_index, value) in &context.get_inputs() {
 		let input = match wallet.get(id, mmr_index) {
 			Ok(o) => Some(o),
-			Err(_) => wallet.iter()?.find(|out| out.key_id == *id),
+			Err(_) => match wallet.iter()?.find(|out| out.key_id == *id) {
+				Some(output) => Some(output),
+				None => wallet.shared_draft(id)?,
+			},
 		};
 		if let Some(i) = input {
 			if i.is_coinbase {

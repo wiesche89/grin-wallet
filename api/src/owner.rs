@@ -75,6 +75,8 @@ where
 	pub wallet_inst: Arc<Mutex<Box<dyn WalletInst<'static, L, C, K>>>>,
 	/// Wallet configuration path
 	config_path: crate::ConfigPath,
+	/// Explicit Bitcoin settings for embedded swap callers
+	pub(crate) bitcoin_config: Option<crate::config::types::BitcoinConfig>,
 	/// Flag to normalize some output during testing. Can mostly be ignored.
 	pub doctest_mode: bool,
 	/// Retail TLD during doctest
@@ -208,6 +210,7 @@ where
 		Owner {
 			wallet_inst,
 			config_path: config_path.into(),
+			bitcoin_config: None,
 			doctest_mode: false,
 			doctest_retain_tld: false,
 			shared_key: Arc::new(Mutex::new(None)),
@@ -216,6 +219,12 @@ where
 			status_tx: Mutex::new(Some(tx)),
 			updater_messages,
 		}
+	}
+
+	/// Use explicit Bitcoin settings for this owner's swap operations
+	pub fn with_bitcoin_config(mut self, config: crate::config::types::BitcoinConfig) -> Self {
+		self.bitcoin_config = Some(config);
+		self
 	}
 
 	/// Return the active wallet configuration path.

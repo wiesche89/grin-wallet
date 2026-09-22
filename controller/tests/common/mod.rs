@@ -180,3 +180,6 @@ pub fn open_local_wallet(
 		.unwrap();
 	(Arc::new(Mutex::new(wallet)), mask)
 }
+
+mod bitcoin;
+pub use bitcoin::bitcoin;

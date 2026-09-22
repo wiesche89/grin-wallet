@@ -56,7 +56,7 @@ struct Swap {
 	last_action: Action,
 }
 
-enum Publish {
+pub(super) enum Publish {
 	Grin(crate::core::core::Transaction),
 	Bitcoin(btc::Transaction),
 }
@@ -73,7 +73,7 @@ impl Swap {
 fn invalid(message: &str) -> Error {
 	Error::GenericError(format!("swap: {message}"))
 }
-fn encode(slate: &Slate) -> Result<String, Error> {
+pub(super) fn encode(slate: &Slate) -> Result<String, Error> {
 	serde_json::to_string(slate).map_err(|e| invalid(&e.to_string()))
 }
 fn slate(value: &Option<String>) -> Result<Slate, Error> {
@@ -92,7 +92,7 @@ fn secret<C: NodeClient, K: Keychain>(
 fn public(key: &btc::secp256k1::SecretKey) -> btc::PublicKey {
 	btc::PublicKey::new(key.public_key(&btc::secp256k1::Secp256k1::new()))
 }
-fn point(main: &Slate) -> Result<btc::PublicKey, Error> {
+pub(super) fn point(main: &Slate) -> Result<btc::PublicKey, Error> {
 	let mut keys = main
 		.participant_data
 		.iter()
@@ -113,6 +113,15 @@ where
 {
 	/// Run one persisted swap operation using the locally configured Bitcoin backend
 	pub fn swap(&self, mask: Option<&SecretKey>, request: Request) -> Result<Reply, Error> {
+		if let Request::CancelPreparation { record } = request {
+			return self.cancel_preparation(mask, &record);
+		}
+		if let Request::Track { record } = request {
+			return self.track_swap(mask, &record);
+		}
+		if let Request::Sas { request } = request {
+			return self.sas(mask, request);
+		}
 		if let Request::Status { id } = &request {
 			let mut lock = self.wallet_inst.lock();
 			let w = lock.lc_provider()?.wallet_inst()?;
@@ -123,18 +132,11 @@ where
 			}
 			return reply(w, mask, *id, &state);
 		}
-		let config = crate::config::config::reload_global_config(&self.config_path())
-			.map_err(|e| invalid(&e.to_string()))?
-			.members
-			.wallet
-			.bitcoin
-			.ok_or_else(|| invalid("Bitcoin backend is not configured"))?;
-		let network =
-			btc::Network::from_str(&config.network).map_err(|_| invalid("Bitcoin network"))?;
+
 		let mut lock = self.wallet_inst.lock();
 		let w = lock.lc_provider()?.wallet_inst()?;
 		w.keychain(mask)?;
-		let core = Core::new(&config.url, config.cookie, network)?;
+		let (core, network) = super::core(self.config_path())?;
 		if let Request::Start {
 			role,
 			policy,
@@ -197,7 +199,10 @@ where
 			| Request::Bump { id, .. }
 			| Request::Step { id }
 			| Request::Status { id } => *id,
-			Request::Start { .. } => unreachable!(),
+			Request::Start { .. }
+			| Request::Sas { .. }
+			| Request::Track { .. }
+			| Request::CancelPreparation { .. } => unreachable!(),
 		};
 		let mut state: Swap = w.load_swap(&id)?.ok_or_else(|| invalid("unknown swap"))?;
 		if state.version != 1 || state.network != network {
@@ -298,7 +303,10 @@ where
 			Request::Step { .. } => publish = step(w, mask, &core, &mut state)?,
 			Request::Bump { fee, .. } => publish = Some(bump(w, mask, &core, &mut state, fee)?),
 			Request::Status { .. } => return reply(w, mask, id, &state),
-			Request::Start { .. } => unreachable!(),
+			Request::Start { .. }
+			| Request::Sas { .. }
+			| Request::Track { .. }
+			| Request::CancelPreparation { .. } => unreachable!(),
 		}
 		w.save_swap(mask, &id, &state)?;
 		let reply = reply(w, mask, id, &state)?;
@@ -311,24 +319,6 @@ where
 		} else {
 			None
 		};
-		let cancel = if let Some(id) = cancel {
-			let parent = w.parent_key_id();
-			let txs =
-				crate::libwallet::retrieve_txs(w, None, Some(id), None, Some(&parent), false)?;
-			txs.iter()
-				.any(|tx| {
-					!tx.confirmed
-						&& matches!(
-							tx.tx_type,
-							crate::libwallet::TxLogEntryType::TxSent
-								| crate::libwallet::TxLogEntryType::TxReceived
-								| crate::libwallet::TxLogEntryType::TxReverted
-						)
-				})
-				.then_some(id)
-		} else {
-			None
-		};
 		let client = w.w2n_client().clone();
 		drop(lock);
 		match publish {
@@ -337,7 +327,7 @@ where
 			None => (),
 		}
 		if let Some(id) = cancel {
-			self.cancel_tx(mask, None, Some(id))?;
+			self.cancel_pending(mask, &[id])?;
 		}
 		Ok(reply)
 	}
@@ -350,6 +340,10 @@ fn reply<C: NodeClient, K: Keychain>(
 	state: &Swap,
 ) -> Result<Reply, Error> {
 	Ok(Reply {
+		chain: None,
+		withdrawal: None,
+		payment: None,
+		proof: None,
 		id,
 		key: public(&secret(w, mask, &state.key)?).to_string(),
 		action: state.last_action,
@@ -478,21 +472,50 @@ fn prepare<C: NodeClient, K: Keychain>(
 	Ok(())
 }
 
-fn grin_status<C: NodeClient, K: Keychain>(
+pub(super) fn grin_status<C: NodeClient, K: Keychain>(
 	w: &mut WalletBackend<C, K>,
 	mask: Option<&SecretKey>,
 	slate: &Slate,
 	height: u64,
 ) -> Result<TxState, Error> {
-	let excess = slate.calc_excess(w.keychain(mask)?.secp())?;
-	Ok(match w.w2n_client().get_kernel(&excess, None, None)? {
-		Some((kernel, h, _)) if h <= height => {
-			kernel.verify()?;
-			TxState::Confirmed(height - h + 1)
+	let lock_height = if slate.kernel_features == 2 {
+		Some(
+			slate
+				.kernel_features_args
+				.as_ref()
+				.ok_or_else(|| invalid("missing lock height"))?
+				.lock_height,
+		)
+	} else {
+		None
+	};
+	if lock_height.is_some_and(|lock| lock > height) {
+		return Ok(TxState::Absent);
+	}
+	let mut created = None;
+	for tx in w.tx_log_iter()? {
+		let tx = tx?;
+		if tx.tx_slate_id == Some(slate.id) {
+			if let Some(h) = tx.kernel_lookup_min_height {
+				created = Some(created.map_or(h, |previous: u64| previous.min(h)));
+			}
 		}
-		Some(_) => return Err(invalid("Grin tip changed during lookup")),
-		None => TxState::Absent,
-	})
+	}
+	let min_height = created.into_iter().chain(lock_height).max();
+	let excess = slate.calc_excess(w.keychain(mask)?.secp())?;
+	Ok(
+		match w
+			.w2n_client()
+			.get_kernel(&excess, min_height, Some(height))?
+		{
+			Some((kernel, h, _)) if h <= height => {
+				kernel.verify()?;
+				TxState::Confirmed(height - h + 1)
+			}
+			Some(_) => return Err(invalid("Grin tip changed during lookup")),
+			None => TxState::Absent,
+		},
+	)
 }
 
 fn step<C: NodeClient, K: Keychain>(

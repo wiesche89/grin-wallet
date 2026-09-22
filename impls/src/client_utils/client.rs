@@ -20,6 +20,7 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYP
 use reqwest::{ClientBuilder, Method, Proxy, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +30,18 @@ use tokio::runtime::{Builder, Handle, Runtime};
 lazy_static! {
 	pub static ref RUNTIME: Arc<Runtime> =
 		Arc::new(Builder::new_multi_thread().enable_all().build().unwrap());
+}
+
+// Run synchronous clients from either a CLI or an async API handler
+pub(crate) fn block_on<F: Future + Send>(future: F) -> F::Output
+where
+	F::Output: Send,
+{
+	if Handle::try_current().is_ok() {
+		std::thread::scope(|scope| scope.spawn(|| RUNTIME.block_on(future)).join().unwrap())
+	} else {
+		RUNTIME.block_on(future)
+	}
 }
 
 #[derive(Clone, Eq, thiserror::Error, PartialEq, Debug)]
@@ -261,17 +274,6 @@ impl Client {
 	}
 
 	pub fn send_request(&self, req: RequestBuilder) -> Result<String, Error> {
-		// This client is currently used both outside and inside of a tokio runtime
-		// context. In the latter case we are not allowed to do a blocking call to
-		// our global runtime, which unfortunately means we have to spawn a new thread
-		if Handle::try_current().is_ok() {
-			let rt = RUNTIME.clone();
-			let client = self.clone();
-			std::thread::spawn(move || rt.block_on(async { client.send_request_async(req).await }))
-				.join()
-				.unwrap()
-		} else {
-			RUNTIME.block_on(self.send_request_async(req))
-		}
+		block_on(self.send_request_async(req))
 	}
 }

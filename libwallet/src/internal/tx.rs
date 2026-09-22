@@ -222,6 +222,7 @@ where
 	// according to plan
 	// This function is just a big helper to do all of that, in theory
 	// this process can be split up in any way
+	let shared = slate.multisig_key_id.clone();
 	let mut context = selection::build_send_tx(
 		wallet,
 		&wallet.keychain(keychain_mask)?,
@@ -234,7 +235,7 @@ where
 		selection_strategy_is_use_all,
 		None,
 		parent_key_id.clone(),
-		None,
+		shared.as_ref(),
 		use_test_rng,
 		is_initiator,
 		amount_includes_fee,
@@ -284,6 +285,22 @@ where
 	K: Keychain,
 {
 	let keychain = wallet.keychain(keychain_mask)?;
+	let shared = if let Some(shared) = &slate.multisig_key_id {
+		let output = wallet
+			.iter()?
+			.find(|o| o.is_multisig && &o.key_id == shared)
+			.ok_or_else(|| Error::GenericError("missing shared input".into()))?;
+		if !slate.is_multisig()
+			|| slate.amount.checked_add(slate.fee_fields.fee()) != Some(output.value)
+		{
+			return Err(Error::GenericError(
+				"shared transfer must spend the full output".into(),
+			));
+		}
+		Some((output.key_id, output.mmr_index, output.value))
+	} else {
+		None
+	};
 	// create an output using the amount in the slate
 	let (_, mut context, mut tx) = selection::build_recipient_output(
 		wallet,
@@ -296,6 +313,9 @@ where
 		|_, _, _, _| Ok(()),
 	)?;
 
+	if let Some(input) = shared {
+		context.input_ids = vec![input];
+	}
 	// fill public keys
 	slate.fill_round_1(&keychain, &mut context)?;
 
@@ -573,6 +593,35 @@ where
 	C: NodeClient,
 	K: Keychain,
 {
+	cancel_tx_inner(
+		wallet,
+		keychain_mask,
+		parent_key_id,
+		tx_id,
+		tx_slate_id,
+		None,
+	)
+}
+
+/// Used by the swap coordinator after checking its persisted state
+pub fn cancel_swap_tx<C: NodeClient, K: Keychain>(
+	wallet: &mut WalletBackend<C, K>,
+	mask: Option<&SecretKey>,
+	parent: &Identifier,
+	id: Uuid,
+	swap: Uuid,
+) -> Result<(), Error> {
+	cancel_tx_inner(wallet, mask, parent, None, Some(id), Some(swap))
+}
+
+fn cancel_tx_inner<C: NodeClient, K: Keychain>(
+	wallet: &mut WalletBackend<C, K>,
+	keychain_mask: Option<&SecretKey>,
+	parent_key_id: &Identifier,
+	tx_id: Option<u32>,
+	tx_slate_id: Option<Uuid>,
+	swap: Option<Uuid>,
+) -> Result<(), Error> {
 	let mut tx_id_string = String::new();
 	if let Some(tx_id) = tx_id {
 		tx_id_string = tx_id.to_string();
@@ -591,6 +640,15 @@ where
 		return Err(Error::TransactionDoesntExist(tx_id_string));
 	}
 	let tx = tx_vec[0].clone();
+	match swap {
+		None => crate::swap::records::check_edit(&tx)?,
+		Some(id) if tx.swap.as_ref().map(|s| s.id) == Some(id) => {}
+		Some(_) => {
+			return Err(Error::GenericError(
+				"swap transaction ownership mismatch".into(),
+			))
+		}
+	}
 	match tx.tx_type {
 		TxLogEntryType::TxSent | TxLogEntryType::TxReceived | TxLogEntryType::TxReverted => {}
 		_ => return Err(Error::TransactionNotCancellable(tx_id_string)),

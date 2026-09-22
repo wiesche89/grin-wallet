@@ -684,6 +684,9 @@ impl fmt::Display for TxLogEntryType {
 /// maps to one or many outputs
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TxLogEntry {
+	/// Swap ownership, also returned by the owner API
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub swap: Option<crate::swap::records::TxInfo>,
 	/// BIP32 account path used for creating this tx
 	pub parent_key_id: Identifier,
 	/// Local id for this transaction (distinct from a slate transaction id)
@@ -755,6 +758,7 @@ impl TxLogEntry {
 	/// Return a new blank with TS initialised with next entry
 	pub fn new(parent_key_id: Identifier, t: TxLogEntryType, id: u32) -> Self {
 		TxLogEntry {
+			swap: None,
 			parent_key_id,
 			tx_type: t,
 			id,

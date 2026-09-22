@@ -600,6 +600,20 @@ where
 
 	let height = w.w2n_client().get_chain_tip()?.0;
 	let is_multisig = args.is_multisig.unwrap_or(false);
+	if let Some(path) = &args.multisig_path {
+		if !is_multisig || args.late_lock.unwrap_or(false) || args.ttl_blocks.is_some() {
+			return Err(Error::SlateState);
+		}
+		let lock_height = args.refund_height.ok_or(Error::SlateState)?;
+		if lock_height <= height {
+			return Err(Error::GenericError(
+				"revoke height must be in the future".into(),
+			));
+		}
+		slate.multisig_key_id = Some(Identifier::from_bip_32_string(path)?);
+		slate.kernel_features = 2;
+		slate.kernel_features_args = Some(KernelFeaturesArgs { lock_height });
+	}
 	let mut context = if args.late_lock.unwrap_or(false) {
 		tx::create_late_lock_context(
 			w,
@@ -1067,12 +1081,13 @@ where
 	let height = w.w2n_client().get_chain_tip()?.0;
 	let keychain = w.keychain(keychain_mask)?;
 
-	let output = w
-		.iter()?
-		.find(|d| d.key_id == multisig_id)
-		.ok_or(Error::from(Error::GenericError(
-			"missing multisig output".into(),
-		)))?;
+	let output = match w.iter()?.find(|d| d.key_id == multisig_id) {
+		Some(output) => Some(output),
+		None => w.shared_draft(&multisig_id)?,
+	}
+	.ok_or(Error::from(Error::GenericError(
+		"missing multisig output".into(),
+	)))?;
 
 	let context = if args.late_lock.unwrap_or(false) {
 		// use late_lock context for initial height_lock tx,
@@ -1395,6 +1410,28 @@ where
 	wallet_lock!(wallet_inst, w);
 	let parent_key_id = w.parent_key_id();
 	tx::cancel_tx(w, keychain_mask, &parent_key_id, tx_id, tx_slate_id)
+}
+
+/// Swap coordinator cleanup with a fresh node view and an explicit graph binding
+pub fn cancel_swap_tx<'a, L, C, K>(
+	wallet_inst: Arc<Mutex<Box<dyn WalletInst<'a, L, C, K>>>>,
+	mask: Option<&SecretKey>,
+	id: Uuid,
+	swap: Uuid,
+) -> Result<(), Error>
+where
+	L: WalletLCProvider<'a, C, K>,
+	C: NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	if !update_wallet_state(wallet_inst.clone(), mask, &None, false)? {
+		return Err(Error::TransactionCancellationError(
+			"Can't contact running Grin node. Not Cancelling.",
+		));
+	}
+	wallet_lock!(wallet_inst, w);
+	let parent = w.parent_key_id();
+	tx::cancel_swap_tx(w, mask, &parent, id, swap)
 }
 
 /// get stored tx
