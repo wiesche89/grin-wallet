@@ -39,10 +39,17 @@ impl WalletSeed {
 		WalletSeed(bytes.to_vec())
 	}
 
+	pub(super) fn is_empty(&self) -> bool {
+		self.0.is_empty()
+	}
+
 	pub fn from_mnemonic(word_list: util::ZeroingString) -> Result<WalletSeed, Error> {
 		let res = mnemonic::to_entropy(&word_list);
 		match res {
 			Ok(s) => Ok(WalletSeed::from_bytes(&s)),
+			Err(mnemonic::Error::BadWord(_)) => {
+				Err(Error::Mnemonic("invalid bip39 word".to_owned()))
+			}
 			Err(e) => Err(Error::Mnemonic(format!("{}", e))),
 		}
 	}
@@ -94,6 +101,7 @@ impl WalletSeed {
 				.to_vec();
 		}
 		let _ = mnemonic::from_entropy(seed.as_slice())
+			.map(util::ZeroingString::from)
 			.map_err(|e| Error::Mnemonic(format!("{}", e)))?;
 		Ok(WalletSeed(seed))
 	}

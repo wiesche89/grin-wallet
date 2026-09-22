@@ -247,6 +247,9 @@ where
 		let wallet_seed = WalletSeed::from_file(&data_dir_name, password).map_err(|_| {
 			Error::Lifecycle("Error opening wallet (is password correct?)".to_owned())
 		})?;
+		if wallet_seed.is_empty() {
+			warn!("This wallet has an empty seed and its funds are unsafe. Move them to a new wallet.");
+		}
 		let keychain = wallet_seed
 			.derive_keychain(global::is_testnet())
 			.map_err(|_| Error::Lifecycle("Error deriving keychain".to_owned()))?;
@@ -285,7 +288,7 @@ where
 			.map_err(|_| Error::Lifecycle("Error opening wallet seed file".into()))?;
 		let res = wallet_seed
 			.to_mnemonic()
-			.map_err(|e| Error::Lifecycle(format!("Error recovering wallet seed: {}, move funds to new wallet or recreate wallet from existing mnemonic backup", e)))?;
+			.map_err(|e| Error::Lifecycle(format!("Error recovering wallet seed: {}. This wallet has no valid recovery phrase and its funds may be unsafe. Move them to a new wallet.", e)))?;
 		Ok(ZeroingString::from(res))
 	}
 
@@ -418,11 +421,28 @@ mod tests {
 	}
 
 	#[test]
+	fn mnemonic_error_redacted() {
+		let test_dir = "test_output/mnemonic_error_redacted";
+		let _ = fs::remove_dir_all(test_dir);
+		let mut provider = provider(test_dir);
+		let input = ZeroingString::from("INVALID_INPUT_MARKER ".repeat(12));
+		let error = provider
+			.create_wallet(None, Some(input), 32, ZeroingString::from("test"), false)
+			.unwrap_err()
+			.to_string();
+
+		assert!(error.contains("invalid bip39 word"));
+		assert!(!error.contains("INVALID_INPUT_MARKER"));
+		assert!(!provider.wallet_exists(None).unwrap());
+		fs::remove_dir_all(test_dir).unwrap();
+	}
+
+	#[test]
 	fn missing_recovery_phrase() {
 		let test_dir = "test_output/missing_recovery_phrase";
 		let _ = fs::remove_dir_all(test_dir);
 		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
-		let provider = provider(test_dir);
+		let mut provider = provider(test_dir);
 		let password = ZeroingString::from("test");
 		let data_dir = PathBuf::from(test_dir).join(GRIN_WALLET_DIR);
 		fs::create_dir_all(data_dir.clone()).unwrap();
@@ -443,15 +463,18 @@ mod tests {
 		let mut file = File::create(seed_file_path).unwrap();
 		file.write_all(&enc_seed_json.as_bytes()).unwrap();
 
-		let error = match provider.get_mnemonic(None, password) {
+		let error = match provider.get_mnemonic(None, password.clone()) {
 			Ok(_) => panic!("expected missing recovery phrase error"),
 			Err(error) => error,
 		};
 
 		assert_eq!(
 			error,
-			Error::Lifecycle("Error recovering wallet seed: BIP39 Mnemonic (word list) Error: invalid mnemonic/entropy length 0, move funds to new wallet or recreate wallet from existing mnemonic backup".into())
+			Error::Lifecycle("Error recovering wallet seed: BIP39 Mnemonic (word list) Error: invalid mnemonic/entropy length 0. This wallet has no valid recovery phrase and its funds may be unsafe. Move them to a new wallet.".into())
 		);
+		provider.open_wallet(None, password, false, false).unwrap();
+		provider.close_wallet(None).unwrap();
+		assert_eq!(fs::read_to_string(seed_file_path).unwrap(), enc_seed_json);
 		fs::remove_dir_all(test_dir).unwrap();
 	}
 }
