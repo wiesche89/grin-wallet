@@ -651,11 +651,7 @@ pub struct TxLogEntry {
 	#[serde(default)]
 	pub confirmed_height: Option<u64>,
 	/// Last known kernel height for bounded rechecks
-	#[serde(
-		default,
-		alias = "reverted_height",
-		skip_serializing_if = "Option::is_none"
-	)]
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub last_known_kernel_height: Option<u64>,
 	/// number of inputs involved in TX
 	pub num_inputs: usize,
@@ -1032,11 +1028,6 @@ mod tests {
 		tx.last_known_kernel_height = Some(42);
 		let restored: TxLogEntry =
 			serde_json::from_slice(&serde_json::to_vec(&tx).unwrap()).unwrap();
-		assert_eq!(restored.last_known_kernel_height, Some(42));
-		let old_json = serde_json::to_string(&tx)
-			.unwrap()
-			.replace("last_known_kernel_height", "reverted_height");
-		let restored: TxLogEntry = serde_json::from_str(&old_json).unwrap();
 		assert_eq!(restored.last_known_kernel_height, Some(42));
 	}
 
