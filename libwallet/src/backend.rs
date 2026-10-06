@@ -110,7 +110,11 @@ where
 	Ok((ret_blind, ret_nonce))
 }
 
-fn tau_x_xor_key<K>(keychain: &K, slate_id: &[u8]) -> Result<[u8; SECRET_KEY_SIZE], Error>
+fn context_xor_key<K>(
+	keychain: &K,
+	slate_id: &[u8],
+	domain: &[u8],
+) -> Result<[u8; SECRET_KEY_SIZE], Error>
 where
 	K: Keychain,
 {
@@ -119,7 +123,7 @@ where
 	let mut hasher = Blake2b::new(SECRET_KEY_SIZE);
 	hasher.update(&root_key.0[..]);
 	hasher.update(&slate_id[..]);
-	hasher.update(&b"tau_x"[..]);
+	hasher.update(domain);
 	let tau_x_xor_key = hasher.finalize();
 	let mut ret_tau_x = [0; SECRET_KEY_SIZE];
 	ret_tau_x.copy_from_slice(&tau_x_xor_key.as_bytes()[..SECRET_KEY_SIZE]);
@@ -536,6 +540,8 @@ where
 		let (id, entries) = record.entries()?;
 		let parent = self.parent_key_id();
 		let mut batch = self.batch(mask)?;
+		let graph_ids: std::collections::HashSet<_> =
+			entries.iter().map(|(slate, _)| *slate).collect();
 		for (slate, info) in entries {
 			let key = swap_tx_key(&parent, &slate);
 			let bytes: Option<Vec<u8>> = batch.db.get_ser(Some(SWAP_PREFIX), &key, None)?;
@@ -553,7 +559,9 @@ where
 			batch.db.put_ser(Some(SWAP_PREFIX), &key, &bytes)?;
 		}
 		let txs = batch.tx_log_iter()?.collect::<Result<Vec<_>, _>>()?;
-		for tx in txs.into_iter().filter(|tx| tx.parent_key_id == parent) {
+		for tx in txs.into_iter().filter(|tx| {
+			tx.parent_key_id == parent && tx.tx_slate_id.map_or(false, |id| graph_ids.contains(&id))
+		}) {
 			batch.save_tx_log_entry(tx, &parent)?;
 		}
 		batch.commit()?;
@@ -647,6 +655,7 @@ where
 			2 => crate::SlateState::Atomic1,
 			3 => crate::SlateState::Atomic2,
 			4 => crate::SlateState::Atomic3,
+			5 => crate::SlateState::Multisig2,
 			_ => return Err(Error::SlateState),
 		};
 		if slate.state != expected || slate.num_participants != 2 {
@@ -828,7 +837,8 @@ where
 		let (blind_xor_key, nonce_xor_key) =
 			private_ctx_xor_keys(&self.keychain(keychain_mask)?, slate_id)?;
 
-		let tau_mask = tau_x_xor_key(&self.keychain(keychain_mask)?, slate_id)?;
+		let keychain = self.keychain(keychain_mask)?;
+		let tau_mask = context_xor_key(&keychain, slate_id, b"tau_x")?;
 		let mut ctx: Context = option_to_not_found(
 			self.db
 				.get_ser(Some(PRIVATE_TX_CONTEXT_PREFIX), &ctx_key, None),
@@ -844,6 +854,22 @@ where
 			for (b, mask) in tau.0.iter_mut().zip(tau_mask) {
 				*b ^= mask;
 			}
+		}
+		let legacy_atomic = ctx.sec_atomic.is_some() && !ctx.sec_atomic_masked;
+		if ctx.sec_atomic_masked {
+			if let Some(secret) = ctx.sec_atomic.as_mut() {
+				let mask = context_xor_key(&keychain, slate_id, b"context_atomic")?;
+				for (byte, mask) in secret.0.iter_mut().zip(mask) {
+					*byte ^= mask;
+				}
+			}
+			ctx.sec_atomic_masked = false;
+		}
+		// Old contexts contain the plaintext scalar. Upgrade on an authenticated read.
+		if legacy_atomic {
+			let mut batch = self.batch(keychain_mask)?;
+			batch.save_private_context(slate_id, &ctx)?;
+			batch.commit()?;
 		}
 		Ok(ctx)
 	}
@@ -1236,8 +1262,15 @@ where
 		let ctx_key = to_key_u64(slate_id, 0);
 		let (blind_xor_key, nonce_xor_key) = private_ctx_xor_keys(self.keychain(), slate_id)?;
 
-		let tau_mask = tau_x_xor_key(self.keychain(), slate_id)?;
+		let tau_mask = context_xor_key(self.keychain(), slate_id, b"tau_x")?;
 		let mut s_ctx = ctx.clone();
+		if let Some(secret) = s_ctx.sec_atomic.as_mut() {
+			let mask = context_xor_key(self.keychain(), slate_id, b"context_atomic")?;
+			for (byte, mask) in secret.0.iter_mut().zip(mask) {
+				*byte ^= mask;
+			}
+		}
+		s_ctx.sec_atomic_masked = true;
 		if let Some(tau) = s_ctx.tau_x.as_mut() {
 			for (b, mask) in tau.0.iter_mut().zip(tau_mask) {
 				*b ^= mask;
@@ -1281,13 +1314,20 @@ where
 			.map(serde_json::to_string)
 			.transpose()
 			.map_err(|e| Error::GenericError(e.to_string()))?;
+		let key = to_key_u64(input.id.as_bytes(), round as u64);
+		// Recheck under the write transaction before publishing any response.
+		// Another wallet process may have committed since begin_round.
+		if let Some(bytes) = self.db.get_ser::<Vec<u8>>(Some(ROUND_PREFIX), &key, None)? {
+			let (saved_request, saved_response): (String, Option<String>) =
+				serde_json::from_slice(&bytes).map_err(|e| Error::GenericError(e.to_string()))?;
+			if saved_request != request || (saved_response.is_some() && saved_response != response)
+			{
+				return Err(Error::Signature("signing round already committed".into()));
+			}
+		}
 		let bytes = serde_json::to_vec(&(request, response))
 			.map_err(|e| Error::GenericError(e.to_string()))?;
-		self.db.put_ser(
-			Some(ROUND_PREFIX),
-			&to_key_u64(input.id.as_bytes(), round as u64),
-			&bytes,
-		)?;
+		self.db.put_ser(Some(ROUND_PREFIX), &key, &bytes)?;
 		Ok(())
 	}
 
@@ -1358,4 +1398,132 @@ fn swap_tx_key(parent: &Identifier, id: &Uuid) -> Vec<u8> {
 	key.extend_from_slice(&parent.to_bytes());
 	key.extend_from_slice(id.as_bytes());
 	key
+}
+
+#[cfg(test)]
+mod context_tests {
+	use super::*;
+	use grin_core::core::TxKernel;
+	use grin_util::secp::pedersen::RangeProof;
+	use std::collections::HashMap;
+
+	#[derive(Clone)]
+	struct Offline;
+	impl NodeClient for Offline {
+		fn node_url(&self) -> &str {
+			unreachable!()
+		}
+		fn set_node_url(&mut self, _: &str) {
+			unreachable!()
+		}
+		fn node_api_secret(&self) -> Option<String> {
+			unreachable!()
+		}
+		fn set_node_api_secret(&mut self, _: Option<String>) {
+			unreachable!()
+		}
+		fn post_tx(&self, _: &Transaction, _: bool) -> Result<(), Error> {
+			unreachable!()
+		}
+		fn get_version_info(&mut self) -> Option<crate::NodeVersionInfo> {
+			unreachable!()
+		}
+		fn get_chain_tip(&self) -> Result<(u64, String), Error> {
+			unreachable!()
+		}
+		fn get_kernel(
+			&mut self,
+			_: &Commitment,
+			_: Option<u64>,
+			_: Option<u64>,
+		) -> Result<Option<(TxKernel, u64, u64)>, Error> {
+			unreachable!()
+		}
+		fn get_outputs_from_node(
+			&self,
+			_: Vec<Commitment>,
+		) -> Result<HashMap<Commitment, (String, u64, u64)>, Error> {
+			unreachable!()
+		}
+		fn get_outputs_by_pmmr_index(
+			&self,
+			_: u64,
+			_: Option<u64>,
+			_: u64,
+		) -> Result<(u64, u64, Vec<(Commitment, RangeProof, bool, u64, u64)>), Error> {
+			unreachable!()
+		}
+		fn height_range_to_pmmr_indices(
+			&self,
+			_: u64,
+			_: Option<u64>,
+		) -> Result<(u64, u64), Error> {
+			unreachable!()
+		}
+	}
+
+	#[test]
+	fn atomic_context_storage_and_legacy_upgrade() {
+		grin_core::global::set_local_chain_type(grin_core::global::ChainTypes::AutomatedTesting);
+		let path = std::env::temp_dir().join(format!("atomic-context-{}", Uuid::new_v4()));
+		let keychain = ExtKeychain::from_seed(&[42; 32], false).unwrap();
+		let mut ctx = Context::new(keychain.secp(), &Identifier::zero(), true, false);
+		let secret = SecretKey::from_slice(keychain.secp(), &[37; 32]).unwrap();
+		ctx.sec_atomic = Some(secret.clone());
+		let slate = [19; 16];
+		let key = to_key_u64(slate, 0);
+		let mut wallet = WalletBackend::new(path.to_str().unwrap(), Offline).unwrap();
+		let mask = wallet.set_keychain(keychain.clone(), true, true).unwrap();
+		let mut batch = wallet.batch(mask.as_ref()).unwrap();
+		batch.save_private_context(&slate, &ctx).unwrap();
+		batch.commit().unwrap();
+		let stored: Context = wallet
+			.db
+			.get_ser(Some(PRIVATE_TX_CONTEXT_PREFIX), &key, None)
+			.unwrap()
+			.unwrap();
+		assert!(stored.sec_atomic_masked);
+		assert!(stored.sec_atomic.as_ref() != Some(&secret));
+		assert!(
+			serde_json::to_value(&stored).unwrap()["sec_atomic"]
+				!= serde_json::to_value(&secret).unwrap()
+		);
+		wallet.close().unwrap();
+		drop(wallet);
+		let mut wallet = WalletBackend::new(path.to_str().unwrap(), Offline).unwrap();
+		let mask = wallet.set_keychain(keychain, true, true).unwrap();
+		assert!(wallet.get_private_context(None, &slate).is_err());
+		let restored = wallet.get_private_context(mask.as_ref(), &slate).unwrap();
+		assert!(restored.sec_atomic.as_ref() == Some(&secret));
+		assert!(restored.sec_key == ctx.sec_key && restored.sec_nonce == ctx.sec_nonce);
+
+		// Recreate the old JSON shape without a marker and with its plaintext scalar.
+		let mut legacy = serde_json::to_value(stored).unwrap();
+		legacy.as_object_mut().unwrap().remove("sec_atomic_masked");
+		legacy["sec_atomic"] = serde_json::to_value(&secret).unwrap();
+		let legacy: Context = serde_json::from_value(legacy).unwrap();
+		let mut batch = wallet.db.batch().unwrap();
+		batch
+			.put_ser(Some(PRIVATE_TX_CONTEXT_PREFIX), &key, &legacy)
+			.unwrap();
+		batch.commit().unwrap();
+		let restored = wallet.get_private_context(mask.as_ref(), &slate).unwrap();
+		assert!(restored.sec_atomic.as_ref() == Some(&secret));
+		let upgraded: Context = wallet
+			.db
+			.get_ser(Some(PRIVATE_TX_CONTEXT_PREFIX), &key, None)
+			.unwrap()
+			.unwrap();
+		assert!(upgraded.sec_atomic_masked && upgraded.sec_atomic.as_ref() != Some(&secret));
+		assert!(
+			wallet
+				.get_private_context(mask.as_ref(), &slate)
+				.unwrap()
+				.sec_atomic
+				.as_ref() == Some(&secret)
+		);
+		wallet.close().unwrap();
+		drop(wallet);
+		fs::remove_dir_all(path).unwrap();
+	}
 }

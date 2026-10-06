@@ -76,7 +76,7 @@ impl Node {
 	}
 	pub fn status(&self, txid: Txid) -> Result<TxState, Error> {
 		match self {
-			Self::Core(n) => n.status(txid),
+			Self::Core(n) => n.swap_status(txid),
 			Self::Remote(n) => n.status(txid),
 		}
 	}

@@ -1068,6 +1068,9 @@ pub trait OwnerRpc {
 	 */
 	fn finalize_tx(&self, token: Token, slate: VersionedSlate) -> Result<VersionedSlate, Error>;
 
+	/// Complete a shared-output proof with owner authorization, without publishing.
+	fn presign_tx(&self, token: Token, slate: VersionedSlate) -> Result<VersionedSlate, Error>;
+
 	/**
 	Networked version of [Owner::post_tx](struct.Owner.html#method.post_tx).
 
@@ -2504,6 +2507,12 @@ where
 		)?;
 		let v = out_slate.version();
 		Ok(VersionedSlate::into_version(out_slate, v)?)
+	}
+
+	fn presign_tx(&self, token: Token, in_slate: VersionedSlate) -> Result<VersionedSlate, Error> {
+		let slate = Owner::presign_tx(self, token.keychain_mask.as_ref(), &Slate::from(in_slate))?;
+		let version = slate.version();
+		VersionedSlate::into_version(slate, version)
 	}
 
 	fn tx_lock_outputs(&self, token: Token, in_slate: VersionedSlate) -> Result<(), Error> {

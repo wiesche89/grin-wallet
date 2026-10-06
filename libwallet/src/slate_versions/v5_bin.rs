@@ -434,17 +434,20 @@ impl Readable for ProofWrap {
 				.try_into()
 				.map_err(|_| grin_ser::Error::CorruptedData)?,
 		)
-		.unwrap();
+		.map_err(|_| grin_ser::Error::CorruptedData)?;
 		let raddr = DalekPublicKey::from_bytes(
 			&reader
 				.read_fixed_bytes(32)?
 				.try_into()
 				.map_err(|_| grin_ser::Error::CorruptedData)?,
 		)
-		.unwrap();
+		.map_err(|_| grin_ser::Error::CorruptedData)?;
 		let rsig = match reader.read_u8()? {
 			0 => None,
-			1 | _ => Some(DalekSignature::try_from(&reader.read_fixed_bytes(64)?[..]).unwrap()),
+			1 | _ => Some(
+				DalekSignature::try_from(&reader.read_fixed_bytes(64)?[..])
+					.map_err(|_| grin_ser::Error::CorruptedData)?,
+			),
 		};
 		Ok(ProofWrap(PaymentInfoV5 { saddr, raddr, rsig }))
 	}

@@ -115,6 +115,42 @@ impl Preparation {
 		{
 			return Err(invalid("round contents"));
 		}
+		for name in names.iter().filter(|name| **name != "outputs") {
+			if let Some(previous) = self.slates.get(*name) {
+				if Slate::deserialize_upgrade(previous)?.id
+					!= Slate::deserialize_upgrade(&message.slates[*name])?.id
+				{
+					return Err(invalid("transaction identifier changed"));
+				}
+			}
+		}
+		let p = &self.proposal;
+		// Check new transaction offers against the approved amounts and deadlines
+		for (name, amount, height) in [
+			("fund", p.grin, None),
+			("success", p.grin - p.fee, None),
+			("revoke", p.grin - p.fee, Some(p.terms.revoke)),
+			("timeout", p.grin - 2 * p.fee, Some(p.terms.timeout)),
+			("refund", p.grin - 2 * p.fee, Some(p.terms.refund)),
+		] {
+			if (r == 0 && name != "refund") || (r == 1 && name == "refund") {
+				let slate = Slate::deserialize_upgrade(&message.slates[name])?;
+				if slate.amount != amount
+					|| (name != "fund" && slate.fee_fields.fee() != p.fee)
+					|| slate.kernel_features != if height.is_some() { 2 } else { 0 }
+					|| slate
+						.kernel_features_args
+						.as_ref()
+						.map(|args| args.lock_height)
+						!= height
+				{
+					return Err(invalid("transaction offer differs from agreed terms"));
+				}
+			}
+		}
+		// Bind cached wallet operations to the exact message before signing
+		self.receiving = Some(message.clone());
+		save(self)?;
 		for (name, slate) in &message.slates {
 			self.slates.insert(name.clone(), slate.clone());
 		}
@@ -192,7 +228,7 @@ impl Preparation {
 						api,
 						r,
 						name,
-						true,
+						false,
 						"presign_tx",
 						json!({"slate":self.slate(name)?}),
 						save,
@@ -249,6 +285,7 @@ impl Preparation {
 			_ => unreachable!(),
 		}
 		self.incoming = Some(message);
+		self.receiving = None;
 		save(self)
 	}
 }

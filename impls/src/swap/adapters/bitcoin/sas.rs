@@ -111,19 +111,43 @@ impl Contract {
 		fee: Amount,
 		key: &SecretKey,
 	) -> Result<Transaction, Error> {
+		let point = self.output(funding, network)?;
+		self.spend_output(funding, point.vout, network, destination, fee, key)
+	}
+
+	/// Recover a specific contract output after key recovery, including extra deposits.
+	/// This does not select or change the payment agreed for a swap.
+	pub fn spend_output(
+		&self,
+		funding: &Transaction,
+		vout: u32,
+		network: Network,
+		destination: &Address,
+		fee: Amount,
+		key: &SecretKey,
+	) -> Result<Transaction, Error> {
+		let output = funding
+			.output
+			.get(vout as usize)
+			.ok_or_else(|| invalid("SAS output index"))?;
+		if output.script_pubkey != self.address(network)?.script_pubkey()
+			|| output.value > Amount::MAX_MONEY
+		{
+			return Err(invalid("SAS recovery output"));
+		}
 		let secp = Secp256k1::new();
 		if key.public_key(&secp) != self.public()? {
 			return Err(invalid("SAS signing key"));
 		}
-		let value = self
-			.amount
+		let value = output
+			.value
 			.checked_sub(fee)
 			.ok_or_else(|| invalid("fee exceeds amount"))?;
 		let script_pubkey = destination.script_pubkey();
 		if fee == Amount::ZERO || value < script_pubkey.minimal_non_dust() {
 			return Err(invalid("invalid fee or dust output"));
 		}
-		let point = self.output(funding, network)?;
+		let point = OutPoint::new(funding.compute_txid(), vout);
 		let mut tx = Transaction {
 			version: btc::transaction::Version::TWO,
 			lock_time: btc::absolute::LockTime::ZERO,
@@ -175,6 +199,110 @@ pub fn verify(key: PublicKey, digest: [u8; 32], proof: &str) -> Result<(), Error
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn funding() {
+		let secp = Secp256k1::new();
+		let keys = [1, 2].map(|n| SecretKey::from_slice(&[n; 32]).unwrap());
+		let contract = Contract {
+			keys: keys.map(|key| PublicKey::new(key.public_key(&secp))),
+			amount: Amount::from_sat(100_000),
+		};
+		let address = contract.address(Network::Regtest).unwrap();
+		let mut tx = Transaction {
+			version: btc::transaction::Version::TWO,
+			lock_time: btc::absolute::LockTime::ZERO,
+			input: vec![],
+			output: vec![TxOut {
+				value: contract.amount,
+				script_pubkey: address.script_pubkey(),
+			}],
+		};
+		assert_eq!(contract.output(&tx, Network::Regtest).unwrap().vout, 0);
+		for amount in [99_999, 100_001] {
+			tx.output[0].value = Amount::from_sat(amount);
+			assert!(contract.output(&tx, Network::Regtest).is_err());
+		}
+		tx.output[0].value = contract.amount;
+		tx.output.push(tx.output[0].clone());
+		assert!(contract.output(&tx, Network::Regtest).is_err());
+		tx.output.pop();
+		let key = contract.recover(&keys[0], &keys[1]).unwrap();
+		for key in &keys {
+			assert!(contract
+				.spend(&tx, Network::Regtest, &address, Amount::from_sat(1000), key)
+				.is_err());
+		}
+		for fee in [0, 99_999, 100_001] {
+			assert!(contract
+				.spend(&tx, Network::Regtest, &address, Amount::from_sat(fee), &key)
+				.is_err());
+		}
+		let payout = contract
+			.spend(
+				&tx,
+				Network::Regtest,
+				&address,
+				Amount::from_sat(1000),
+				&key,
+			)
+			.unwrap();
+		assert_eq!(payout.output[0].value.to_sat(), 99_000);
+		assert_eq!(payout.input[0].previous_output.txid, tx.compute_txid());
+		// Recovery names an exact outpoint and uses its actual value, including
+		// duplicate and differently sized deposits. Negotiation remains strict.
+		tx.output.push(tx.output[0].clone());
+		tx.output[1].value = Amount::from_sat(120_000);
+		let recovered = contract
+			.spend_output(
+				&tx,
+				1,
+				Network::Regtest,
+				&address,
+				Amount::from_sat(1000),
+				&key,
+			)
+			.unwrap();
+		assert_eq!(recovered.input[0].previous_output.vout, 1);
+		assert_eq!(recovered.output[0].value.to_sat(), 119_000);
+		assert!(contract
+			.spend_output(
+				&tx,
+				2,
+				Network::Regtest,
+				&address,
+				Amount::from_sat(1000),
+				&key
+			)
+			.is_err());
+		tx.output[1].script_pubkey = btc::ScriptBuf::new();
+		assert!(contract
+			.spend_output(
+				&tx,
+				1,
+				Network::Regtest,
+				&address,
+				Amount::from_sat(1000),
+				&key
+			)
+			.is_err());
+		tx.output[0].script_pubkey = btc::ScriptBuf::new();
+		assert!(contract.output(&tx, Network::Regtest).is_err());
+	}
+
+	#[test]
+	fn rogue_key() {
+		let secp = Secp256k1::new();
+		let honest = SecretKey::from_slice(&[1; 32]).unwrap().public_key(&secp);
+		let attacker = SecretKey::from_slice(&[2; 32]).unwrap();
+		let rogue = attacker
+			.public_key(&secp)
+			.combine(&honest.negate(&secp))
+			.unwrap();
+		assert_eq!(honest.combine(&rogue).unwrap(), attacker.public_key(&secp));
+		assert!(verify(PublicKey::new(rogue), [1; 32], &prove(&attacker, [1; 32])).is_err());
+	}
+
 	#[test]
 	fn possession() {
 		let secp = Secp256k1::new();

@@ -116,7 +116,8 @@ pub enum TxState {
 }
 
 impl TxState {
-	fn confirmed(self, required: u64) -> bool {
+	/// Whether a fresh observation meets a nonzero confirmation requirement.
+	pub fn confirmed(self, required: u64) -> bool {
 		matches!(self, Self::Confirmed(n) if n >= required && required > 0)
 	}
 }

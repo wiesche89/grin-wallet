@@ -1024,9 +1024,11 @@ where
 	// Rather than duplicating the entire command, we'll just
 	// try to determine what kind of finalization this is
 	// based on the slate state
-	let is_invoice = matches!(slate.state, SlateState::Invoice2 | SlateState::Multisig3);
+	let is_invoice = slate.state == SlateState::Invoice2;
 
-	if is_invoice {
+	if slate.state == SlateState::Multisig3 {
+		slate = owner_api.presign_tx(keychain_mask, &slate)?;
+	} else if is_invoice {
 		let km = match keychain_mask.as_ref() {
 			None => None,
 			Some(&m) => Some(m.to_owned()),
@@ -1162,7 +1164,7 @@ where
 #[derive(Clone)]
 pub struct GetAtomicSecretsArgs {
 	pub id: u32,
-	pub amount: f64,
+	pub amount: u64,
 }
 
 /// Get atomic secrets from storage to recover funds on the other chain
@@ -1181,8 +1183,7 @@ where
 		keychain_mask,
 		owner_api.config_path(),
 		|api, m| {
-			let result =
-				api.get_atomic_secrets(m, args.id, (args.amount * (10_u64.pow(9) as f64)) as u64);
+			let result = api.get_atomic_secrets(m, args.id, args.amount);
 			match result {
 				Ok((local, recovered)) => {
 					println!("Local atomic secret: {}", local.to_hex());

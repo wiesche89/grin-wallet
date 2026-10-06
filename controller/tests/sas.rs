@@ -60,7 +60,9 @@ fn slate(
 fn multisig(
 	a: &(dyn OwnerRpc + 'static),
 	mask: Option<&SecretKey>,
-	b: &(dyn ForeignRpc + 'static),
+	b: &(dyn OwnerRpc + 'static),
+	bm: Option<&SecretKey>,
+	fb: &(dyn ForeignRpc + 'static),
 	args: InitTxArgs,
 ) -> Result<(Slate, Slate), libwallet::Error> {
 	let start = slate(a, mask, "init_send_tx", serde_json::json!({"args":args}))?;
@@ -71,7 +73,7 @@ fn multisig(
 		serde_json::json!({"slate":start}),
 	)?;
 	let received = foreign(
-		b,
+		fb,
 		"receive_tx",
 		serde_json::json!({"slate":start,"dest_acct_name":null,"dest":null}),
 	);
@@ -81,7 +83,7 @@ fn multisig(
 		"process_multisig_tx",
 		serde_json::json!({"slate":received}),
 	)?;
-	let partial = foreign(b, "presign_tx", serde_json::json!({"slate":processed}));
+	let partial = slate(b, bm, "presign_tx", serde_json::json!({"slate":processed}))?;
 	let full = slate(a, mask, "finalize_tx", serde_json::json!({"slate":partial}))?;
 	Ok((full, partial))
 }
@@ -130,10 +132,15 @@ enum Funding {
 	Core,
 	External,
 	Grouped,
+	Duplicate,
+	Replaced,
 }
 
 fn run(dir: &'static str, outcome: Outcome, funding: Funding) -> Result<(), libwallet::Error> {
-	let negotiated = funding == Funding::Grouped;
+	let negotiated = matches!(
+		funding,
+		Funding::Grouped | Funding::Duplicate | Funding::Replaced
+	);
 	let external = funding != Funding::Core;
 	common::clean_output_dir(dir);
 	common::setup(dir);
@@ -167,16 +174,22 @@ fn run(dir: &'static str, outcome: Outcome, funding: Funding) -> Result<(), libw
 	std::fs::write(&path, config.ser_config()?).unwrap();
 	let a = Owner::new(wallet1.clone(), None, path.clone());
 	let b = Owner::new(wallet2.clone(), None, path.clone());
+	let mut offline = config.members.wallet.bitcoin.clone().unwrap();
+	offline.url = "http://127.0.0.1:1".into();
+	offline.cookie = PathBuf::from(dir).join("missing.cookie");
+	let offline_a =
+		Owner::new(wallet1.clone(), None, path.clone()).with_bitcoin_config(offline.clone());
+	let offline_b = Owner::new(wallet2.clone(), None, path.clone()).with_bitcoin_config(offline);
 	let fa = Foreign::new(wallet1.clone(), path.clone(), mask1.clone(), None, false);
 	let fb = Foreign::new(wallet2.clone(), path.clone(), mask2.clone(), None, false);
 	a.retrieve_summary_info(am, true, 1)?;
 	let terms = Terms {
-		revoke: 22,
-		refund: 30,
-		timeout: 38,
+		revoke: 40,
+		refund: 64,
+		timeout: 88,
 		confirmations: 2,
 		bitcoin_confirmations: 2,
-		margin: 3,
+		margin: 12,
 	};
 	let fee = core::libtx::tx_fee(1, 1, 1);
 	let value = 5_012_500_000;
@@ -188,6 +201,8 @@ fn run(dir: &'static str, outcome: Outcome, funding: Funding) -> Result<(), libw
 		let (fund, partial) = multisig(
 			&a,
 			am,
+			&b,
+			bm,
 			&fb,
 			InitTxArgs {
 				amount: value,
@@ -212,6 +227,8 @@ fn run(dir: &'static str, outcome: Outcome, funding: Funding) -> Result<(), libw
 		let (revoke, _) = multisig(
 			&a,
 			am,
+			&b,
+			bm,
 			&fb,
 			InitTxArgs {
 				amount: value - fee,
@@ -343,6 +360,10 @@ fn run(dir: &'static str, outcome: Outcome, funding: Funding) -> Result<(), libw
 		(id, revoke, refund, timeout, destination)
 	};
 	assert_eq!(chain.head().unwrap().height, 10);
+	assert!(offline_a.sas(am, Request::Step { id }).is_err());
+	for (owner, mask) in [(&a, am), (&b, bm)] {
+		assert!(owner.sas(mask, Request::WithdrawAuto { id }).is_err());
+	}
 	assert_eq!(sas(&a, am, Request::Step { id })?.action, Action::FundGrin);
 	assert_eq!(sas(&b, bm, Request::Step { id })?.action, Action::Wait);
 	test_framework::award_blocks_to_wallet(&chain, wallet1.clone(), am, 1, false)?;
@@ -394,6 +415,60 @@ fn run(dir: &'static str, outcome: Outcome, funding: Funding) -> Result<(), libw
 		},
 	)?;
 	assert_eq!(sas(&a, am, Request::Step { id })?.action, Action::Wait);
+	let mut duplicates = Vec::new();
+	if matches!(funding, Funding::Duplicate | Funding::Replaced) {
+		let original = sas(&a, am, Request::Status { id })?.funding.unwrap();
+		if funding == Funding::Replaced {
+			assert_eq!(
+				sas(&b, bm, Request::Step { id })?.funding,
+				Some(original.clone())
+			);
+		}
+		let original_id = bitcoin(&["decoderawtransaction", &original])["txid"]
+			.as_str()
+			.unwrap()
+			.to_owned();
+		let replacement_id = bitcoin(&["bumpfee", &original_id, r#"{"fee_rate":4}"#])["txid"]
+			.as_str()
+			.unwrap()
+			.to_owned();
+		let replacement = bitcoin(&["gettransaction", &replacement_id])["hex"]
+			.as_str()
+			.unwrap()
+			.to_owned();
+		// An RBF replacement paying the same address must not silently rebind
+		// the seller, even before signature release. Recovery remains available.
+		assert_eq!(
+			sas(&a, am, Request::Step { id })?.funding,
+			Some(original.clone())
+		);
+		assert!(a
+			.sas(
+				am,
+				Request::Receive {
+					id,
+					funding: Some(replacement.clone()),
+					success: None
+				}
+			)
+			.is_err());
+		let address = &funded.payment.as_ref().unwrap().address;
+		let txid = bitcoin(&["sendtoaddress", address, "0.001"]);
+		let extra = bitcoin(&["gettransaction", txid.as_str().unwrap()])["hex"]
+			.as_str()
+			.unwrap()
+			.to_owned();
+		assert_eq!(
+			sas(&a, am, Request::Step { id })?.funding,
+			Some(original.clone())
+		);
+		if funding == Funding::Duplicate {
+			assert!(b.sas(bm, Request::Step { id }).is_err());
+		} else {
+			assert_eq!(sas(&b, bm, Request::Step { id })?.funding, Some(original));
+		}
+		duplicates = vec![replacement, extra];
+	}
 	bitcoin(&["-generate", "2"]);
 	if outcome == Outcome::Claim {
 		let tip = bitcoin(&["getbestblockhash"]);
@@ -405,8 +480,35 @@ fn run(dir: &'static str, outcome: Outcome, funding: Funding) -> Result<(), libw
 	}
 	match outcome {
 		Outcome::Claim => {
+			assert!(offline_a.sas(am, Request::Step { id }).is_err());
+			assert!(sas(&a, am, Request::Status { id })?.main.is_none());
 			let released = sas(&a, am, Request::Step { id })?;
 			assert_eq!(released.action, Action::Release);
+			let original = Slate::deserialize_upgrade(released.main.as_ref().unwrap())?;
+			let before = serde_json::to_value(sas(&b, bm, Request::Status { id })?).unwrap();
+			for mutation in 0..4 {
+				let mut changed = original.clone();
+				match mutation {
+					0 => changed.id = uuid::Uuid::new_v4(),
+					1 => changed.amount += 1,
+					2 => changed.participant_data[1] = changed.participant_data[0].clone(),
+					_ => changed.kernel_features = 2,
+				}
+				assert!(b
+					.sas(
+						bm,
+						Request::Receive {
+							id,
+							funding: None,
+							success: Some(serde_json::to_string(&changed).unwrap()),
+						}
+					)
+					.is_err());
+				assert_eq!(
+					before,
+					serde_json::to_value(sas(&b, bm, Request::Status { id })?).unwrap()
+				);
+			}
 			sas(
 				&b,
 				bm,
@@ -416,9 +518,17 @@ fn run(dir: &'static str, outcome: Outcome, funding: Funding) -> Result<(), libw
 					success: released.main,
 				},
 			)?;
+			let tip = bitcoin(&["getbestblockhash"]);
+			assert!(offline_b.sas(bm, Request::Step { id }).is_err());
+			bitcoin(&["invalidateblock", tip.as_str().unwrap()]);
+			assert_eq!(sas(&b, bm, Request::Step { id })?.action, Action::Wait);
+			bitcoin(&["reconsiderblock", tip.as_str().unwrap()]);
 			assert_eq!(sas(&b, bm, Request::Step { id })?.action, Action::ClaimGrin);
 			test_framework::award_blocks_to_wallet(&chain, wallet1.clone(), am, 1, false)?;
-			assert_eq!(sas(&a, am, Request::Step { id })?.action, Action::Complete);
+			assert_eq!(
+				sas(&offline_a, am, Request::Step { id })?.action,
+				Action::Complete
+			);
 			assert_eq!(sas(&b, bm, Request::Step { id })?.action, Action::Complete);
 			for (owner, mask) in [(&a, am), (&b, bm)] {
 				let (_, txs) = owner.retrieve_txs(mask, true, None, None, None)?;
@@ -453,10 +563,21 @@ fn run(dir: &'static str, outcome: Outcome, funding: Funding) -> Result<(), libw
 			assert!(resumed
 				.sas(rm, Request::Withdraw { id, fee: 5001 })
 				.is_err());
-			sas(&resumed, rm, Request::Withdraw { id, fee: 1000 })?;
-			sas(&resumed, rm, Request::Withdraw { id, fee: 1000 })?;
+			let sent = sas(&resumed, rm, Request::Withdraw { id, fee: 1000 })?;
+			assert_eq!(
+				sent.payout.as_ref().unwrap().status,
+				libwallet::swap::TxState::Absent
+			);
+			let pending = sas(&resumed, rm, Request::WithdrawAuto { id })?;
+			assert_eq!(pending.withdrawal, sent.withdrawal);
+			assert_eq!(
+				pending.payout.as_ref().unwrap().status,
+				libwallet::swap::TxState::Pending
+			);
 			sas(&resumed, rm, Request::Withdraw { id, fee: 2000 })?;
 			bitcoin(&["-generate", "2"]);
+			let confirmed = sas(&resumed, rm, Request::WithdrawAuto { id })?;
+			assert!(confirmed.payout.as_ref().unwrap().status.confirmed(2));
 			if let Some(address) = &destination {
 				let received = bitcoin(&["getreceivedbyaddress", address, "1", "true"]);
 				assert_eq!(received.as_f64(), Some(0.00098));
@@ -464,9 +585,65 @@ fn run(dir: &'static str, outcome: Outcome, funding: Funding) -> Result<(), libw
 			assert!(resumed
 				.sas(rm, Request::Withdraw { id, fee: 3000 })
 				.is_err());
+			if negotiated {
+				let address = &funded.payment.as_ref().unwrap().address;
+				let original = sas(&resumed, rm, Request::Status { id })?.funding;
+				let mut extras = Vec::new();
+				for amount in ["0.001", "0.00123"] {
+					let txid = bitcoin(&["sendtoaddress", address, amount]);
+					let raw = bitcoin(&["gettransaction", txid.as_str().unwrap()])["hex"]
+						.as_str()
+						.unwrap()
+						.to_owned();
+					let decoded = bitcoin(&["decoderawtransaction", &raw]);
+					let vout = decoded["vout"]
+						.as_array()
+						.unwrap()
+						.iter()
+						.find(|out| out["scriptPubKey"]["address"] == *address)
+						.unwrap()["n"]
+						.as_u64()
+						.unwrap() as u32;
+					extras.push((raw, vout));
+				}
+				bitcoin(&["-generate", "2"]);
+				for (funding, vout) in extras {
+					let recover = |fee| Request::Recover {
+						id,
+						funding: funding.clone(),
+						vout,
+						fee,
+					};
+					assert!(b.sas(bm, recover(1000)).is_err());
+					assert!(resumed.sas(rm, recover(5001)).is_err());
+					let first = sas(&resumed, rm, recover(1000))?;
+					// Reload the journal through a new owner instance and retry.
+					let reopened = Owner::new(wallet1.clone(), None, path.clone());
+					let repeated = sas(&reopened, rm, recover(1000))?;
+					assert_eq!(first.withdrawal, repeated.withdrawal);
+					assert_eq!(
+						repeated.payout.unwrap().status,
+						libwallet::swap::TxState::Pending
+					);
+					assert!(reopened.sas(rm, recover(999)).is_err());
+					let bumped = sas(&reopened, rm, recover(2000))?;
+					assert_ne!(bumped.withdrawal, first.withdrawal);
+					bitcoin(&["-generate", "2"]);
+					assert!(sas(&reopened, rm, recover(2000))?
+						.payout
+						.unwrap()
+						.status
+						.confirmed(2));
+					assert!(reopened.sas(rm, recover(3000)).is_err());
+				}
+				let unchanged = sas(&resumed, rm, Request::Status { id })?;
+				assert_eq!(unchanged.funding, original);
+				assert_eq!(unchanged.withdrawal, confirmed.withdrawal);
+			}
 		}
 		Outcome::Refund | Outcome::Timeout => {
-			sas(&a, am, Request::Abort { id })?;
+			sas(&offline_a, am, Request::Abort { id })?;
+			assert_eq!(sas(&a, am, Request::Step { id })?.action, Action::Wait);
 			let count = terms.revoke - chain.head().unwrap().height;
 			test_framework::award_blocks_to_wallet(
 				&chain,
@@ -476,12 +653,24 @@ fn run(dir: &'static str, outcome: Outcome, funding: Funding) -> Result<(), libw
 				false,
 			)?;
 			assert_eq!(
-				sas(&b, bm, Request::Step { id })?.action,
+				sas(&offline_b, bm, Request::Step { id })?.action,
 				Action::RevokeGrin
 			);
 			assert_eq!(sas(&a, am, Request::Step { id })?.action, Action::Wait);
+			test_framework::award_blocks_to_wallet(
+				&chain,
+				wallet1.clone(),
+				am,
+				terms.confirmations as usize,
+				false,
+			)?;
+			let waiting = sas(&offline_a, am, Request::Step { id })?;
+			assert_eq!(waiting.action, Action::Wait);
+			assert!(waiting.chain.is_none());
+			assert!(waiting.grin.unwrap().revoke.confirmed(terms.confirmations));
 			let target = if outcome == Outcome::Refund {
-				terms.refund
+				// First refund at the old cutoff must still be published.
+				terms.timeout - terms.margin
 			} else {
 				terms.timeout
 			};
@@ -495,21 +684,80 @@ fn run(dir: &'static str, outcome: Outcome, funding: Funding) -> Result<(), libw
 			)?;
 			if outcome == Outcome::Refund {
 				assert_eq!(
-					sas(&a, am, Request::Step { id })?.action,
+					sas(&offline_a, am, Request::Step { id })?.action,
 					Action::RefundGrin
 				);
 				test_framework::award_blocks_to_wallet(&chain, wallet1.clone(), am, 1, false)?;
 				assert_eq!(sas(&a, am, Request::Step { id })?.action, Action::Refunded);
-				assert_eq!(sas(&b, bm, Request::Step { id })?.action, Action::Refunded);
-				let payout = sas(&b, bm, Request::WithdrawAuto { id })?;
-				let repeated = sas(&b, bm, Request::WithdrawAuto { id })?;
-				assert!(payout.withdrawal.is_some());
-				assert_eq!(payout.withdrawal, repeated.withdrawal);
-				bitcoin(&["-generate", "2"]);
-			} else {
-				assert_eq!(sas(&a, am, Request::Step { id })?.action, Action::Wait);
+				let recovered = sas(&offline_b, bm, Request::Step { id })?;
 				assert_eq!(
-					sas(&b, bm, Request::Step { id })?.action,
+					recovered.action,
+					if recovered.funding.is_none() {
+						Action::OwnBitcoin
+					} else {
+						Action::Refunded
+					}
+				);
+				// The grouped buyer has not observed its external payment yet. Its
+				// offline key recovery must still allow the subsequent withdrawal.
+				if matches!(funding, Funding::Duplicate | Funding::Replaced) {
+					let bound = recovered.funding.clone();
+					if funding == Funding::Duplicate {
+						assert!(bound.is_none());
+						assert!(b.sas(bm, Request::WithdrawAuto { id }).is_err());
+					} else {
+						assert!(bound.is_some());
+						for _ in 0..2 {
+							let reply = sas(&b, bm, Request::WithdrawAuto { id })?;
+							assert!(reply.funding_recovery);
+							assert_eq!(reply.action, Action::Refunded);
+							let mut lock = wallet2.lock();
+							let w = lock.lc_provider()?.wallet_inst()?;
+							let saved = w.load_swap::<serde_json::Value>(&id)?.unwrap();
+							assert_eq!(
+								saved["action"],
+								serde_json::to_value(reply.action).unwrap()
+							);
+							assert!(!saved["funding"].is_null());
+							assert!(reply.withdrawal.is_none() && reply.payout.is_none());
+						}
+					}
+					for raw in duplicates {
+						let decoded = bitcoin(&["decoderawtransaction", &raw]);
+						let address = &funded.payment.as_ref().unwrap().address;
+						let vout = decoded["vout"]
+							.as_array()
+							.unwrap()
+							.iter()
+							.find(|out| out["scriptPubKey"]["address"] == *address)
+							.unwrap()["n"]
+							.as_u64()
+							.unwrap() as u32;
+						let request = Request::Recover {
+							id,
+							funding: raw,
+							vout,
+							fee: 1000,
+						};
+						let sent = sas(&b, bm, request.clone())?;
+						assert!(sent.withdrawal.is_some());
+						assert_eq!(sas(&b, bm, Request::Step { id })?.funding, bound);
+						assert_eq!(sas(&b, bm, request.clone())?.withdrawal, sent.withdrawal);
+						bitcoin(&["-generate", "2"]);
+						assert!(sas(&b, bm, request)?.payout.unwrap().status.confirmed(2));
+					}
+				} else {
+					let payout = sas(&b, bm, Request::WithdrawAuto { id })?;
+					let repeated = sas(&b, bm, Request::WithdrawAuto { id })?;
+					assert!(payout.withdrawal.is_some());
+					assert_eq!(payout.withdrawal, repeated.withdrawal);
+					bitcoin(&["-generate", "2"]);
+				}
+			} else {
+				// Simulate a seller withholding its refund: an honest seller would now
+				// keep attempting RefundGrin instead of giving up before timeout.
+				assert_eq!(
+					sas(&offline_b, bm, Request::Step { id })?.action,
 					Action::TimeoutGrin
 				);
 				test_framework::award_blocks_to_wallet(&chain, wallet1.clone(), am, 1, false)?;
@@ -591,5 +839,25 @@ fn grouped_timeout() -> Result<(), libwallet::Error> {
 		"test_output/sas_grouped_timeout",
 		Outcome::Timeout,
 		Funding::Grouped,
+	)
+}
+
+#[test]
+#[ignore = "requires an isolated funded Bitcoin Core regtest wallet"]
+fn duplicate_refund() -> Result<(), libwallet::Error> {
+	run(
+		"test_output/sas_duplicate_refund",
+		Outcome::Refund,
+		Funding::Duplicate,
+	)
+}
+
+#[test]
+#[ignore = "requires an isolated funded Bitcoin Core regtest wallet"]
+fn replaced_refund() -> Result<(), libwallet::Error> {
+	run(
+		"test_output/sas_replaced_refund",
+		Outcome::Refund,
+		Funding::Replaced,
 	)
 }

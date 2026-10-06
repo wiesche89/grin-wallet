@@ -152,18 +152,49 @@ fn atomic_tx_impl(test_dir: &'static str) -> Result<(), libwallet::Error> {
 		mask1.clone(),
 		PathBuf::from(test_dir),
 		|api, m| {
-			slate = api.process_multisig_tx(m, &slate)?;
+			let request = slate.clone();
+			slate = api.process_multisig_tx(m, &request)?;
+			let replay = api.process_multisig_tx(m, &request)?;
+			assert_eq!(
+				serde_json::to_value(&slate).unwrap(),
+				serde_json::to_value(&replay).unwrap()
+			);
+			let mut changed = request.clone();
+			changed.amount += 1;
+			assert!(api.process_multisig_tx(m, &changed).is_err());
 			Ok(())
 		},
 	)?;
 	assert_eq!(slate.state, SlateState::Multisig3);
 
+	// Remote callers cannot finalize swap rounds, even without posting.
 	wallet::controller::foreign_single_use(
 		wallet2.clone(),
 		PathBuf::from(test_dir),
 		mask2_i.clone(),
 		|api| {
-			slate = api.finalize_tx(&slate, false)?;
+			assert!(api.finalize_tx(&slate, false).is_err());
+			assert!(api.finalize_tx(&slate, true).is_err());
+			// The local context remains swap-only even if the wire state is ordinary.
+			let mut ordinary = slate.clone();
+			ordinary.state = SlateState::Standard2;
+			ordinary.participant_data.clear();
+			assert!(matches!(
+				api.finalize_tx(&ordinary, false),
+				Err(libwallet::Error::SlateState)
+			));
+			let versioned =
+				libwallet::VersionedSlate::into_version(slate.clone(), slate.version())?;
+			assert!(grin_wallet_api::ForeignRpc::presign_tx(api, versioned).is_err());
+			Ok(())
+		},
+	)?;
+	wallet::controller::owner_single_use(
+		wallet2.clone(),
+		mask2_i.as_ref(),
+		PathBuf::from(test_dir),
+		|api, m| {
+			slate = api.presign_tx(m, &slate)?;
 			Ok(())
 		},
 	)?;
@@ -242,12 +273,34 @@ fn atomic_tx_impl(test_dir: &'static str) -> Result<(), libwallet::Error> {
 	assert_eq!(slate.state, SlateState::Atomic3);
 
 	// wallet 2 finalizes and posts the atomic swap
+	// Remote callers cannot finalize swap rounds, even without posting.
 	wallet::controller::foreign_single_use(
 		wallet2.clone(),
 		PathBuf::from(test_dir),
 		mask2_i.clone(),
 		|api| {
-			slate = api.finalize_tx(&slate, false)?;
+			assert!(api.finalize_tx(&slate, false).is_err());
+			assert!(api.finalize_tx(&slate, true).is_err());
+			// The local context remains swap-only even if the wire state is ordinary.
+			let mut ordinary = slate.clone();
+			ordinary.state = SlateState::Standard2;
+			ordinary.participant_data.clear();
+			assert!(matches!(
+				api.finalize_tx(&ordinary, false),
+				Err(libwallet::Error::SlateState)
+			));
+			let versioned =
+				libwallet::VersionedSlate::into_version(slate.clone(), slate.version())?;
+			assert!(grin_wallet_api::ForeignRpc::presign_tx(api, versioned).is_err());
+			Ok(())
+		},
+	)?;
+	wallet::controller::owner_single_use(
+		wallet2.clone(),
+		mask2_i.as_ref(),
+		PathBuf::from(test_dir),
+		|api, m| {
+			slate = api.finalize_atomic_swap(m, &slate)?;
 			Ok(())
 		},
 	)?;
@@ -379,18 +432,49 @@ fn atomic_refund_tx_impl(test_dir: &'static str) -> Result<(), libwallet::Error>
 		mask1.clone(),
 		PathBuf::from(test_dir),
 		|api, m| {
-			slate = api.process_multisig_tx(m, &slate)?;
+			let request = slate.clone();
+			slate = api.process_multisig_tx(m, &request)?;
+			let replay = api.process_multisig_tx(m, &request)?;
+			assert_eq!(
+				serde_json::to_value(&slate).unwrap(),
+				serde_json::to_value(&replay).unwrap()
+			);
+			let mut changed = request.clone();
+			changed.amount += 1;
+			assert!(api.process_multisig_tx(m, &changed).is_err());
 			Ok(())
 		},
 	)?;
 	assert_eq!(slate.state, SlateState::Multisig3);
 
+	// Remote callers cannot finalize swap rounds, even without posting.
 	wallet::controller::foreign_single_use(
 		wallet2.clone(),
 		PathBuf::from(test_dir),
 		mask2_i.clone(),
 		|api| {
-			slate = api.finalize_tx(&slate, false)?;
+			assert!(api.finalize_tx(&slate, false).is_err());
+			assert!(api.finalize_tx(&slate, true).is_err());
+			// The local context remains swap-only even if the wire state is ordinary.
+			let mut ordinary = slate.clone();
+			ordinary.state = SlateState::Standard2;
+			ordinary.participant_data.clear();
+			assert!(matches!(
+				api.finalize_tx(&ordinary, false),
+				Err(libwallet::Error::SlateState)
+			));
+			let versioned =
+				libwallet::VersionedSlate::into_version(slate.clone(), slate.version())?;
+			assert!(grin_wallet_api::ForeignRpc::presign_tx(api, versioned).is_err());
+			Ok(())
+		},
+	)?;
+	wallet::controller::owner_single_use(
+		wallet2.clone(),
+		mask2_i.as_ref(),
+		PathBuf::from(test_dir),
+		|api, m| {
+			slate = api.presign_tx(m, &slate)?;
 			Ok(())
 		},
 	)?;
@@ -665,12 +749,17 @@ fn atomic_end_to_end_tx_impl(
 	)?;
 	assert_eq!(slate.state, SlateState::Multisig3);
 
-	wallet::controller::foreign_single_use(
+	wallet::controller::owner_single_use(
 		wallet2.clone(),
+		mask2_i.as_ref(),
 		PathBuf::from(test_dir),
-		mask2_i.clone(),
-		|api| {
-			slate = foreign(api, "presign_tx", serde_json::json!({"slate": slate}));
+		|api, m| {
+			slate = Slate::from(rpc::<libwallet::VersionedSlate>(
+				api,
+				m,
+				"presign_tx",
+				serde_json::json!({"slate": slate}),
+			)?);
 			Ok(())
 		},
 	)?;
@@ -1204,12 +1293,34 @@ fn atomic_end_to_end_tx_impl(
 	assert_eq!(slate.state, SlateState::Atomic3);
 
 	// wallet 2 finalizes and posts the atomic swap
+	// Remote callers cannot finalize swap rounds, even without posting.
 	wallet::controller::foreign_single_use(
 		wallet2.clone(),
 		PathBuf::from(test_dir),
 		mask2_i.clone(),
 		|api| {
-			slate = api.finalize_tx(&slate, false)?;
+			assert!(api.finalize_tx(&slate, false).is_err());
+			assert!(api.finalize_tx(&slate, true).is_err());
+			// The local context remains swap-only even if the wire state is ordinary.
+			let mut ordinary = slate.clone();
+			ordinary.state = SlateState::Standard2;
+			ordinary.participant_data.clear();
+			assert!(matches!(
+				api.finalize_tx(&ordinary, false),
+				Err(libwallet::Error::SlateState)
+			));
+			let versioned =
+				libwallet::VersionedSlate::into_version(slate.clone(), slate.version())?;
+			assert!(grin_wallet_api::ForeignRpc::presign_tx(api, versioned).is_err());
+			Ok(())
+		},
+	)?;
+	wallet::controller::owner_single_use(
+		wallet2.clone(),
+		mask2_i.as_ref(),
+		PathBuf::from(test_dir),
+		|api, m| {
+			slate = api.finalize_atomic_swap(m, &slate)?;
 			Ok(())
 		},
 	)?;
@@ -1373,6 +1484,13 @@ fn round_restart() {
 			);
 			assert_eq!(w.iter().unwrap().count(), 1);
 			assert_eq!(w.tx_log_iter().unwrap().count(), 1);
+			let mut changed = request.clone();
+			changed.amount += 1;
+			let mut batch = w.batch(None).unwrap();
+			assert!(batch.save_round(&changed, 2, None).is_err());
+			assert!(batch.save_round(&request, 2, None).is_err());
+			drop(batch);
+			assert!(w.atomic_round(&request.id, 2).unwrap().is_some());
 			let id = w.get_used_atomic_id(&request.id).unwrap();
 			let context = w.get_private_context(None, request.id.as_bytes()).unwrap();
 			assert_eq!(

@@ -119,6 +119,7 @@ pub struct Preparation {
 	pub outgoing: Option<Message>,
 	next: u8,
 	incoming: Option<Message>,
+	receiving: Option<Message>,
 	slates: BTreeMap<String, String>,
 	saved: BTreeMap<String, Value>,
 	pending: Option<String>,
@@ -186,8 +187,10 @@ impl Preparation {
 	/// Reserve the proposal before constructing any transaction
 	pub fn new(proposal: Proposal, address: String) -> Result<Self, Error> {
 		proposal.validate()?;
+		proposal.terms.validate_offer()?;
 		use crate::impls::swap::adapters::bitcoin::types::{Address, Network};
 		let network = Network::from_str(&proposal.network).map_err(|_| invalid("network"))?;
+		super::test_network(network)?;
 		Address::from_str(&address)
 			.map_err(|_| invalid("payout address"))?
 			.require_network(network)
@@ -203,6 +206,7 @@ impl Preparation {
 			outgoing: None,
 			next: 1,
 			incoming: None,
+			receiving: None,
 			slates: BTreeMap::new(),
 			saved: BTreeMap::new(),
 			pending: None,
@@ -303,14 +307,34 @@ impl Preparation {
 		if let Some(value) = self.saved.get(&key) {
 			return decode(value.clone());
 		}
-		if self.pending.is_some() {
-			return Err(invalid(
-				"interrupted preparation; review pending wallet transactions before restarting",
-			));
-		}
-		self.pending = Some(key.clone());
-		save(self)?;
-		let result: T = api.call(foreign, method, params)?;
+		let result: T = if let Some(pending) = &self.pending {
+			if pending != &key {
+				return Err(invalid("another operation is pending"));
+			}
+			let round = match method {
+				"receive_atomic_tx" => 2,
+				"countersign_atomic_swap" => 3,
+				"finalize_atomic_swap" => 4,
+				"process_multisig_tx" => 5,
+				_ => {
+					return Err(invalid(
+						"preparation interrupted; cancel and create a new offer",
+					))
+				}
+			};
+			let reply = api.sas(Request::Replay {
+				round,
+				slate: params["slate"].to_string(),
+			})?;
+			let slate = reply
+				.main
+				.ok_or_else(|| invalid("preparation interrupted; cancel and create a new offer"))?;
+			serde_json::from_str(&slate).map_err(|e| invalid(&e.to_string()))?
+		} else {
+			self.pending = Some(key.clone());
+			save(self)?;
+			api.call(foreign, method, params)?
+		};
 		self.saved.insert(
 			key,
 			serde_json::to_value(&result).map_err(|e| invalid(&e.to_string()))?,
@@ -423,6 +447,16 @@ impl Preparation {
 		{
 			return Err(invalid("unexpected message"));
 		}
+		if let Some(receiving) = &self.receiving {
+			if receiving != &message {
+				return Err(invalid("message changed during preparation"));
+			}
+		} else {
+			let prefix = format!("{}-", message.round);
+			if self.pending.is_some() || self.saved.keys().any(|key| key.starts_with(&prefix)) {
+				return Err(invalid("interrupted preparation without saved message"));
+			}
+		}
 		self.receive_grouped(api, message, save)?;
 		self.track(api)
 	}
@@ -468,11 +502,7 @@ impl Preparation {
 
 	/// Cancel a complete local preparation before funding
 	pub fn cancel(&self, api: &Driver) -> Result<(), Error> {
-		if self.pending.is_some() {
-			return Err(invalid(
-				"interrupted preparation; review pending wallet transactions",
-			));
-		}
+		// The wallet checks publication and chain state before releasing reserved inputs
 		if self.slates.contains_key("fund") {
 			let _: super::Reply = api.call(
 				false,

@@ -1074,6 +1074,20 @@ where
 		owner::process_multisig_tx(w, keychain_mask, slate, self.doctest_mode)
 	}
 
+	/// Complete the receiver's shared-output proof without publishing it.
+	pub fn presign_tx(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		slate: &Slate,
+	) -> Result<Slate, Error> {
+		if slate.state != libwallet::SlateState::Multisig3 {
+			return Err(Error::SlateState);
+		}
+		let mut lock = self.wallet_inst.lock();
+		let w = lock.lc_provider()?.wallet_inst()?;
+		libwallet::api_impl::foreign::finalize_tx(w, keychain_mask, slate, false)
+	}
+
 	/// Initializes an atomic swap transaction. The transaction can either be
 	/// the main or refund. To create a refund transaction, set `args.late_lock = Some(true)`
 	pub fn init_atomic_swap(

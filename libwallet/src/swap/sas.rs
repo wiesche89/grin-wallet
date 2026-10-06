@@ -49,6 +49,22 @@ impl Terms {
 		Ok(())
 	}
 
+	/// Minimum policy for new offers; existing swaps retain their recovery deadlines.
+	pub fn validate_offer(self) -> Result<(), Error> {
+		self.validate()?;
+		let margin = self.confirmations.checked_mul(6);
+		let window = self.margin.checked_mul(2);
+		if self.confirmations < 2
+			|| self.bitcoin_confirmations < 2
+			|| margin.map_or(true, |n| self.margin < n)
+			|| window.map_or(true, |n| {
+				self.refund - self.revoke < n || self.timeout - self.refund < n
+			}) {
+			return Err(Error::GenericError("SAS offers require at least two confirmations per chain, six Grin confirmation intervals of margin and two margins between recovery deadlines".into()));
+		}
+		Ok(())
+	}
+
 	fn before(self, height: u64, deadline: u64) -> bool {
 		height
 			.checked_add(self.margin)
@@ -88,6 +104,43 @@ pub struct View {
 	pub bitcoin_unspent: bool,
 }
 
+/// Grin facts needed for recovery without a Bitcoin connection
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct GrinView {
+	/// Current height
+	pub height: u64,
+	/// Funding kernel
+	pub funding: TxState,
+	/// Success kernel
+	pub success: TxState,
+	/// Revoke kernel
+	pub revoke: TxState,
+	/// Refund kernel
+	pub refund: TxState,
+	/// Timeout kernel
+	pub timeout: TxState,
+	/// Funding output remains unspent
+	pub funded: bool,
+	/// Revoke output remains unspent
+	pub revoked: bool,
+}
+
+impl View {
+	/// Separate Grin observations from Bitcoin observations
+	pub fn grin(self) -> GrinView {
+		GrinView {
+			height: self.height,
+			funding: self.funding,
+			success: self.success,
+			revoke: self.revoke,
+			refund: self.refund,
+			timeout: self.timeout,
+			funded: self.funded,
+			revoked: self.revoked,
+		}
+	}
+}
+
 /// Durable facts; confirmations are always read again from the chains
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Flow {
@@ -110,6 +163,51 @@ pub struct Flow {
 }
 
 impl Flow {
+	/// Select recovery using only a fresh Grin observation
+	pub fn recovery(&self, view: GrinView) -> Result<Option<Action>, Error> {
+		use Action::*;
+		self.terms.validate()?;
+		let confirmed = |tx: TxState| tx.confirmed(self.terms.confirmations);
+		if !self.prepared {
+			return Ok(Some(Wait));
+		}
+		if confirmed(view.timeout) {
+			return Ok(Some(TimedOut));
+		}
+		if confirmed(view.success) {
+			return Ok(Some(match self.role {
+				Role::SellGrin if !self.owned => OwnBitcoin,
+				_ => Complete,
+			}));
+		}
+		if confirmed(view.refund) {
+			return Ok(Some(match self.role {
+				Role::BuyGrin if !self.owned => OwnBitcoin,
+				_ => Refunded,
+			}));
+		}
+		if self.owned {
+			return Ok(Some(Wait));
+		}
+		if self.claimed && view.funded && !confirmed(view.revoke) {
+			return Ok(Some(ClaimGrin));
+		}
+		if self.refund_sent && view.revoked && confirmed(view.revoke) {
+			return Ok(Some(RefundGrin));
+		}
+		if confirmed(view.revoke) && view.revoked {
+			return Ok(Some(match self.role {
+				Role::SellGrin if view.height >= self.terms.refund => RefundGrin,
+				Role::BuyGrin if view.height >= self.terms.timeout => TimeoutGrin,
+				_ => Wait,
+			}));
+		}
+		if view.funded && view.height >= self.terms.revoke {
+			return Ok(Some(RevokeGrin));
+		}
+		Ok(None)
+	}
+
 	/// Choose one action without assuming any mempool ordering
 	pub fn next(&self, view: View) -> Result<Action, Error> {
 		use Action::*;
@@ -142,31 +240,13 @@ impl Flow {
 		if self.owned {
 			return Ok(Wait);
 		}
-		if self.claimed && view.funded && !confirmed(view.revoke) {
-			return Ok(ClaimGrin);
-		}
-		if self.refund_sent && view.revoked && confirmed(view.revoke) {
-			return Ok(RefundGrin);
+		if let Some(action) = self.recovery(view.grin())? {
+			return Ok(action);
 		}
 		let open = !self.aborted && self.terms.open(view.height);
 		let funded = view.funded && confirmed(view.funding);
 		let bitcoin =
 			view.bitcoin_unspent && view.bitcoin.confirmed(self.terms.bitcoin_confirmations);
-		if confirmed(view.revoke) && view.revoked {
-			return Ok(match self.role {
-				Role::SellGrin
-					if view.height >= self.terms.refund
-						&& self.terms.before(view.height, self.terms.timeout) =>
-				{
-					RefundGrin
-				}
-				Role::BuyGrin if view.height >= self.terms.timeout => TimeoutGrin,
-				_ => Wait,
-			});
-		}
-		if view.funded && view.height >= self.terms.revoke {
-			return Ok(RevokeGrin);
-		}
 		Ok(match self.role {
 			Role::SellGrin if open && !self.released && funded && bitcoin => Release,
 			Role::SellGrin
@@ -228,6 +308,53 @@ mod tests {
 	}
 
 	#[test]
+	fn pending_is_not_confirmation() {
+		let (mut flow, mut view) = setup(Role::SellGrin);
+		flow.released = false;
+		view.funding = TxState::Pending;
+		view.funded = false;
+		assert_eq!(flow.next(view).unwrap(), Action::Wait);
+		view.height = flow.terms.refund;
+		view.revoke = TxState::Pending;
+		view.revoked = true;
+		assert_eq!(flow.recovery(view.grin()).unwrap(), None);
+		view.revoke = TxState::Confirmed(3);
+		assert_eq!(
+			flow.recovery(view.grin()).unwrap(),
+			Some(Action::RefundGrin)
+		);
+	}
+
+	#[test]
+	fn recover_keys_without_bitcoin() {
+		for (role, success) in [(Role::SellGrin, true), (Role::BuyGrin, false)] {
+			let (mut flow, mut view) = setup(role);
+			if success {
+				view.success = TxState::Confirmed(3);
+			} else {
+				view.refund = TxState::Confirmed(3);
+			}
+			assert_eq!(
+				flow.recovery(view.grin()).unwrap(),
+				Some(Action::OwnBitcoin)
+			);
+			flow.owned = true;
+			assert_eq!(
+				flow.recovery(view.grin()).unwrap(),
+				Some(if success {
+					Action::Complete
+				} else {
+					Action::Refunded
+				})
+			);
+			view.success = TxState::Absent;
+			view.refund = TxState::Absent;
+			view.height = 200;
+			assert_eq!(flow.recovery(view.grin()).unwrap(), Some(Action::Wait));
+		}
+	}
+
+	#[test]
 	fn revoke_first() {
 		let (mut flow, mut v) = setup(Role::SellGrin);
 		v.height = 120;
@@ -240,8 +367,10 @@ mod tests {
 		}
 		v.revoke = TxState::Confirmed(3);
 		assert_eq!(flow.next(v).unwrap(), Action::RefundGrin);
-		v.height = 135;
-		assert_eq!(flow.next(v).unwrap(), Action::Wait);
+		for height in 120..=145 {
+			v.height = height;
+			assert_eq!(flow.recovery(v.grin()).unwrap(), Some(Action::RefundGrin));
+		}
 		flow.refund_sent = true;
 		assert_eq!(flow.next(v).unwrap(), Action::RefundGrin);
 	}
@@ -306,8 +435,10 @@ mod tests {
 		assert_eq!(flow.next(v).unwrap(), Action::Wait);
 		v.revoke = TxState::Confirmed(3);
 		assert_eq!(flow.next(v).unwrap(), Action::RefundGrin);
-		v.height = 135;
-		assert_eq!(flow.next(v).unwrap(), Action::Wait);
+		for height in 120..=145 {
+			v.height = height;
+			assert_eq!(flow.recovery(v.grin()).unwrap(), Some(Action::RefundGrin));
+		}
 	}
 
 	#[test]
@@ -321,6 +452,45 @@ mod tests {
 		v.revoked = true;
 		v.revoke = TxState::Confirmed(3);
 		assert_eq!(flow.next(v).unwrap(), Action::Wait);
+	}
+
+	#[test]
+	fn release_gates() {
+		let states = [
+			TxState::Absent,
+			TxState::Pending,
+			TxState::Confirmed(1),
+			TxState::Confirmed(2),
+			TxState::Confirmed(3),
+		];
+		for role in [Role::SellGrin, Role::BuyGrin] {
+			for funding in states {
+				for bitcoin in states {
+					for height in [80, 94, 95, 99] {
+						for unspent in [false, true] {
+							for aborted in [false, true] {
+								let (mut flow, mut view) = setup(role);
+								flow.released = role == Role::BuyGrin;
+								flow.aborted = aborted;
+								view.funding = funding;
+								view.bitcoin = bitcoin;
+								view.height = height;
+								view.bitcoin_unspent = unspent;
+								let action = flow.next(view).unwrap();
+								let releases =
+									matches!(action, Action::Release | Action::ClaimGrin);
+								assert_eq!(
+									releases,
+									funding == TxState::Confirmed(3)
+										&& matches!(bitcoin, TxState::Confirmed(2 | 3))
+										&& height < 95 && unspent && !aborted
+								);
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 
 	#[test]

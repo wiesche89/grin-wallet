@@ -368,7 +368,7 @@ pub trait ForeignRpc {
 	*/
 	fn finalize_tx(&self, slate: VersionedSlate) -> Result<VersionedSlate, Error>;
 
-	/// Finalize without publishing, for swap funding and refunds
+	/// Finalize an ordinary transaction without publishing. Swap rounds require the owner API.
 	fn presign_tx(&self, slate: VersionedSlate) -> Result<VersionedSlate, Error>;
 }
 

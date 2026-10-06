@@ -304,17 +304,6 @@ fn parse_u64_or_none(arg: Option<&str>) -> Option<u64> {
 	}
 }
 
-fn parse_f64_or_none(arg: Option<&str>) -> Option<f64> {
-	let val = match arg {
-		Some(a) => a.parse::<f64>(),
-		None => return None,
-	};
-	match val {
-		Ok(v) => Some(v),
-		Err(_) => None,
-	}
-}
-
 // parses a number, returns None if argument is None, or value is absent
 fn parse_u32_or_none(arg: Option<&str>) -> Option<u32> {
 	let val = match arg {
@@ -660,9 +649,8 @@ pub fn parse_get_atomic_secrets_args(
 ) -> Result<command::GetAtomicSecretsArgs, ParseError> {
 	let id = parse_u32_or_none(args.value_of("id"))
 		.ok_or(ParseError::ArgumentError("missing atomic ID".into()))?;
-	let amount = parse_f64_or_none(args.value_of("amount")).ok_or(ParseError::ArgumentError(
-		"missing atomic swap amount".into(),
-	))?;
+	let amount = core::core::amount_from_hr_string(parse_required(args, "amount")?)
+		.map_err(|e| ParseError::ArgumentError(format!("Invalid atomic swap amount: {e}")))?;
 
 	Ok(command::GetAtomicSecretsArgs { id, amount })
 }

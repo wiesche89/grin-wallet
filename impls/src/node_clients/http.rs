@@ -165,6 +165,17 @@ impl NodeClient for HTTPNodeClient {
 		Ok((result.height, result.last_block_pushed))
 	}
 
+	fn get_unconfirmed_kernels(&self) -> Result<Option<Vec<TxKernel>>, libwallet::Error> {
+		let entries =
+			self.send_json_request::<Vec<PoolKernels>>("get_unconfirmed_transactions", &json!([]))?;
+		Ok(Some(
+			entries
+				.into_iter()
+				.flat_map(|entry| entry.tx.body.kernels)
+				.collect(),
+		))
+	}
+
 	/// Get kernel implementation
 	fn get_kernel(
 		&mut self,
@@ -393,6 +404,20 @@ impl NodeClient for HTTPNodeClient {
 	}
 }
 
+// Read only kernels from the existing public-pool RPC, including aggregated entries.
+#[derive(Deserialize)]
+struct PoolKernels {
+	tx: PoolTransaction,
+}
+#[derive(Deserialize)]
+struct PoolTransaction {
+	body: PoolBody,
+}
+#[derive(Deserialize)]
+struct PoolBody {
+	kernels: Vec<TxKernel>,
+}
+
 fn posted(response: Response) -> Result<(), Error> {
 	match response.into_result::<serde_json::Value>() {
 		Ok(_) => Ok(()),
@@ -414,6 +439,66 @@ mod tests {
 	use crate::core::libtx::build;
 	use crate::core::libtx::ProofBuilder;
 	use crate::keychain::{ExtKeychain, Keychain};
+
+	#[test]
+	fn public_pool_kernels() {
+		use std::io::{Read, Write};
+		use std::net::TcpListener;
+		let tx = tx1i1o_v2_compatible();
+		let expected = vec![tx.kernels()[0], tx.kernels()[0]];
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let address = listener.local_addr().unwrap();
+		let server = std::thread::spawn(move || {
+			for result in [
+				json!({"Ok":[{"tx":{"body":{"kernels":expected}}}]}),
+				json!({"Ok":[]}),
+				json!({"Err":{"Internal":"pool unavailable"}}),
+			] {
+				let (mut stream, _) = listener.accept().unwrap();
+				stream
+					.set_read_timeout(Some(Duration::from_secs(5)))
+					.unwrap();
+				let mut request = Vec::new();
+				let mut chunk = [0; 4096];
+				loop {
+					let count = stream.read(&mut chunk).unwrap();
+					assert!(count > 0);
+					request.extend_from_slice(&chunk[..count]);
+					if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+						let headers = String::from_utf8_lossy(&request[..end]);
+						let length: usize = headers
+							.lines()
+							.find_map(|line| {
+								let (name, value) = line.split_once(':')?;
+								name.eq_ignore_ascii_case("content-length")
+									.then(|| value.trim().parse().unwrap())
+							})
+							.unwrap();
+						if request.len() >= end + 4 + length {
+							let body: serde_json::Value =
+								serde_json::from_slice(&request[end + 4..end + 4 + length])
+									.unwrap();
+							assert_eq!(body["method"], "get_unconfirmed_transactions");
+							assert_eq!(body["params"], json!([]));
+							break;
+						}
+					}
+				}
+				let body = json!({"id":1,"jsonrpc":"2.0","result":result}).to_string();
+				write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+			}
+		});
+		let client =
+			HTTPNodeClient::new(&format!("http://{address}"), None, Duration::from_secs(5))
+				.unwrap();
+		assert_eq!(
+			client.get_unconfirmed_kernels().unwrap().unwrap(),
+			vec![tx.kernels()[0]; 2]
+		);
+		assert_eq!(client.get_unconfirmed_kernels().unwrap(), Some(vec![]));
+		assert!(client.get_unconfirmed_kernels().is_err());
+		server.join().unwrap();
+	}
 
 	#[test]
 	fn post_reply() {

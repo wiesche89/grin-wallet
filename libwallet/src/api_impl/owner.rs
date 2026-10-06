@@ -866,8 +866,17 @@ where
 	C: NodeClient,
 	K: Keychain,
 {
+	if let Some(saved) = w.begin_round(keychain_mask, slate, 5)? {
+		return Ok(saved);
+	}
 	let keychain = w.keychain(keychain_mask)?;
 	let mut context = w.get_private_context(keychain_mask, slate.id.as_bytes())?;
+	// Legacy completed rounds have no replay journal: do not reuse their nonce.
+	if context.tau_x.is_some() {
+		return Err(Error::Signature(
+			"multisig round already processed without a journal".into(),
+		));
+	}
 	let mut ret_slate = slate.clone();
 
 	let secp = keychain.secp();
@@ -974,7 +983,9 @@ where
 	// Then, calculate the partial excess signature, add to receiver's signature,
 	// and finalize the multisig transaction
 
-	// Save the multisig output and context in our DB
+	ret_slate.state = SlateState::Multisig3;
+
+	// Commit the response with its context and output before returning it.
 	{
 		let height = w.last_confirmed_height()?;
 		let mut batch = w.batch(keychain_mask)?;
@@ -994,10 +1005,10 @@ where
 			tx_log_entry: None,
 		})?;
 		batch.save_private_context(slate.id.as_bytes(), &context)?;
+		batch.save_round(slate, 5, Some(&ret_slate))?;
 		batch.commit()?;
 	}
 
-	ret_slate.state = SlateState::Multisig3;
 	Ok(ret_slate)
 }
 

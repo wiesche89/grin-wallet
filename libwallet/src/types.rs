@@ -169,6 +169,12 @@ pub trait NodeClient: Send + Sync + Clone {
 		max_height: Option<u64>,
 	) -> Result<Option<(TxKernel, u64, u64)>, Error>;
 
+	/// Optional public-pool observation. None means unsupported, not an empty pool.
+	/// Stem transactions must not be exposed by this query.
+	fn get_unconfirmed_kernels(&self) -> Result<Option<Vec<TxKernel>>, Error> {
+		Ok(None)
+	}
+
 	/// retrieve a list of outputs from the specified grin node
 	/// need "by_height" and "by_id" variants
 	fn get_outputs_from_node(
@@ -382,6 +388,9 @@ pub struct Context {
 	pub initial_sec_nonce: SecretKey,
 	/// Secret key (of which public is shared, atomic swap only)
 	pub sec_atomic: Option<SecretKey>,
+	/// Storage marker; absent in contexts written before atomic-secret masking.
+	#[serde(default)]
+	pub(crate) sec_atomic_masked: bool,
 	/// store my outputs + amounts between invocations
 	/// Id, mmr_index (if known), amount
 	pub output_ids: Vec<(Identifier, Option<u64>, u64)>,
@@ -452,6 +461,7 @@ impl Context {
 			initial_sec_key: sec_key,
 			initial_sec_nonce: sec_nonce,
 			sec_atomic: None,
+			sec_atomic_masked: false,
 			input_ids: vec![],
 			output_ids: vec![],
 			amount: 0,

@@ -337,7 +337,7 @@ impl Core {
 
 	/// Observe a local wallet transaction. Unknown and conflicted transactions stay distinct
 	pub fn status(&self, txid: Txid) -> Result<TxState, Error> {
-		match self.request("gettransaction", json!([txid])) {
+		match self.request("gettransaction", json!([txid, true])) {
 			Ok(tx) => match tx["confirmations"].as_i64() {
 				Some(n) if n < 0 => Ok(TxState::Conflicted),
 				Some(0) => match self.request("getmempoolentry", json!([txid])) {
@@ -350,6 +350,14 @@ impl Core {
 			},
 			Err(-5) => Ok(TxState::Absent),
 			Err(code) => Err(invalid(&format!("transaction lookup failed ({code})"))),
+		}
+	}
+
+	/// SAS payouts may belong to the watch wallet when the destination is external.
+	pub(super) fn swap_status(&self, txid: Txid) -> Result<TxState, Error> {
+		match self.status(txid)? {
+			TxState::Absent => self.watcher(false)?.status(txid),
+			status => Ok(status),
 		}
 	}
 
@@ -390,6 +398,110 @@ mod tests {
 	use super::*;
 	use ::bitcoin::secp256k1::Secp256k1;
 	use ::bitcoin::PublicKey;
+
+	#[test]
+	fn external_payout_status() {
+		use ::bitcoin::hashes::Hash;
+		use std::io::{Read, Write};
+		use std::net::TcpListener;
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let address = listener.local_addr().unwrap();
+		let cookie = std::env::temp_dir().join(format!("grin-payout-{}.cookie", address.port()));
+		std::fs::write(&cookie, "test:cookie").unwrap();
+		let server = std::thread::spawn(move || {
+			let chain = json!({"chain":"regtest","initialblockdownload":false});
+			let wallet = json!({"private_keys_enabled":false,"descriptors":true});
+			let missing = json!({"code":-5,"message":"not in this wallet"});
+			let mut replies = vec![("/wallet/test", "getblockchaininfo", chain, Value::Null)];
+			for (confirmations, evicted) in [(0, false), (2, false), (-1, false), (0, true)] {
+				replies.extend([
+					(
+						"/wallet/test",
+						"gettransaction",
+						Value::Null,
+						missing.clone(),
+					),
+					(
+						"/wallet/grin-sas-watch",
+						"getwalletinfo",
+						wallet.clone(),
+						Value::Null,
+					),
+					(
+						"/wallet/grin-sas-watch",
+						"getwalletinfo",
+						wallet.clone(),
+						Value::Null,
+					),
+					(
+						"/wallet/grin-sas-watch",
+						"gettransaction",
+						json!({"confirmations":confirmations}),
+						Value::Null,
+					),
+				]);
+				if confirmations == 0 {
+					replies.push((
+						"/wallet/grin-sas-watch",
+						"getmempoolentry",
+						json!({}),
+						if evicted {
+							missing.clone()
+						} else {
+							Value::Null
+						},
+					));
+				}
+			}
+			for (path, method, result, error) in replies {
+				let (mut stream, _) = listener.accept().unwrap();
+				stream
+					.set_read_timeout(Some(Duration::from_secs(5)))
+					.unwrap();
+				let mut headers = Vec::new();
+				while !headers.ends_with(b"\r\n\r\n") {
+					let mut byte = [0];
+					stream.read_exact(&mut byte).unwrap();
+					headers.push(byte[0]);
+				}
+				let headers = String::from_utf8(headers).unwrap();
+				assert!(headers.starts_with(&format!("POST {path} ")));
+				let length: usize = headers
+					.lines()
+					.find_map(|line| {
+						let (name, value) = line.split_once(':')?;
+						name.eq_ignore_ascii_case("content-length")
+							.then(|| value.trim().parse().unwrap())
+					})
+					.unwrap();
+				let mut body = vec![0; length];
+				stream.read_exact(&mut body).unwrap();
+				let request: Value = serde_json::from_slice(&body).unwrap();
+				assert_eq!(request["method"], method);
+				if method == "gettransaction" {
+					assert_eq!(request["params"][1], true);
+				}
+				let body = json!({"id":1,"result":result,"error":error}).to_string();
+				write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+			}
+		});
+		let core = Core::new(
+			&format!("http://{address}/wallet/test"),
+			cookie.clone(),
+			Network::Regtest,
+		)
+		.unwrap();
+		for expected in [
+			TxState::Pending,
+			TxState::Confirmed(2),
+			TxState::Conflicted,
+			TxState::Absent,
+		] {
+			assert_eq!(core.swap_status(Txid::all_zeros()).unwrap(), expected);
+		}
+		server.join().unwrap();
+		std::fs::remove_file(cookie).unwrap();
+	}
 
 	#[test]
 	fn runtime() {

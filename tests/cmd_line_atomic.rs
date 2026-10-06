@@ -450,3 +450,21 @@ fn wallet_command_line() {
 		panic!("Libwallet Error: {}", e);
 	}
 }
+
+#[test]
+fn recovery_amount_is_exact() {
+	let yaml = load_yaml!("../src/bin/grin-wallet.yml");
+	let matches = App::from_yaml(yaml).get_matches_from(vec![
+		"grin-wallet",
+		"get_atomic_secrets",
+		"--id",
+		"0",
+		"--amount",
+		"1.000000007",
+	]);
+	let args = grin_wallet::cmd::wallet_args::parse_get_atomic_secrets_args(
+		matches.subcommand_matches("get_atomic_secrets").unwrap(),
+	)
+	.unwrap();
+	assert_eq!(args.amount, 1_000_000_007);
+}

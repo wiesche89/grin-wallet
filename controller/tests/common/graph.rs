@@ -80,6 +80,38 @@ pub fn prepare(
 	for _ in 0..2 {
 		seller.cancel(&da)?;
 	}
+	for committed in [false, true] {
+		seller = Preparation::new(seller.proposal.clone(), address.into())?;
+		let mut pending = None;
+		assert!(seller
+			.start(&da, &mut |state| {
+				let value = serde_json::to_value(state).unwrap();
+				if value["pending"] == "0-lock-fund" {
+					pending = Some(value.clone());
+				}
+				if (!committed && pending.is_some())
+					|| (committed && value["saved"].get("0-lock-fund").is_some())
+				{
+					return Err(libwallet::Error::GenericError("interrupted".into()));
+				}
+				Ok(())
+			})
+			.is_err());
+		seller = serde_json::from_value(pending.unwrap()).unwrap();
+		assert!(seller.start(&da, &mut checkpoint).is_err());
+		seller.cancel(&da)?;
+		let (_, outputs) = a.retrieve_outputs(
+			grin_wallet_api::Token {
+				keychain_mask: am.cloned(),
+			},
+			false,
+			false,
+			None,
+		)?;
+		assert!(outputs
+			.iter()
+			.all(|o| o.output.status != libwallet::OutputStatus::Locked));
+	}
 	seller = Preparation::new(seller.proposal.clone(), address.into())?;
 	seller.start(&da, &mut checkpoint)?;
 	let mut old_offer = seller.outgoing.clone().unwrap();
@@ -120,6 +152,19 @@ pub fn prepare(
 		};
 		assert_eq!(message.version, 2);
 		assert_eq!(message.round, round);
+		if round > 0 {
+			let mut changed = message.clone();
+			let mut slate = Slate::deserialize_upgrade(&changed.slates["fund"])?;
+			slate.id = Uuid::new_v4();
+			changed
+				.slates
+				.insert("fund".into(), serde_json::to_string(&slate).unwrap());
+			assert!(receiver
+				.receive(driver, changed, &mut |_| panic!("changed identifier saved"))
+				.unwrap_err()
+				.to_string()
+				.contains("identifier changed"));
+		}
 		for mutation in 0..4 {
 			let mut changed = message.clone();
 			match mutation {
@@ -146,6 +191,91 @@ pub fn prepare(
 					));
 				}
 			}
+		}
+		if round <= 1 {
+			let name = if round == 0 { "revoke" } else { "refund" };
+			let before = serde_json::to_value(&receiver).unwrap();
+			for mutation in 0..4 {
+				let mut changed = message.clone();
+				let mut slate = Slate::deserialize_upgrade(&changed.slates[name])?;
+				match mutation {
+					0 => slate.amount -= 1,
+					1 => slate.kernel_features = 1,
+					2 => slate.fee_fields = ((fee + 1) as u32).into(),
+					_ => {
+						slate
+							.kernel_features_args
+							.get_or_insert_with(Default::default)
+							.lock_height = terms.refund + 1;
+					}
+				}
+				changed
+					.slates
+					.insert(name.into(), serde_json::to_string(&slate).unwrap());
+				assert!(receiver
+					.receive(driver, changed, &mut |_| panic!("invalid terms saved"))
+					.unwrap_err()
+					.to_string()
+					.contains("agreed terms"));
+				assert_eq!(before, serde_json::to_value(&receiver).unwrap());
+			}
+		}
+		let mut interrupted = None;
+		let prefix = format!("{round}-");
+		assert!(receiver
+			.receive(driver, message.clone(), &mut |state| {
+				let saved = serde_json::to_value(state).unwrap();
+				if saved["pending"].is_null()
+					&& saved["saved"]
+						.as_object()
+						.unwrap()
+						.keys()
+						.any(|key| key.starts_with(&prefix))
+				{
+					interrupted = Some(saved);
+					return Err(libwallet::Error::GenericError("interrupted".into()));
+				}
+				Ok(())
+			})
+			.is_err());
+		*receiver = serde_json::from_value(interrupted.expect("saved wallet operation")).unwrap();
+		let before = serde_json::to_value(&receiver).unwrap();
+		let mut unbound = before.clone();
+		unbound.as_object_mut().unwrap().remove("receiving");
+		let mut unbound: Preparation = serde_json::from_value(unbound).unwrap();
+		assert!(unbound
+			.receive(driver, message.clone(), &mut |_| panic!(
+				"unbound message saved"
+			))
+			.unwrap_err()
+			.to_string()
+			.contains("without saved message"));
+		let mut changed = message.clone();
+		changed.slates.get_mut("fund").unwrap().push(' ');
+		let error = receiver.receive(driver, changed, &mut |_| panic!("changed message saved"));
+		assert!(error.unwrap_err().to_string().contains("message changed"));
+		assert_eq!(before, serde_json::to_value(&receiver).unwrap());
+		let replayable: &[&str] = match round {
+			0 => &["0-success"],
+			1 => &["1-revoke", "1-refund"],
+			2 => &["2-refund", "2-timeout"],
+			_ => &[],
+		};
+		for key in replayable {
+			let mut pending = None;
+			assert!(receiver
+				.receive(driver, message.clone(), &mut |state| {
+					let value = serde_json::to_value(state).unwrap();
+					if value["pending"] == *key {
+						pending = Some(value.clone());
+					}
+					if value["saved"].get(*key).is_some() {
+						return Err(libwallet::Error::GenericError("response lost".into()));
+					}
+					Ok(())
+				})
+				.is_err());
+			*receiver = serde_json::from_value(pending.unwrap()).unwrap();
 		}
 		receiver.receive(driver, message.clone(), &mut checkpoint)?;
 		*receiver = serde_json::from_slice(&serde_json::to_vec(receiver).unwrap()).unwrap();

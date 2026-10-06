@@ -53,6 +53,24 @@ impl Timing {
 		self.terms(0).map(|_| ())
 	}
 
+	/// Check incoming terms against the local minimum confirmation and recovery policy.
+	pub fn accepts(self, terms: Terms, height: u64) -> Result<(), Error> {
+		self.validate()?;
+		terms.validate_offer()?;
+		if !terms.open(height)
+			|| terms.confirmations < self.confirmations
+			|| terms.bitcoin_confirmations < self.bitcoin_confirmations
+			|| terms.margin < self.margin
+			|| terms.refund - terms.revoke < self.refund - self.revoke
+			|| terms.timeout - terms.refund < self.timeout - self.refund
+		{
+			return Err(Error::GenericError(
+				"Offer does not meet the local confirmation and recovery policy".into(),
+			));
+		}
+		Ok(())
+	}
+
 	/// Resolve deadlines against the current Grin height
 	pub fn terms(self, height: u64) -> Result<Terms, Error> {
 		let add = |offset| {
@@ -68,7 +86,7 @@ impl Timing {
 			bitcoin_confirmations: self.bitcoin_confirmations,
 			margin: self.margin,
 		};
-		terms.validate()?;
+		terms.validate_offer()?;
 		if !terms.open(height) {
 			return Err(Error::GenericError(
 				"Leave more blocks than the safety margin before recovery and between deadlines"
@@ -82,6 +100,40 @@ impl Timing {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	fn offer_policy() {
+		let policy = Timing {
+			confirmations: 10,
+			bitcoin_confirmations: 6,
+			margin: 60,
+			..Timing::default()
+		};
+		assert!(policy
+			.accepts(Timing::default().terms(100).unwrap(), 100)
+			.is_err());
+		let terms = policy.terms(100).unwrap();
+		assert!(policy.accepts(terms, 100).is_ok());
+		assert!(policy.accepts(terms, terms.revoke).is_err());
+		let tiny = Timing {
+			revoke: 2,
+			refund: 4,
+			timeout: 6,
+			confirmations: 1,
+			bitcoin_confirmations: 1,
+			margin: 1,
+		};
+		assert!(tiny.validate().is_err());
+		let mut terms = terms;
+		terms.refund -= 1;
+		assert!(policy.accepts(terms, 100).is_err());
+		assert!(Timing {
+			margin: u64::MAX,
+			..policy
+		}
+		.validate()
+		.is_err());
+	}
+
 	#[test]
 	fn deadlines() {
 		let terms = Timing::default().terms(100).unwrap();

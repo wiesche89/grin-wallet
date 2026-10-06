@@ -105,12 +105,21 @@ pub enum Request {
 /// Public state and messages that may be sent to the counterparty
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Reply {
+	/// Fresh Grin-only observation, also available during Bitcoin-free recovery.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub grin: Option<crate::libwallet::swap::sas::GrinView>,
+	/// The agreed Bitcoin input cannot fund a first payout; explicit recovery is needed.
+	#[serde(default)]
+	pub funding_recovery: bool,
 	/// Fresh chain observations from the last successful step
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub chain: Option<sas::Chain>,
 	/// Published Bitcoin payout transaction
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub withdrawal: Option<String>,
+	/// Fresh payout observation; absent when Bitcoin has not been queried.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub payout: Option<sas::Payout>,
 	/// External Bitcoin payment, available only when funding is allowed
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub payment: Option<sas::Payment>,
@@ -127,6 +136,56 @@ pub struct Reply {
 	pub funding: Option<String>,
 	/// Released A3 slate; identical across retries
 	pub main: Option<String>,
+}
+
+impl Reply {
+	fn new(id: Uuid, action: Action) -> Self {
+		Self {
+			grin: None,
+			funding_recovery: false,
+			chain: None,
+			withdrawal: None,
+			payout: None,
+			payment: None,
+			proof: None,
+			id,
+			key: String::new(),
+			action,
+			funding: None,
+			main: None,
+		}
+	}
+}
+
+// New swaps are experimental. Recovery of already stored swaps stays available.
+fn test_network(
+	network: crate::impls::swap::adapters::bitcoin::types::Network,
+) -> Result<(), crate::libwallet::Error> {
+	if network == crate::impls::swap::adapters::bitcoin::types::Network::Bitcoin
+		|| crate::core::global::get_chain_type() == crate::core::global::ChainTypes::Mainnet
+	{
+		return Err(crate::libwallet::Error::GenericError(
+			"New swaps are only supported on test networks".into(),
+		));
+	}
+	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::core::global::{set_local_chain_type, ChainTypes};
+	use crate::impls::swap::adapters::bitcoin::types::Network;
+	#[test]
+	fn new_swaps_require_test_networks() {
+		set_local_chain_type(ChainTypes::Testnet);
+		assert!(test_network(Network::Bitcoin).is_err());
+		assert!(test_network(Network::Testnet4).is_ok());
+		set_local_chain_type(ChainTypes::Mainnet);
+		assert!(test_network(Network::Testnet4).is_err());
+		set_local_chain_type(ChainTypes::AutomatedTesting);
+		assert!(test_network(Network::Regtest).is_ok());
+	}
 }
 
 fn settings(

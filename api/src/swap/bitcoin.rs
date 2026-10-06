@@ -146,6 +146,7 @@ where
 			max_fee,
 		} = request
 		{
+			super::test_network(network)?;
 			policy.validate(w.w2n_client().get_chain_tip()?.0, core.height()?)?;
 			if amount > btc::Amount::MAX_MONEY.to_sat()
 				|| amount <= fee
@@ -340,15 +341,10 @@ fn reply<C: NodeClient, K: Keychain>(
 	state: &Swap,
 ) -> Result<Reply, Error> {
 	Ok(Reply {
-		chain: None,
-		withdrawal: None,
-		payment: None,
-		proof: None,
-		id,
 		key: public(&secret(w, mask, &state.key)?).to_string(),
-		action: state.last_action,
 		funding: state.btc_funding.as_ref().map(serialize_hex),
 		main: state.released.clone(),
+		..Reply::new(id, state.last_action)
 	})
 }
 

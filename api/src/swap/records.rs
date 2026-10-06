@@ -75,16 +75,6 @@ where
 		let w = lock.lc_provider()?.wallet_inst()?;
 		w.keychain(mask)?;
 		let id = w.register_swap(mask, record)?;
-		Ok(Reply {
-			id,
-			action: Action::Wait,
-			chain: None,
-			withdrawal: None,
-			payment: None,
-			proof: None,
-			key: String::new(),
-			funding: None,
-			main: None,
-		})
+		Ok(Reply::new(id, Action::Wait))
 	}
 }

@@ -18,8 +18,8 @@ use crate::keychain::Keychain;
 use crate::libwallet::api_impl::foreign;
 use crate::libwallet::api_impl::types::update_tx_slate_state;
 use crate::libwallet::{
-	BlockFees, CbData, Error, NodeClient, NodeVersionInfo, Slate, VersionInfo, WalletInst,
-	WalletLCProvider,
+	BlockFees, CbData, Error, NodeClient, NodeVersionInfo, Slate, SlateState, VersionInfo,
+	WalletInst, WalletLCProvider,
 };
 use crate::try_slatepack_sync_workflow;
 use crate::util::secp::key::SecretKey;
@@ -478,8 +478,23 @@ where
 	/// ```
 
 	pub fn finalize_tx(&self, slate: &Slate, post_automatically: bool) -> Result<Slate, Error> {
+		// Swap finalization requires local owner authorization.
+		if !matches!(slate.state, SlateState::Standard2 | SlateState::Invoice2)
+			|| slate.is_multisig()
+		{
+			return Err(Error::SlateState);
+		}
 		let mut w_lock = self.wallet_inst.lock();
 		let w = w_lock.lc_provider()?.wallet_inst()?;
+		// Authorize from local state as well as the caller-provided slate type.
+		let context = w.get_private_context(self.keychain_mask.as_ref(), slate.id.as_bytes())?;
+		if context.sec_atomic.is_some()
+			|| context.partial_commit.is_some()
+			|| w.atomic_round(&slate.id, 1)?.is_some()
+			|| w.atomic_round(&slate.id, 2)?.is_some()
+		{
+			return Err(Error::SlateState);
+		}
 		let post_automatically = match self.doctest_mode {
 			true => false,
 			false => post_automatically,
